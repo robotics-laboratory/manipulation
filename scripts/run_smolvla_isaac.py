@@ -63,6 +63,27 @@ from env_wrapper import IsaacEEWrapper
 
 
 def main():
+    def _find_camera_and_dt(env):
+        base = env
+        while hasattr(base, "env"):
+            base = base.env
+        dt = None
+        if hasattr(base, "sim") and base.sim is not None:
+            try:
+                dt = base.sim.get_physics_dt()
+            except Exception:
+                pass
+        if dt is None:
+            dt = 1.0 / 60.0
+        camera = None
+        if hasattr(base, "scene") and hasattr(base.scene, "sensors"):
+            for name, sensor in base.scene.sensors.items():
+                if hasattr(sensor, "data") and hasattr(sensor.data, "output"):
+                    if isinstance(getattr(sensor.data, "output", None), dict) and "rgb" in sensor.data.output:
+                        camera = sensor
+                        break
+        return camera, dt
+
     # Load policy and processors (LeRobot)
     try:
         import torch
@@ -114,6 +135,10 @@ def main():
         ee_link_name=args_cli.ee_link_name,
         add_ee_to_obs=not args_cli.no_ee_in_obs,
     )
+
+    camera, sim_dt = _find_camera_and_dt(env)
+    if camera is not None:
+        print("[Camera] found.")
 
     action_shape = tuple(env.action_space.shape)
     num_envs = args_cli.num_envs
@@ -193,6 +218,12 @@ def main():
             env_action_t = torch.as_tensor(env_action, device=inner.device, dtype=torch.float32)
             obs, reward, terminated, truncated, info = env.step(env_action_t)
             step += 1
+            if camera is not None:
+                camera.update(dt=sim_dt)
+                if "rgb" in camera.data.output and camera.data.output["rgb"].shape[0] > 0:
+                    rgb_np = camera.data.output["rgb"][0].cpu().numpy()
+                    if ep == 0 and step == 1:
+                        print(f"[Camera] RGB shape={rgb_np.shape}")
             if (terminated.any() if hasattr(terminated, "any") else terminated) or (truncated.any() if hasattr(truncated, "any") else truncated):
                 break
         print(f"Episode {ep + 1}/{args_cli.episodes} done ({step} steps).")
