@@ -40,7 +40,7 @@ parser.add_argument("--rename_map", type=str, default=None,
 parser.add_argument("--empty_cameras", type=int, default=1,
                     help="Number of trailing policy camera slots to fill with zeros (default 1 for SmolVLA side+up+empty)")
 parser.add_argument("--camera_usd", type=str, default=None,
-                    help="Load camera pose/intrinsics from this USD (cameras under CameraSideXform and CameraUpXform)")
+                    help="Load camera pose/intrinsics from this USD (CameraTopXform/CameraWristXform, with legacy side/up fallback)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -62,7 +62,28 @@ from camera_usd_loader import apply_camera_usd_to_env_cfg
 from env_wrapper import IsaacEEWrapper
 
 
-def main():
+def main(): 
+    def _find_camera_and_dt(env):
+        base = env
+        while hasattr(base, "env"):
+            base = base.env
+        dt = None
+        if hasattr(base, "sim") and base.sim is not None:
+            try:
+                dt = base.sim.get_physics_dt()
+            except Exception:
+                pass
+        if dt is None:
+            dt = 1.0 / 60.0
+        camera = None
+        if hasattr(base, "scene") and hasattr(base.scene, "sensors"):
+            for name, sensor in base.scene.sensors.items():
+                if hasattr(sensor, "data") and hasattr(sensor.data, "output"):
+                    if isinstance(getattr(sensor.data, "output", None), dict) and "rgb" in sensor.data.output:
+                        camera = sensor
+                        break
+        return camera, dt
+
     # Load policy and processors (LeRobot)
     try:
         import torch
@@ -115,6 +136,10 @@ def main():
         add_ee_to_obs=not args_cli.no_ee_in_obs,
     )
 
+    camera, sim_dt = _find_camera_and_dt(env)
+    if camera is not None:
+        print("[Camera] found.")
+
     action_shape = tuple(env.action_space.shape)
     num_envs = args_cli.num_envs
 
@@ -136,11 +161,22 @@ def main():
             if args_cli.rename_map:
                 rename_map = json.loads(args_cli.rename_map)
             elif args_cli.empty_cameras >= 1:
-                # Default: map lift task camera keys (observation.images_side/up) to policy camera1/camera2
-                rename_map = {
-                    "observation.images_side": "observation.images.camera1",
-                    "observation.images_up": "observation.images.camera2",
-                }
+                # Default: prefer dataset-aligned top/wrist keys, then fall back to legacy side/up keys.
+                if "observation.images_top" in single_obs and "observation.images_wrist" in single_obs:
+                    rename_map = {
+                        "observation.images_top": "observation.images.camera1",
+                        "observation.images_wrist": "observation.images.camera2",
+                    }
+                elif "observation.images.top" in single_obs and "observation.images.wrist" in single_obs:
+                    rename_map = {
+                        "observation.images.top": "observation.images.camera1",
+                        "observation.images.wrist": "observation.images.camera2",
+                    }
+                else:
+                    rename_map = {
+                        "observation.images_side": "observation.images.camera1",
+                        "observation.images_up": "observation.images.camera2",
+                    }
             frame = isaac_obs_to_policy_frame(
                 single_obs,
                 language_instruction=args_cli.instruction,
@@ -193,6 +229,14 @@ def main():
             env_action_t = torch.as_tensor(env_action, device=inner.device, dtype=torch.float32)
             obs, reward, terminated, truncated, info = env.step(env_action_t)
             step += 1
+
+            if camera is not None:
+                camera.update(dt=sim_dt)
+                if "rgb" in camera.data.output and camera.data.output["rgb"].shape[0] > 0:
+                    rgb_np = camera.data.output["rgb"][0].cpu().numpy()
+                    if ep == 0 and step == 1:
+                        print(f"[Camera] RGB shape={rgb_np.shape}")
+
             if (terminated.any() if hasattr(terminated, "any") else terminated) or (truncated.any() if hasattr(truncated, "any") else truncated):
                 break
         print(f"Episode {ep + 1}/{args_cli.episodes} done ({step} steps).")

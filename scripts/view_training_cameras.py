@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-View sample camera frames from the dataset the SmolVLA pickplace model was trained on.
-Saves side and up images so you can compare with your Isaac camera views.
+View sample camera frames from the selected SO101 training dataset.
+Saves top and wrist images so you can compare with your Isaac camera views.
 
 Usage:
   python view_training_cameras.py
@@ -25,13 +25,13 @@ except ImportError as e:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Save sample side/up camera frames from lerobot/svla_so101_pickplace"
+        description="Save sample top/wrist camera frames from an SO101 LeRobot dataset"
     )
     parser.add_argument(
         "--repo_id",
         type=str,
-        default="lerobot/svla_so101_pickplace",
-        help="HuggingFace dataset repo (default: training dataset for SmolVLA pickplace)",
+        default="legalaspro/so101-pick-and-place-cube-lerobot-50hz",
+        help="HuggingFace dataset repo (default: selected SO101 pick-place dataset)",
     )
     parser.add_argument(
         "--output_dir",
@@ -132,14 +132,22 @@ def main():
         step = max(1, (n_total - 1) // max(1, args.num_frames))
         frame_indices = list(range(0, min(step * args.num_frames, n_total), step))[: args.num_frames]
 
-    # Dataset uses observation.images.side / observation.images.up (per dataset card)
+    # Prefer dataset-aligned keys; keep legacy side/up fallback.
     sample = dataset[frame_indices[0]] if frame_indices else {}
-    side_key = "observation.images.side" if "observation.images.side" in sample else "observation.images_side"
-    up_key = "observation.images.up" if "observation.images.up" in sample else "observation.images_up"
+    top_key = (
+        "observation.images.top"
+        if "observation.images.top" in sample
+        else ("observation.images_top" if "observation.images_top" in sample else "observation.images.side")
+    )
+    wrist_key = (
+        "observation.images.wrist"
+        if "observation.images.wrist" in sample
+        else ("observation.images_wrist" if "observation.images_wrist" in sample else "observation.images.up")
+    )
 
     for idx in frame_indices:
         frame = dataset[idx]
-        for key, name in [(side_key, "side"), (up_key, "up")]:
+        for key, name in [(top_key, "top"), (wrist_key, "wrist")]:
             if key not in frame:
                 print(f"Warning: {key} not in frame keys: {list(frame.keys())}")
                 continue
@@ -162,7 +170,7 @@ def main():
             Image.fromarray(img).save(out_path)
             print(f"Saved {out_path} ({img.shape[0]}x{img.shape[1]})")
 
-    print(f"\nDone. Open images in {out_dir.absolute()} to see how side/up cameras looked in the training data.")
+    print(f"\nDone. Open images in {out_dir.absolute()} to see how top/wrist cameras looked in the training data.")
 
 
 if __name__ == "__main__":

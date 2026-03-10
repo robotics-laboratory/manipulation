@@ -2,13 +2,13 @@
 """
 Load the Isaac Lab SO-101 env with cameras enabled, run one reset, and save
 the rendered camera images to PNGs. Use this to inspect how the env's
-side/up (or other) camera views look.
+top/wrist (or other) camera views look.
 
 Usage:
   ./isaaclab.sh -p scripts/save_env_cameras.py
   ./isaaclab.sh -p scripts/save_env_cameras.py --task Isaac-SO-ARM101-Lift-Cube-v0 --output_dir ./my_cameras
   ./isaaclab.sh -p scripts/save_env_cameras.py --num_envs 2   # save cameras for env 0 and env 1
-  ./isaaclab.sh -p scripts/save_env_cameras.py --camera_usd /path/to/scene.usd   # use cameras from USD (CameraSideXform / CameraUpXform)
+  ./isaaclab.sh -p scripts/save_env_cameras.py --camera_usd /path/to/scene.usd   # use cameras from USD (CameraTopXform / CameraWristXform)
 
 Requires: run with isaaclab.sh (Isaac Sim). Cameras are enabled automatically.
 """
@@ -34,7 +34,7 @@ parser.add_argument("--num_envs", type=int, default=1, help="Number of envs (sav
 parser.add_argument("--output_dir", type=str, default="env_camera_samples", help="Directory to save PNGs")
 parser.add_argument("--env_index", type=int, default=0, help="Which env's cameras to save (0 to num_envs-1)")
 parser.add_argument("--camera_usd", type=str, default=None,
-                    help="Load camera pose/intrinsics from this USD (cameras under CameraSideXform and CameraUpXform)")
+                    help="Load camera pose/intrinsics from this USD (CameraTopXform/CameraWristXform, with legacy side/up fallback)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
