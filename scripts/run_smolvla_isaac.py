@@ -62,7 +62,7 @@ from camera_usd_loader import apply_camera_usd_to_env_cfg
 from env_wrapper import IsaacEEWrapper
 
 
-def main(): 
+def main():
     def _find_camera_and_dt(env):
         base = env
         while hasattr(base, "env"):
@@ -229,14 +229,12 @@ def main():
             env_action_t = torch.as_tensor(env_action, device=inner.device, dtype=torch.float32)
             obs, reward, terminated, truncated, info = env.step(env_action_t)
             step += 1
-
             if camera is not None:
                 camera.update(dt=sim_dt)
                 if "rgb" in camera.data.output and camera.data.output["rgb"].shape[0] > 0:
                     rgb_np = camera.data.output["rgb"][0].cpu().numpy()
                     if ep == 0 and step == 1:
                         print(f"[Camera] RGB shape={rgb_np.shape}")
-
             if (terminated.any() if hasattr(terminated, "any") else terminated) or (truncated.any() if hasattr(truncated, "any") else truncated):
                 break
         print(f"Episode {ep + 1}/{args_cli.episodes} done ({step} steps).")
