@@ -18,6 +18,7 @@ Notes:
 - "orient" with 3 values is interpreted as XYZ Euler angles in degrees.
 - "orient" with 4 values is interpreted as quaternion (w, x, y, z).
 - Optional "convention" per camera can be "opengl", "ros", or "world".
+  Use "world" when copying Euler values from Isaac Sim Transform panel.
 """
 
 from __future__ import annotations

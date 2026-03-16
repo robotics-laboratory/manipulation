@@ -79,6 +79,23 @@ from camera_usd_loader import apply_camera_usd_to_env_cfg
 from env_wrapper import IsaacEEWrapper
 
 
+def _print_camera_offsets(env_cfg) -> None:
+    scene = getattr(env_cfg, "scene", None)
+    if scene is None:
+        return
+    for key in ("camera_top", "camera_wrist", "camera_side", "camera_up"):
+        if not hasattr(scene, key):
+            continue
+        cam_cfg = getattr(scene, key)
+        offset = getattr(cam_cfg, "offset", None)
+        if offset is None:
+            continue
+        print(
+            f"[Cameras] {key}: pos={tuple(offset.pos)} "
+            f"rot={tuple(offset.rot)} convention={offset.convention}"
+        )
+
+
 def main():
     def _find_cameras_and_dt(env):
         base = env
@@ -161,6 +178,7 @@ def main():
     if args_cli.camera_json:
         apply_camera_json_to_env_cfg(env_cfg, args_cli.camera_json)
         print(f"[Cameras] Loaded pose overrides from {args_cli.camera_json}")
+    _print_camera_offsets(env_cfg)
     # Override episode length so the env allows max_steps (env otherwise truncates at episode_length_s)
     step_dt = env_cfg.sim.dt * env_cfg.decimation
     env_cfg.episode_length_s = args_cli.max_steps * step_dt
