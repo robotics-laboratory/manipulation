@@ -31,6 +31,8 @@ ENV PROJECT_DIR=/workspace/isaac-bridge
 WORKDIR ${PROJECT_DIR}
 
 # ---- Copy project files ----
+COPY camera_poses.json ${PROJECT_DIR}/camera_poses.json
+COPY camera_poses.example.json ${PROJECT_DIR}/camera_poses.example.json
 COPY isaac_so_arm101/ ${PROJECT_DIR}/isaac_so_arm101/
 COPY src/ ${PROJECT_DIR}/src/
 COPY scripts/ ${PROJECT_DIR}/scripts/

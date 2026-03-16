@@ -29,6 +29,8 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=all
     volumes:
       # --- Live-edit: mount project directories from host ---
+      - ../camera_poses.json:/workspace/isaac-bridge/camera_poses.json
+      - ../camera_poses.example.json:/workspace/isaac-bridge/camera_poses.example.json
       - ../src:/workspace/isaac-bridge/src
       - ../scripts:/workspace/isaac-bridge/scripts
       - ../isaac_so_arm101/src:/workspace/isaac-bridge/isaac_so_arm101/src
