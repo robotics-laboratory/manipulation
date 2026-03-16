@@ -36,8 +36,10 @@ def _gather_images(obs: dict[str, Any]) -> list[np.ndarray]:
     keys = (
         "observation.images.camera1", "observation.images.camera2", "observation.images.camera3",
         "observation.images.side", "observation.images.up",
+        "observation.images.top", "observation.images.wrist",
+        "observation.images_top", "observation.images_wrist",
         "observation.images_side", "observation.images_up",
-        "rgb", "image", "observation.images.top", "observation.images.wrist",
+        "rgb", "image",
     )
     images = []
     for k in keys:

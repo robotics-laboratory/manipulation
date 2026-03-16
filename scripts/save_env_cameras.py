@@ -9,6 +9,7 @@ Usage:
   ./isaaclab.sh -p scripts/save_env_cameras.py --task Isaac-SO-ARM101-Lift-Cube-v0 --output_dir ./my_cameras
   ./isaaclab.sh -p scripts/save_env_cameras.py --num_envs 2   # save cameras for env 0 and env 1
   ./isaaclab.sh -p scripts/save_env_cameras.py --camera_usd /path/to/scene.usd   # use cameras from USD (CameraTopXform / CameraWristXform)
+  ./isaaclab.sh -p scripts/save_env_cameras.py --camera_json /path/to/cameras.json # override poses from JSON
 
 Requires: run with isaaclab.sh (Isaac Sim). Cameras are enabled automatically.
 """
@@ -21,6 +22,20 @@ from isaaclab.app import AppLauncher
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
+
+
+def _pick_default_camera_json(project_root: Path) -> Path:
+    candidates = (
+        project_root / "camera_poses.json",
+        project_root / "manipulation" / "camera_poses.json",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+_DEFAULT_CAMERA_JSON = _pick_default_camera_json(_PROJECT_ROOT)
 _SRC_DIR = _PROJECT_ROOT / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
@@ -35,6 +50,8 @@ parser.add_argument("--output_dir", type=str, default="env_camera_samples", help
 parser.add_argument("--env_index", type=int, default=0, help="Which env's cameras to save (0 to num_envs-1)")
 parser.add_argument("--camera_usd", type=str, default=None,
                     help="Load camera pose/intrinsics from this USD (CameraTopXform/CameraWristXform, with legacy side/up fallback)")
+parser.add_argument("--camera_json", type=str, default=str(_DEFAULT_CAMERA_JSON),
+                    help="Load camera pose overrides from JSON (default: manipulation/camera_poses.json)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -51,6 +68,7 @@ import isaac_so_arm101.tasks.reach  # noqa: F401
 import isaac_so_arm101.tasks.lift   # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
+from camera_json_loader import apply_camera_json_to_env_cfg
 from camera_usd_loader import apply_camera_usd_to_env_cfg
 from env_wrapper import IsaacEEWrapper
 
@@ -116,6 +134,9 @@ def main():
     if args_cli.camera_usd:
         apply_camera_usd_to_env_cfg(env_cfg, args_cli.camera_usd)
         print(f"[save_env_cameras] Loaded cameras from {args_cli.camera_usd}")
+    if args_cli.camera_json:
+        apply_camera_json_to_env_cfg(env_cfg, args_cli.camera_json)
+        print(f"[save_env_cameras] Loaded camera pose overrides from {args_cli.camera_json}")
     env = gym.make(task_id, cfg=env_cfg)
     env = IsaacEEWrapper(
         env,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Load camera_side and camera_up config from a USD file at runtime.
-Expects cameras nested under prims named "CameraSideXform" and "CameraUpXform".
+Load top/wrist camera config from a USD file at runtime.
+Expects cameras nested under prims named "CameraTopXform" and "CameraWristXform".
 Used to override env scene cameras when running with --camera_usd /path/to/scene.usd.
 """
 
@@ -23,14 +23,15 @@ def _find_camera_under_prim(stage, prim):
     return None
 
 
-def _get_world_pose(prim):
-    """Return (position_xyz, quat_wxyz) in world frame."""
-    from pxr import Gf, UsdGeom
+def _get_local_pose(prim):
+    """Return (position_xyz, quat_wxyz) from prim local transform."""
+    from pxr import UsdGeom
 
     xform = UsdGeom.Xformable(prim)
-    world = xform.ComputeLocalToWorldTransform(0)
-    pos = world.ExtractTranslation()
-    rot = world.ExtractRotation().GetQuat()
+    local_tf = xform.GetLocalTransformation()
+    local = local_tf[0] if isinstance(local_tf, tuple) else local_tf
+    pos = local.ExtractTranslation()
+    rot = local.ExtractRotation().GetQuat()
     # Gf.Quat: GetReal() = w, GetImaginary() = (x,y,z)
     quat_wxyz = (
         rot.GetReal(),
@@ -60,14 +61,15 @@ def _get_camera_intrinsics(prim):
 
 def load_camera_config_from_usd(
     usd_path: str | Path,
-    side_xform_name: str = "CameraSideXform",
-    up_xform_name: str = "CameraUpXform",
-    width: int = 256,
-    height: int = 256,
+    top_xform_name: str = "CameraTopXform",
+    wrist_xform_name: str = "CameraWristXform",
+    width: int = 640,
+    height: int = 480,
 ):
     """
-    Open the USD and find cameras under prims named side_xform_name and up_xform_name.
-    Returns (camera_side_cfg, camera_up_cfg) as TiledCameraCfg instances, or (None, None) if not found.
+    Open the USD and find cameras under prims named top_xform_name and wrist_xform_name.
+    Falls back to legacy xform names (CameraSideXform/CameraUpXform) if needed.
+    Returns (camera_top_cfg, camera_wrist_cfg) as TiledCameraCfg instances, or (None, None) if not found.
     """
     from pxr import Usd, UsdGeom
 
@@ -90,20 +92,21 @@ def load_camera_config_from_usd(
                     return cam
         return None
 
-    side_cam = find_camera_by_xform_name(side_xform_name)
-    up_cam = find_camera_by_xform_name(up_xform_name)
+    top_cam = find_camera_by_xform_name(top_xform_name) or find_camera_by_xform_name("CameraSideXform")
+    wrist_cam = find_camera_by_xform_name(wrist_xform_name) or find_camera_by_xform_name("CameraUpXform")
 
     def make_cfg(cam_prim, env_prim_path_key):
         if cam_prim is None:
             return None
-        pos, quat_wxyz = _get_world_pose(cam_prim)
+        pos, quat_wxyz = _get_local_pose(cam_prim)
         intrinsics = _get_camera_intrinsics(cam_prim)
         return TiledCameraCfg(
             prim_path=env_prim_path_key,
             offset=TiledCameraCfg.OffsetCfg(
                 pos=pos,
                 rot=quat_wxyz,
-                convention="world",
+                # USD camera prim rotation is authored in OpenGL camera convention.
+                convention="opengl",
             ),
             data_types=["rgb"],
             width=width,
@@ -116,21 +119,28 @@ def load_camera_config_from_usd(
             ),
         )
 
-    camera_side_cfg = make_cfg(side_cam, "{ENV_REGEX_NS}/CameraSide")
-    camera_up_cfg = make_cfg(up_cam, "{ENV_REGEX_NS}/CameraUp")
-    return camera_side_cfg, camera_up_cfg
+    camera_top_cfg = make_cfg(top_cam, "{ENV_REGEX_NS}/CameraTop")
+    camera_wrist_cfg = make_cfg(wrist_cam, "{ENV_REGEX_NS}/Robot/gripper_link/CameraWrist")
+    return camera_top_cfg, camera_wrist_cfg
 
 
 def apply_camera_usd_to_env_cfg(env_cfg, usd_path: str | Path, **kwargs):
     """
-    If env_cfg has scene.camera_side and scene.camera_up, override them from the given USD.
+    If env_cfg has scene.camera_top/camera_wrist, override them from the given USD.
+    Also supports legacy scene.camera_side/camera_up names.
     kwargs are passed to load_camera_config_from_usd (e.g. width, height).
     """
-    camera_side_cfg, camera_up_cfg = load_camera_config_from_usd(usd_path, **kwargs)
+    camera_top_cfg, camera_wrist_cfg = load_camera_config_from_usd(usd_path, **kwargs)
     scene = getattr(env_cfg, "scene", None)
     if scene is None:
         return
-    if camera_side_cfg is not None and hasattr(scene, "camera_side"):
-        scene.camera_side = camera_side_cfg
-    if camera_up_cfg is not None and hasattr(scene, "camera_up"):
-        scene.camera_up = camera_up_cfg
+    if camera_top_cfg is not None:
+        if hasattr(scene, "camera_top"):
+            scene.camera_top = camera_top_cfg
+        elif hasattr(scene, "camera_side"):
+            scene.camera_side = camera_top_cfg
+    if camera_wrist_cfg is not None:
+        if hasattr(scene, "camera_wrist"):
+            scene.camera_wrist = camera_wrist_cfg
+        elif hasattr(scene, "camera_up"):
+            scene.camera_up = camera_wrist_cfg

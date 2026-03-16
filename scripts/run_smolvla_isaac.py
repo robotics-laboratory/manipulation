@@ -14,6 +14,20 @@ from isaaclab.app import AppLauncher
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
+
+
+def _pick_default_camera_json(project_root: Path) -> Path:
+    candidates = (
+        project_root / "camera_poses.json",
+        project_root / "manipulation" / "camera_poses.json",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+_DEFAULT_CAMERA_JSON = _pick_default_camera_json(_PROJECT_ROOT)
 _SRC_DIR = _PROJECT_ROOT / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
@@ -41,6 +55,8 @@ parser.add_argument("--empty_cameras", type=int, default=1,
                     help="Number of trailing policy camera slots to fill with zeros (default 1 for SmolVLA side+up+empty)")
 parser.add_argument("--camera_usd", type=str, default=None,
                     help="Load camera pose/intrinsics from this USD (CameraTopXform/CameraWristXform, with legacy side/up fallback)")
+parser.add_argument("--camera_json", type=str, default=str(_DEFAULT_CAMERA_JSON),
+                    help="Load camera pose overrides from JSON (default: manipulation/camera_poses.json)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -58,12 +74,13 @@ import isaac_so_arm101.tasks.lift   # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 from adapters import isaac_obs_to_policy_frame, policy_action_to_env
+from camera_json_loader import apply_camera_json_to_env_cfg
 from camera_usd_loader import apply_camera_usd_to_env_cfg
 from env_wrapper import IsaacEEWrapper
 
 
 def main():
-    def _find_camera_and_dt(env):
+    def _find_cameras_and_dt(env):
         base = env
         while hasattr(base, "env"):
             base = base.env
@@ -75,14 +92,31 @@ def main():
                 pass
         if dt is None:
             dt = 1.0 / 60.0
-        camera = None
+        cameras = {}
         if hasattr(base, "scene") and hasattr(base.scene, "sensors"):
             for name, sensor in base.scene.sensors.items():
                 if hasattr(sensor, "data") and hasattr(sensor.data, "output"):
                     if isinstance(getattr(sensor.data, "output", None), dict) and "rgb" in sensor.data.output:
-                        camera = sensor
-                        break
-        return camera, dt
+                        cameras[name] = sensor
+        return cameras, dt
+
+    def _camera_obs_keys(sensor_name: str) -> tuple[str, ...]:
+        name = sensor_name.lower()
+        if "wrist" in name or "up" in name:
+            return (
+                "observation.images_wrist",
+                "observation.images.wrist",
+                "observation.images_up",
+                "observation.images.up",
+            )
+        if "top" in name or "side" in name:
+            return (
+                "observation.images_top",
+                "observation.images.top",
+                "observation.images_side",
+                "observation.images.side",
+            )
+        return (f"observation.images.{sensor_name}",)
 
     # Load policy and processors (LeRobot)
     try:
@@ -124,6 +158,9 @@ def main():
     if args_cli.camera_usd:
         apply_camera_usd_to_env_cfg(env_cfg, args_cli.camera_usd)
         print(f"[Cameras] Loaded from {args_cli.camera_usd}")
+    if args_cli.camera_json:
+        apply_camera_json_to_env_cfg(env_cfg, args_cli.camera_json)
+        print(f"[Cameras] Loaded pose overrides from {args_cli.camera_json}")
     # Override episode length so the env allows max_steps (env otherwise truncates at episode_length_s)
     step_dt = env_cfg.sim.dt * env_cfg.decimation
     env_cfg.episode_length_s = args_cli.max_steps * step_dt
@@ -136,9 +173,9 @@ def main():
         add_ee_to_obs=not args_cli.no_ee_in_obs,
     )
 
-    camera, sim_dt = _find_camera_and_dt(env)
-    if camera is not None:
-        print("[Camera] found.")
+    cameras, sim_dt = _find_cameras_and_dt(env)
+    if cameras:
+        print(f"[Camera] found RGB sensors: {list(cameras.keys())}")
 
     action_shape = tuple(env.action_space.shape)
     num_envs = args_cli.num_envs
@@ -157,6 +194,14 @@ def main():
                         single_obs[k] = v[0] if hasattr(v, "shape") and v.shape[:1] == (num_envs,) else v
             else:
                 single_obs = {"obs": obs[0] if obs.shape[:1] == (num_envs,) else obs}
+            # Ensure all camera frames are read each step and exposed in observation keys.
+            for sensor_name, sensor in cameras.items():
+                sensor.update(dt=sim_dt)
+                if "rgb" not in sensor.data.output or sensor.data.output["rgb"].shape[0] == 0:
+                    continue
+                rgb = sensor.data.output["rgb"][0]
+                for obs_key in _camera_obs_keys(sensor_name):
+                    single_obs[obs_key] = rgb
             rename_map = None
             if args_cli.rename_map:
                 rename_map = json.loads(args_cli.rename_map)
@@ -192,6 +237,15 @@ def main():
                         continue
                     x = np.asarray(frame[key])
                     print(f"[Images] {key}: shape={x.shape} min={x.min():.4f} max={x.max():.4f} mean={x.mean():.4f} zeros={100 * (x == 0).mean():.1f}%")
+                if cameras:
+                    for sensor_name, sensor in cameras.items():
+                        if "rgb" not in sensor.data.output or sensor.data.output["rgb"].shape[0] == 0:
+                            continue
+                        rgb_np = sensor.data.output["rgb"][0].detach().cpu().numpy()
+                        print(
+                            f"[Camera] {sensor_name}: shape={rgb_np.shape} "
+                            f"min={rgb_np.min():.1f} max={rgb_np.max():.1f} mean={rgb_np.mean():.1f}"
+                        )
                 # Warn if env provides no images (e.g. Lift task has no cameras by default)
                 all_zero = all(
                     np.asarray(frame.get(k, np.zeros(1))).size > 0 and np.asarray(frame[k]).mean() == 0.0
@@ -229,12 +283,6 @@ def main():
             env_action_t = torch.as_tensor(env_action, device=inner.device, dtype=torch.float32)
             obs, reward, terminated, truncated, info = env.step(env_action_t)
             step += 1
-            if camera is not None:
-                camera.update(dt=sim_dt)
-                if "rgb" in camera.data.output and camera.data.output["rgb"].shape[0] > 0:
-                    rgb_np = camera.data.output["rgb"][0].cpu().numpy()
-                    if ep == 0 and step == 1:
-                        print(f"[Camera] RGB shape={rgb_np.shape}")
             if (terminated.any() if hasattr(terminated, "any") else terminated) or (truncated.any() if hasattr(truncated, "any") else truncated):
                 break
         print(f"Episode {ep + 1}/{args_cli.episodes} done ({step} steps).")

@@ -40,6 +40,11 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 # from isaaclab.utils.visualizer import FRAME_MARKER_CFG
 # from isaaclab.utils.assets import RigidBodyPropertiesCfg
 
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FOCAL_LENGTH = 18.15
+CAMERA_HORIZONTAL_APERTURE = 20.955
+
 
 ##
 # Scene definition
@@ -80,40 +85,42 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
     )
 
-    # Cameras for vision policies: match LeRobot/svla_so101_pickplace training views
-    # - Side: oblique, slightly top-down (medium height), full gripper + workspace in frame
-    # - Up: above and to the right of the arm, looking down at the table
-    camera_side = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/CameraSide",
+    # Dataset-aligned camera defaults (legalaspro/so101-pick-and-place-cube-lerobot-50hz):
+    # - observation.images.top: static overhead camera in world frame
+    # - observation.images.wrist: camera attached to gripper_link
+    camera_top = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/CameraTop",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.32, 0.45, 0.30),
-            rot=(0.82, 0.56, 0.0, 0.0),
-            convention="world",
+            # Updated from manual Isaac Sim camera transform.
+            pos=(0.06488, 0.00395, 1.06841),
+            rot=(0.700464905, -0.087983463, -0.008909328, -0.708186734),
+            convention="opengl",
         ),
         data_types=["rgb"],
-        width=256,
-        height=256,
+        width=CAMERA_WIDTH,
+        height=CAMERA_HEIGHT,
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0,
+            focal_length=CAMERA_FOCAL_LENGTH,
             focus_distance=400.0,
-            horizontal_aperture=20.955,
+            horizontal_aperture=CAMERA_HORIZONTAL_APERTURE,
             clipping_range=(0.1, 1.0e5),
         ),
     )
-    camera_up = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/CameraUp",
+    camera_wrist = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/gripper_link/CameraWrist",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.52, 0.48, 0.10),
-            rot=(0.707, -0.707, 0.0, 0.0),
-            convention="world",
+            # Updated from manual Isaac Sim camera transform.
+            pos=(0.00165, 0.10846, -0.02989),
+            rot=(0.902356149, -0.419715014, -0.068417350, -0.070083908),
+            convention="opengl",
         ),
         data_types=["rgb"],
-        width=256,
-        height=256,
+        width=CAMERA_WIDTH,
+        height=CAMERA_HEIGHT,
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0,
+            focal_length=CAMERA_FOCAL_LENGTH,
             focus_distance=400.0,
-            horizontal_aperture=20.955,
+            horizontal_aperture=CAMERA_HORIZONTAL_APERTURE,
             clipping_range=(0.1, 1.0e5),
         ),
     )
@@ -173,15 +180,24 @@ class ObservationsCfg:
 
     @configclass
     class ImagesCfg(ObsGroup):
-        """Camera images for vision policies (side and up). Use with --enable_cameras."""
+        """Camera images for vision policies. Use with --enable_cameras."""
 
+        images_top = ObsTerm(
+            func=mdp.image,
+            params={"sensor_cfg": SceneEntityCfg("camera_top"), "data_type": "rgb", "normalize": False},
+        )
+        images_wrist = ObsTerm(
+            func=mdp.image,
+            params={"sensor_cfg": SceneEntityCfg("camera_wrist"), "data_type": "rgb", "normalize": False},
+        )
+        # Backward-compatible aliases for existing scripts/checkpoints.
         images_side = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("camera_side"), "data_type": "rgb", "normalize": False},
+            params={"sensor_cfg": SceneEntityCfg("camera_top"), "data_type": "rgb", "normalize": False},
         )
         images_up = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("camera_up"), "data_type": "rgb", "normalize": False},
+            params={"sensor_cfg": SceneEntityCfg("camera_wrist"), "data_type": "rgb", "normalize": False},
         )
 
         def __post_init__(self):
@@ -299,3 +315,4 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
         self.sim.physx.friction_correlation_distance = 0.00625
+        self.image_obs_list = ["camera_top", "camera_wrist"]

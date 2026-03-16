@@ -56,6 +56,8 @@ Options:
 - `--policy`: HuggingFace policy repo or local path (default: `lerobot/smolvla_base`).
 - `--instruction`: Language instruction for the policy (default: `"Pick the cube."`).
 - `--max_steps`, `--episodes`: Episode length and number of episodes.
+- `--camera_usd`: Load camera pose + intrinsics from a USD.
+- `--camera_json`: Override camera pose from JSON (`translate` + `orient`).
 - `--robot_name`: Scene articulation name (default: `robot`, as in isaac_so_arm101).
 - `--ee_link_name`: End-effector link for EE pose (default: `gripper_link` for SO-101).
 - `--no_ee_in_obs`: Do not add `ee_pos` / `ee_quat` / `ee_pos_delta` into the observation dict (EE still available via `get_ee_state()` and in `info["ee_state"]`).
@@ -158,7 +160,7 @@ ee = env.get_ee_state()
 
 ## Vision / SmolVLA and cameras
 
-The **Lift** task includes **side** and **up** cameras and exposes them as `observation.images_side` and `observation.images_up`. To get real images (and avoid all-zero camera slots), run with **`--enable_cameras`** (see command below).
+The **Lift** task includes **top** and **wrist** cameras and exposes them as `observation.images_top` and `observation.images_wrist` (plus legacy aliases `observation.images_side` / `observation.images_up` for compatibility). To get real images (and avoid all-zero camera slots), run with **`--enable_cameras`** (see command below).
 
 Example with cameras enabled:
 
@@ -166,7 +168,24 @@ Example with cameras enabled:
 ./isaaclab.sh -p /path/to/Isaac/scripts/run_smolvla_isaac.py --task Isaac-SO-ARM101-Lift-Cube-v0 --enable_cameras
 ```
 
-The script uses a default rename map so that `observation.images_side` → `camera1`, `observation.images_up` → `camera2`, and the third slot is zeros (`--empty_cameras 1`). **Reach** and other tasks do not define cameras (see [Isaac Lab Camera](https://isaac-sim.github.io/IsaacLab/main/source/overview/core-concepts/sensors/camera.html) to add them).
+Override camera poses from JSON at runtime:
+
+```bash
+./isaaclab.sh -p scripts/run_smolvla_isaac.py --task Isaac-SO-ARM101-Lift-Cube-v0 --enable_cameras --camera_json manipulation/camera_poses.example.json
+```
+
+By default, if `--camera_json` is not provided, scripts use `manipulation/camera_poses.json`.
+
+JSON schema (Euler degrees are converted to quaternion at launch):
+
+```json
+{
+  "camera_top": { "translate": [0.06488, 0.00395, 1.06841], "orient": [-6.413, -7.88, -90.186], "convention": "opengl" },
+  "camera_wrist": { "translate": [0.00165, 0.10846, -0.02989], "orient": [-49.519, -10.504, -4.027], "convention": "opengl" }
+}
+```
+
+The script uses a default rename map so that top/wrist images map to `camera1`/`camera2` (with legacy side/up fallback), and the third slot is zeros (`--empty_cameras 1`). **Reach** and other tasks do not define cameras (see [Isaac Lab Camera](https://isaac-sim.github.io/IsaacLab/main/source/overview/core-concepts/sensors/camera.html) to add them).
 
 ## Alternative checkpoints
 
@@ -203,7 +222,7 @@ For **EnvHub**: put this repo on the Hub and load with `make_env("username/your-
 
 | File / folder | Purpose |
 |---------------|--------|
-| `src/` | Library modules (`adapters.py`, `env.py`, `env_lerobot.py`, `env_wrapper.py`, `camera_usd_loader.py`). |
+| `src/` | Library modules (`adapters.py`, `env.py`, `env_lerobot.py`, `env_wrapper.py`, `camera_usd_loader.py`, `camera_json_loader.py`). |
 | `scripts/` | Entrypoint scripts (`run_smolvla_isaac.py`, `save_env_cameras.py`, `view_training_cameras.py`). |
 | `docker/` | `Dockerfile` and `docker-compose.yaml`. Build with `cd docker && docker compose build`. |
 | `tools/` | Standalone utilities (`verify_versions.py`). |
