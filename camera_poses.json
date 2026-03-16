@@ -1,7 +1,7 @@
 {
   "camera_top": {
     "translate": [0.06488, 0.00395, 1.06841],
-    "orient": [-6.413, -7.88, -90.186],
+    "orient": [-5.816, -3.77, -88.648],
     "convention": "opengl"
   },
   "camera_wrist": {

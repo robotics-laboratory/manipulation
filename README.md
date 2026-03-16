@@ -180,7 +180,7 @@ JSON schema (Euler degrees are converted to quaternion at launch):
 
 ```json
 {
-  "camera_top": { "translate": [0.06488, 0.00395, 1.06841], "orient": [-6.413, -7.88, -90.186], "convention": "opengl" },
+  "camera_top": { "translate": [0.06488, 0.00395, 1.06841], "orient": [-5.816, -3.77, -88.648], "convention": "opengl" },
   "camera_wrist": { "translate": [0.00165, 0.10846, -0.02989], "orient": [-49.519, -10.504, -4.027], "convention": "opengl" }
 }
 ```
