@@ -26,7 +26,7 @@
 - **Объект**: куб DexCube (Nucleus USD), начальная позиция задаётся в конфиге.
 - **Стол / пол / свет**: `ObjectTableSceneCfg` в `lift_env_cfg.py`.
 - **EE**: `FrameTransformer` от `base_link` к `gripper_link` с offset (конец эффектора для наград/наблюдений).
-- **Симуляция**: `sim.dt = 0.01` (100 Гц физики), `**decimation = 2`** → шаг среды **20 Гц** (`0.02` с на шаг RL).
+- **Симуляция**: `sim.dt = 0.01` (100 Гц физики), **`decimation = 2`** → шаг среды **20 Гц** (`0.02` с на шаг RL).
 - **Эпизод**: `episode_length_s = 5.0` → при 20 Гц это **до 125 шагов** на эпизод (если нет раннего done).
 - **Команда `object_pose`**: целевая поза для куба (Uniform pose command к `gripper_link`), ресэмплинг каждые **5 с**; диапазоны поз в `CommandsCfg` (`lift_env_cfg.py`).
 
@@ -36,8 +36,8 @@
 
 Для SO-101 в `SoArm101LiftCubeEnvCfg`:
 
-- `**arm_action`**: `JointPositionActionCfg` — суставы `shoulder_.*`, `elbow_flex`, `wrist_.*`, `scale=0.5`, `use_default_offset=True`.
-- `**gripper_action**`: `BinaryJointPositionActionCfg` — сустав `gripper`, открыто/закрыто через выражения команд.
+- **`arm_action`**: `JointPositionActionCfg` — суставы `shoulder_.*`, `elbow_flex`, `wrist_.*`, `scale=0.5`, `use_default_offset=True`.
+- **`gripper_action`**: `BinaryJointPositionActionCfg` — сустав `gripper`, открыто/закрыто через выражения команд.
 
 Размер вектора действий задаётся этими двумя компонентами действия.
 
@@ -63,11 +63,11 @@
 
 ### 4.2. Группа `observation` (изображения)
 
-Включена структура `**ImagesCfg`**: камеры `camera_top`, `camera_wrist` (Tiled RGB, 640×480). Для совместимости со скриптами есть **алиасы** `images_side` (= top) и `images_up` (= wrist).
+Включена структура **`ImagesCfg`**: камеры `camera_top`, `camera_wrist` (Tiled RGB, 640×480). Для совместимости со скриптами есть **алиасы** `images_side` (= top) и `images_up` (= wrist).
 
-**Важно для обучения без зрения:** при флаге `**disable_task_cameras = True`** в конфиге камеры **не спавнятся**, компоненты наблюдения с изображениями **обнуляются** (`lift_env_cfg.__post_init__`). В скриптах RSL-RL это делается через CLI `**--disable_task_cameras`**.
+**Важно для обучения без зрения:** при флаге **`disable_task_cameras = True`** в конфиге камеры **не спавнятся**, компоненты наблюдения с изображениями **обнуляются** (`lift_env_cfg.__post_init__`). В скриптах RSL-RL это делается через CLI **`--disable_task_cameras`**.
 
-Чтобы получить RGB в рантайме, нужен запуск с `**--enable_cameras**` у `AppLauncher` / `isaaclab.sh` (как в `run_smolvla_isaac.py` / `save_env_cameras.py`).
+Чтобы получить RGB в рантайме, нужен запуск с **`--enable_cameras`** у `AppLauncher` / `isaaclab.sh` (как в `run_smolvla_isaac.py` / `save_env_cameras.py`).
 
 ---
 
@@ -76,7 +76,7 @@
 На каждом шаге среды Isaac Lab формирует **скалярную награду** как **сумму по компонентам награды**:
 
 $$
-R_t = \sum_i w_i  r_{i,t}
+R_t = \sum_i w_i \, r_{i,t}
 $$
 
 где $w_i$ — **вес** из `RewTerm(..., weight=...)`, $r_{i,t}$ — выход функции награды (часто уже в $[0,1]$ или штраф).
@@ -87,12 +87,12 @@ $$
 
 ## 6. Dense Lift-Cube (`Isaac-SO-ARM101-Lift-Cube-v0`)
 
-Базовый класс `**RewardsCfg`** в `lift_env_cfg.py` + SO-101 в `SoArm101LiftCubeEnvCfg`.
+Базовый класс **`RewardsCfg`** в `lift_env_cfg.py` + SO-101 в `SoArm101LiftCubeEnvCfg`.
 
 ### 6.1. `reaching_object` — подвести EE к объекту
 
 $$
-r_{\text{reach}} = 1 - \tanh\left(\frac{p_{\text{obj}} - p_{\text{ee}}}{\sigma_{\text{reach}}}\right), \quad \sigma_{\text{reach}} = 0.05
+r_{\text{reach}} = 1 - \tanh\left(\frac{\|p_{\text{obj}} - p_{\text{ee}}\|}{\sigma_{\text{reach}}}\right), \quad \sigma_{\text{reach}} = 0.05
 $$
 
 - $p_{\text{obj}}$, $p_{\text{ee}}$ — позиции объекта и EE (world), EE из `ee_frame`.
@@ -101,7 +101,7 @@ $$
 ### 6.2. `lifting_object` — поднять выше порога
 
 $$
-r_{\text{lift}} = \mathbb{1} z_{\text{obj}} > h_{\min} , \quad h_{\min} = 0.025\text{м}
+r_{\text{lift}} = \mathbb{1}\{ z_{\text{obj}} > h_{\min} \}, \quad h_{\min} = 0.025\,\text{м}
 $$
 
 - **Вес** $w_{\text{lift}} = 15.0$.
@@ -111,7 +111,7 @@ $$
 Пусть $p_{\text{goal}}$ — целевая позиция команды `object_pose` в world (из команд робота и `des_pos_b`), $p_{\text{obj}}$ — позиция объекта.
 
 $$
-r_{\text{goal, coarse}} = \mathbb{1} z_{\text{obj}} > h_{\min}  \cdot \left(1 - \tanh\left(\frac{p_{\text{goal}} - p_{\text{obj}}}{\sigma_{\text{coarse}}}\right)\right)
+r_{\text{goal, coarse}} = \mathbb{1}\{ z_{\text{obj}} > h_{\min} \} \cdot \left(1 - \tanh\left(\frac{\|p_{\text{goal}} - p_{\text{obj}}\|}{\sigma_{\text{coarse}}}\right)\right)
 $$
 
 - $\sigma_{\text{coarse}} = 0.3$, $h_{\min} = 0.025$.
@@ -125,24 +125,24 @@ $$
 
 Стандартные компоненты награды в Isaac Lab:
 
-- `**action_rate_l2`**: штраф за **изменение действий** между шагами (L2; знак минус через вес).
-- `**joint_vel_l2`**: штраф за **скорости суставов** робота.
+- **`action_rate_l2`**: штраф за **изменение действий** между шагами (L2; знак минус через вес).
+- **`joint_vel_l2`**: штраф за **скорости суставов** робота.
 
 В Dense конфиге: **веса** $-10^{-4}$ каждый.
 
 ### 6.6. Куррикулум (Dense)
 
-В `CurriculumCfg` для компонентов `action_rate` и `joint_vel` вызывается `**modify_reward_weight`**: за **10000** шагов веса меняются к **$-0.1$** (более сильный штраф после разгона). Это влияет только на Dense вариант, где эти штрафы включены.
+В `CurriculumCfg` для компонентов `action_rate` и `joint_vel` вызывается **`modify_reward_weight`**: за **10000** шагов веса меняются к **$-0.1$** (более сильный штраф после разгона). Это влияет только на Dense вариант, где эти штрафы включены.
 
 ---
 
 ## 7. Sparse Lift-Cube (`Isaac-SO-ARM101-Lift-Cube-Sparse-v0`)
 
-Класс `**SoArm101LiftCubeSparseEnvCfg`**:
+Класс **`SoArm101LiftCubeSparseEnvCfg`**:
 
-- Плотные шейпы `**reaching_object**`, `**object_goal_tracking**`, `**object_goal_tracking_fine_grained**` — **вес 0** (отключены).
-- Остаётся `**lifting_object`** с весом **1.0** и $h_{\min}=0.025$.
-- Лёгкие штрафы `**action_rate`** / `**joint_vel**` остаются с $-10^{-4}$ (как в базовом Sparse описании в коде).
+- Плотные шейпы **`reaching_object`**, **`object_goal_tracking`**, **`object_goal_tracking_fine_grained`** — **вес 0** (отключены).
+- Остаётся **`lifting_object`** с весом **1.0** и $h_{\min}=0.025$.
+- Лёгкие штрафы **`action_rate`** / **`joint_vel`** остаются с $-10^{-4}$ (как в базовом Sparse описании в коде).
 
 Итого в типичном шаге доминирует **бинарный лифт** + маленькие регуляризаторы.
 
@@ -150,11 +150,11 @@ $$
 
 ## 8. Guided (trajectory) поверх Dense / Sparse
 
-Классы `**GuidedRewardsCfg`** добавляют:
+Классы **`GuidedRewardsCfg`** добавляют:
 
 ### 8.1. `trajectory_guidance`
 
-По выбранной из датасета **учительской** траектории EE и текущему времени эпизода считается дистанция $d_t = p_{\text{ee}}^{\text{student}} - p_{\text{ee}}^{\text{teacher}}(t)$ (после матчинга траектории к раскладке, см. `TrajectoryStore`).
+По выбранной из датасета **учительской** траектории EE и текущему времени эпизода считается дистанция $d_t = \|p_{\text{ee}}^{\text{student}} - p_{\text{ee}}^{\text{teacher}}(t)\|$ (после матчинга траектории к раскладке, см. `TrajectoryStore`).
 
 $$
 r_{\text{traj}} = 1 - \tanh\left(\frac{d_t}{\sigma_{\text{traj}}}\right), \quad \sigma_{\text{traj}} = 0.1
@@ -162,7 +162,7 @@ $$
 
 **Вес** $5.0$ (по умолчанию в конфиге).
 
-Путь к файлу траекторий: `**ISAAC_SO_ARM101_TRAJECTORY_FILE`** или дефолт  
+Путь к файлу траекторий: **`ISAAC_SO_ARM101_TRAJECTORY_FILE`** или дефолт  
 `isaac_so_arm101/logs/rsl_rl/teacher_trajectories/so101_lift_cube_teacher.pt` (относительно `cwd`).
 
 ### 8.2. `trajectory_guidance_debug_distance_over_std`
@@ -171,22 +171,22 @@ $$
 
 ### 8.3. `discriminator_guidance`
 
-В `**GuidedRewardsCfg`** **вес 0** — дискриминатор не грузится.
+В **`GuidedRewardsCfg`** **вес 0** — дискриминатор не грузится.
 
 ### Guided Sparse (`Isaac-SO-ARM101-Guided-Lift-Cube-Sparse-v0`)
 
-Наследует Sparse: плотные task-шейпы отключены, `**lifting_object`** вес **1.0**, `**action_rate`** / `**joint_vel**` и куррикулум для них **убраны** (`None`), плотный сигнал идёт от **trajectory_guidance** (+ слабый отладочный компонент награды для логов).
+Наследует Sparse: плотные task-шейпы отключены, **`lifting_object`** вес **1.0**, **`action_rate`** / **`joint_vel`** и куррикулум для них **убраны** (`None`), плотный сигнал идёт от **trajectory_guidance** (+ слабый отладочный компонент награды для логов).
 
 ---
 
 ## 9. Guided Sparse + Discriminator (`Isaac-SO-ARM101-Guided-Lift-Cube-Sparse-Discriminator-v0`)
 
-Используется `**GuidedDiscriminatorRewardsCfg`**: компоненты **trajectory guidance** с **весом 0**, активен `**discriminator_guidance`** (обучаемый лог $D$ по переходам EE; детали и сглаживание — в docstring `discriminator_guidance_reward` в `mdp/rewards.py`). Нужен файл дискриминатора:
+Используется **`GuidedDiscriminatorRewardsCfg`**: компоненты **trajectory guidance** с **весом 0**, активен **`discriminator_guidance`** (обучаемый лог $D$ по переходам EE; детали и сглаживание — в docstring `discriminator_guidance_reward` в `mdp/rewards.py`). Нужен файл дискриминатора:
 
-- `**ISAAC_SO_ARM101_TRAJECTORY_DISCRIMINATOR_FILE**` или дефолт  
+- **`ISAAC_SO_ARM101_TRAJECTORY_DISCRIMINATOR_FILE`** или дефолт  
 `isaac_so_arm101/logs/rsl_rl/teacher_trajectories/trajectory_discriminator_lift_cube.pt`.
 
-Плюс событие `**DiscriminatorDiagnosticsEventCfg**` — сброс метрик в `extras['log']` для TensorBoard.
+Плюс событие **`DiscriminatorDiagnosticsEventCfg`** — сброс метрик в `extras['log']` для TensorBoard.
 
 ---
 
@@ -194,8 +194,8 @@ $$
 
 Из `TerminationsCfg` (`lift_env_cfg.py`):
 
-- `**time_out**`: окончание по времени эпизода.
-- `**object_dropping**`: высота объекта ниже **-0.05** м (`root_height_below_minimum`).
+- **`time_out`**: окончание по времени эпизода.
+- **`object_dropping`**: высота объекта ниже **-0.05** м (`root_height_below_minimum`).
 
 ---
 
@@ -218,9 +218,9 @@ $$
 
 ## 12. Скрипты: обучение и инференс (RSL-RL)
 
-Запуск из каталога проекта в контейнере обычно `**/workspace/isaac-bridge`**, через `**isaaclab**` (или `./isaaclab.sh` из корня Isaac Lab).
+Запуск из каталога проекта в контейнере обычно **`/workspace/isaac-bridge`**, через **`isaaclab`** (или `./isaaclab.sh` из корня Isaac Lab).
 
-Логи по умолчанию: `**isaac_so_arm101/logs/rsl_rl/<experiment_name>/**` (см. `scripts/rsl_rl/log_paths.py`). Переменная `**ISAAC_SO_ARM101_RSL_RL_LOG_ROOT**` переопределяет корень.
+Логи по умолчанию: **`isaac_so_arm101/logs/rsl_rl/<experiment_name>/`** (см. `scripts/rsl_rl/log_paths.py`). Переменная **`ISAAC_SO_ARM101_RSL_RL_LOG_ROOT`** переопределяет корень.
 
 ### 12.1. Обучение PPO (в т.ч. Sparse / Guided)
 
@@ -249,7 +249,7 @@ isaaclab -p -m isaac_so_arm101.scripts.rsl_rl.play \
 
 ### 13.1. Чекпоинт «учителя» (dense lift-cube)
 
-Обучите `**Isaac-SO-ARM101-Lift-Cube-v0**` (или другой совместимый teacher-task), возьмите `model_*.pt` из `isaac_so_arm101/logs/rsl_rl/.../`.
+Обучите **`Isaac-SO-ARM101-Lift-Cube-v0`** (или другой совместимый teacher-task), возьмите `model_*.pt` из `isaac_so_arm101/logs/rsl_rl/.../`.
 
 ### 13.2. Датасет траекторий EE (`so101_lift_cube_teacher.pt`)
 
