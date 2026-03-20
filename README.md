@@ -180,10 +180,12 @@ JSON schema (Euler degrees are converted to quaternion at launch):
 
 ```json
 {
-  "camera_top": { "translate": [0.06488, 0.00395, 1.06841], "orient": [-3.732, -5.338, -89.595], "convention": "world" },
+  "camera_top": { "translate": [0.06488, 0.00395, 1.06841], "orient": [-3.732, -5.338, -89.595], "euler_mode": "ui", "convention": "opengl" },
   "camera_wrist": { "translate": [0.00165, 0.10846, -0.02989], "orient": [-49.519, -10.504, -4.027], "convention": "opengl" }
 }
 ```
+
+If you paste rotation values directly from Isaac Sim's Transform panel, set `"euler_mode": "ui"` for that camera.
 
 The script uses a default rename map so that top/wrist images map to `camera1`/`camera2` (with legacy side/up fallback), and the third slot is zeros (`--empty_cameras 1`). **Reach** and other tasks do not define cameras (see [Isaac Lab Camera](https://isaac-sim.github.io/IsaacLab/main/source/overview/core-concepts/sensors/camera.html) to add them).
 

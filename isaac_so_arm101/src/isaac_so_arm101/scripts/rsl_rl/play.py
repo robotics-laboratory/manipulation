@@ -13,7 +13,8 @@ import sys
 from isaaclab.app import AppLauncher
 
 # local imports
-import isaac_so_arm101.scripts.rsl_rl.cli_args as cli_args # isort: skip
+import isaac_so_arm101.scripts.rsl_rl.cli_args as cli_args  # isort: skip
+import isaac_so_arm101.scripts.rsl_rl.log_paths as log_paths  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -28,6 +29,12 @@ parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument(
+    "--disable_task_cameras",
+    action="store_true",
+    default=False,
+    help="Disable task camera sensors and image observation terms in the env config.",
+)
 parser.add_argument(
     "--use_pretrained_checkpoint",
     action="store_true",
@@ -69,7 +76,12 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+try:
+    # Isaac Lab RL utility path (current).
+    from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+except ImportError:
+    # Backward-compat path used by some older forks.
+    from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
 
@@ -79,6 +91,26 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
+
+
+def _disable_task_cameras_in_env_cfg(env_cfg):
+    """Disable lift-task cameras directly on a resolved env cfg instance."""
+    scene = getattr(env_cfg, "scene", None)
+    if scene is not None:
+        if hasattr(scene, "camera_top"):
+            scene.camera_top = None
+        if hasattr(scene, "camera_wrist"):
+            scene.camera_wrist = None
+
+    observations = getattr(env_cfg, "observations", None)
+    image_group = getattr(observations, "observation", None) if observations is not None else None
+    if image_group is not None:
+        for image_term in ("images_top", "images_wrist", "images_side", "images_up"):
+            if hasattr(image_group, image_term):
+                setattr(image_group, image_term, None)
+
+    if hasattr(env_cfg, "image_obs_list"):
+        env_cfg.image_obs_list = []
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -96,10 +128,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.disable_task_cameras and hasattr(env_cfg, "disable_task_cameras"):
+        env_cfg.disable_task_cameras = True
+    if args_cli.disable_task_cameras:
+        _disable_task_cameras_in_env_cfg(env_cfg)
 
     # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
+    log_root_path = log_paths.rsl_rl_experiment_dir(agent_cfg.experiment_name)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     if args_cli.use_pretrained_checkpoint:
         resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)

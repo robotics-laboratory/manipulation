@@ -102,6 +102,30 @@ class SoArm100LiftCubeEnvCfg_PLAY(SoArm100LiftCubeEnvCfg):
 
 
 @configclass
+class SoArm100TargetCubeEnvCfg(SoArm100LiftCubeEnvCfg):
+    """Variant of lift where target-point tracking is prioritized over pure lifting."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Keep a tiny lift incentive to pick the cube, but prioritize target tracking.
+        self.rewards.lifting_object.weight = 2.0
+        self.rewards.object_goal_tracking.weight = 28.0
+        self.rewards.object_goal_tracking_fine_grained.weight = 14.0
+        # Lower gate so goal-tracking reward activates earlier once grasped.
+        self.rewards.object_goal_tracking.params["minimal_height"] = 0.01
+        self.rewards.object_goal_tracking_fine_grained.params["minimal_height"] = 0.01
+
+
+@configclass
+class SoArm100TargetCubeEnvCfg_PLAY(SoArm100TargetCubeEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+
+
+@configclass
 class SoArm101LiftCubeEnvCfg(LiftEnvCfg):
     def __post_init__(self):
         # post init of parent
@@ -173,4 +197,58 @@ class SoArm101LiftCubeEnvCfg_PLAY(SoArm101LiftCubeEnvCfg):
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
         # disable randomization for play
+        self.observations.policy.enable_corruption = False
+
+
+@configclass
+class SoArm101LiftCubeSparseEnvCfg(SoArm101LiftCubeEnvCfg):
+    """Sparse-reward lift setup for VLA-like conditions.
+
+    Keeps only binary lifting success and tiny action regularization.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Disable dense shaping terms.
+        self.rewards.reaching_object.weight = 0.0
+        self.rewards.object_goal_tracking.weight = 0.0
+        self.rewards.object_goal_tracking_fine_grained.weight = 0.0
+        # Sparse success signal.
+        self.rewards.lifting_object.weight = 1.0
+        self.rewards.lifting_object.params["minimal_height"] = 0.025
+        # Keep light regularization.
+        self.rewards.action_rate.weight = -1e-4
+        self.rewards.joint_vel.weight = -1e-4
+
+
+@configclass
+class SoArm101LiftCubeSparseEnvCfg_PLAY(SoArm101LiftCubeSparseEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+
+
+@configclass
+class SoArm101TargetCubeEnvCfg(SoArm101LiftCubeEnvCfg):
+    """Variant of lift where target-point tracking is prioritized over pure lifting."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Keep a tiny lift incentive to pick the cube, but prioritize target tracking.
+        self.rewards.lifting_object.weight = 2.0
+        self.rewards.object_goal_tracking.weight = 28.0
+        self.rewards.object_goal_tracking_fine_grained.weight = 14.0
+        # Lower gate so goal-tracking reward activates earlier once grasped.
+        self.rewards.object_goal_tracking.params["minimal_height"] = 0.01
+        self.rewards.object_goal_tracking_fine_grained.params["minimal_height"] = 0.01
+
+
+@configclass
+class SoArm101TargetCubeEnvCfg_PLAY(SoArm101TargetCubeEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False

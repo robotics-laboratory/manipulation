@@ -299,6 +299,9 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
+    # If True, do not spawn task cameras and disable image observation terms.
+    # This is useful for state-only RL training where cameras are unnecessary.
+    disable_task_cameras: bool = False
 
     def __post_init__(self):
         """Post initialization."""
@@ -316,3 +319,12 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
         self.sim.physx.friction_correlation_distance = 0.00625
         self.image_obs_list = ["camera_top", "camera_wrist"]
+
+        if self.disable_task_cameras:
+            self.scene.camera_top = None
+            self.scene.camera_wrist = None
+            self.image_obs_list = []
+            self.observations.observation.images_top = None
+            self.observations.observation.images_wrist = None
+            self.observations.observation.images_side = None
+            self.observations.observation.images_up = None

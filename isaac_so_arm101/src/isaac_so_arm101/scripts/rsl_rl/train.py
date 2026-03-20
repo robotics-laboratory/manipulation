@@ -13,7 +13,8 @@ import sys
 from isaaclab.app import AppLauncher
 
 # local imports
-import isaac_so_arm101.scripts.rsl_rl.cli_args as cli_args # isort: skip
+import isaac_so_arm101.scripts.rsl_rl.cli_args as cli_args  # isort: skip
+import isaac_so_arm101.scripts.rsl_rl.log_paths as log_paths  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -27,6 +28,12 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument(
+    "--disable_task_cameras",
+    action="store_true",
+    default=False,
+    help="Disable task camera sensors and image observation terms in the env config.",
+)
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
@@ -92,6 +99,23 @@ from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
+
+def _sanitize_rsl_rl_policy_std(runner) -> None:
+    """Best-effort clamp of action-std / log-std after checkpoint load (rsl-rl versions differ)."""
+    pol = getattr(getattr(runner, "alg", None), "policy", None)
+    if pol is None:
+        return
+    with torch.no_grad():
+        for attr in ("log_std", "std", "noise_std", "action_std"):
+            p = getattr(pol, attr, None)
+            if isinstance(p, torch.nn.Parameter):
+                if "log" in attr:
+                    p.data.clamp_(-20.0, 5.0)
+                    p.data.copy_(torch.nan_to_num(p.data, nan=0.0, posinf=5.0, neginf=-20.0))
+                else:
+                    p.data.clamp_(min=1e-6)
+                    p.data.copy_(torch.nan_to_num(p.data, nan=1e-6, posinf=10.0, neginf=1e-6))
+
 import isaaclab_tasks  # noqa: F401
 import isaac_so_arm101.tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -103,6 +127,26 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def _disable_task_cameras_in_env_cfg(env_cfg):
+    """Disable lift-task cameras directly on a resolved env cfg instance."""
+    scene = getattr(env_cfg, "scene", None)
+    if scene is not None:
+        if hasattr(scene, "camera_top"):
+            scene.camera_top = None
+        if hasattr(scene, "camera_wrist"):
+            scene.camera_wrist = None
+
+    observations = getattr(env_cfg, "observations", None)
+    image_group = getattr(observations, "observation", None) if observations is not None else None
+    if image_group is not None:
+        for image_term in ("images_top", "images_wrist", "images_side", "images_up"):
+            if hasattr(image_group, image_term):
+                setattr(image_group, image_term, None)
+
+    if hasattr(env_cfg, "image_obs_list"):
+        env_cfg.image_obs_list = []
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -119,6 +163,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.disable_task_cameras and hasattr(env_cfg, "disable_task_cameras"):
+        env_cfg.disable_task_cameras = True
+    if args_cli.disable_task_cameras:
+        _disable_task_cameras_in_env_cfg(env_cfg)
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
         raise ValueError(
@@ -136,9 +184,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.seed = seed
         agent_cfg.seed = seed
 
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
+    # specify directory for logging experiments (under isaac_so_arm101/logs/rsl_rl for Docker bind-mount)
+    log_root_path = log_paths.rsl_rl_experiment_dir(agent_cfg.experiment_name)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
     # specify directory for logging runs: {time-stamp}_{run_name}
     log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -197,9 +244,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+        policy_cfg = getattr(agent_cfg, "policy", None)
+        if agent_cfg.resume and policy_cfg is not None and getattr(policy_cfg, "noise_std_type", "scalar") == "log":
+            print(
+                "[WARN] resume=True with policy.noise_std_type='log': if the checkpoint used **scalar** std, "
+                "weights may be incompatible → Normal.sample std errors. Prefer a **fresh** run (no resume) when "
+                "changing noise parametrization."
+            )
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        _sanitize_rsl_rl_policy_std(runner)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

@@ -4,8 +4,9 @@ Adapters: Isaac Lab obs/actions <-> SmolVLA policy I/O.
 
 from __future__ import annotations
 
-import numpy as np
 from typing import Any
+
+import numpy as np
 
 CAMERA_KEYS = ("observation.images.camera1", "observation.images.camera2", "observation.images.camera3")
 IMAGE_SHAPE = (3, 256, 256)
@@ -34,20 +35,27 @@ def _resize_to_chw(img: np.ndarray, target_hw: tuple[int, int] = (256, 256)) -> 
 
 def _gather_images(obs: dict[str, Any]) -> list[np.ndarray]:
     keys = (
-        "observation.images.camera1", "observation.images.camera2", "observation.images.camera3",
-        "observation.images.side", "observation.images.up",
-        "observation.images.top", "observation.images.wrist",
-        "observation.images_top", "observation.images_wrist",
-        "observation.images_side", "observation.images_up",
-        "rgb", "image",
+        "observation.images.camera1",
+        "observation.images.camera2",
+        "observation.images.camera3",
+        "observation.images.side",
+        "observation.images.up",
+        "observation.images.top",
+        "observation.images.wrist",
+        "observation.images_top",
+        "observation.images_wrist",
+        "observation.images_side",
+        "observation.images_up",
+        "rgb",
+        "image",
     )
     images = []
-    for k in keys:
-        if k not in obs or len(images) >= 3:
+    for key in keys:
+        if key not in obs or len(images) >= 3:
             continue
-        v = _to_numpy(obs[k])
-        if (v.ndim == 2 or (v.ndim == 3 and min(v.shape) >= 2)) and v.size > 0:
-            images.append(v)
+        value = _to_numpy(obs[key])
+        if (value.ndim == 2 or (value.ndim == 3 and min(value.shape) >= 2)) and value.size > 0:
+            images.append(value)
     return images
 
 
@@ -67,17 +75,13 @@ def isaac_obs_to_policy_frame(
     """
     Build a policy frame from Isaac env observation.
 
-    rename_map: maps env observation key -> policy key (e.g. {"observation.images.side": "observation.images.camera1",
-               "observation.images.up": "observation.images.camera2"}). Same semantics as LeRobot training --rename_map.
-    empty_cameras: number of trailing policy camera slots to fill with zeros (e.g. 1 for SmolVLA side+up+empty).
-    observation_state_size: if set, state is truncated/padded to this length to match the model's normalization.
+    rename_map maps env observation key -> policy key.
     """
     frame = {LANGUAGE_KEY: language_instruction, TASK_KEY: language_instruction}
     image_key_map = image_key_map or {}
     rename_map = rename_map or {}
 
     if rename_map:
-        # Build camera slots from env using rename_map (source -> target)
         for src_key, dst_key in rename_map.items():
             if src_key not in obs:
                 continue
@@ -85,16 +89,24 @@ def isaac_obs_to_policy_frame(
             if img.shape[0] == 1:
                 img = np.repeat(img, 3, axis=0)
             frame[dst_key] = np.expand_dims(img.astype(np.float32), axis=0)
-        # Fill trailing camera slots with zeros for empty_cameras
-        for i in range(empty_cameras):
-            slot = CAMERA_KEYS[2 - i]
-            frame[slot] = _empty_image_batch()
-        # Ensure all policy camera keys exist (fill any missing with zeros)
-        for k in CAMERA_KEYS:
-            if k not in frame:
-                frame[k] = _empty_image_batch()
+
+        has_any_image_key = any(k.startswith("observation.images.") for k in frame.keys())
+        present_camera_slots = [k for k in CAMERA_KEYS if k in frame]
+
+        # Base SmolVLA expects camera1/2/3 and often uses empty_cameras=0.
+        # If we have some camera slots but not all, duplicate the latest available
+        # image so all three slots are present and marked valid.
+        if empty_cameras <= 0 and present_camera_slots:
+            fallback = frame[present_camera_slots[-1]]
+            for key in CAMERA_KEYS:
+                if key not in frame:
+                    frame[key] = np.array(fallback, copy=True)
+
+        # If nothing image-like made it into the frame, keep one empty slot to avoid
+        # complete failure in downstream preprocessors.
+        if not has_any_image_key:
+            frame[CAMERA_KEYS[0]] = _empty_image_batch()
     else:
-        # Legacy: gather images by key order, use empty slots for trailing empty_cameras
         images = _gather_images(obs)
         if not images:
             images = [np.zeros((3, IMAGE_SHAPE[1], IMAGE_SHAPE[2]), dtype=np.float32)]
@@ -113,10 +125,20 @@ def isaac_obs_to_policy_frame(
         for src, dst in image_key_map.items():
             if src in frame and dst != src:
                 frame[dst] = frame.pop(src)
-    default_state_keys = ("joint_pos", "joint_positions", "obs", "observation.state", "proprio",
-                          "ee_pos", "ee_quat", "ee_pos_delta")
+
+    default_state_keys = (
+        "observation.state",
+        "joint_pos",
+        "joint_positions",
+        "proprio",
+        "obs",
+        "policy",
+        "ee_pos",
+        "ee_pos_delta",
+        "ee_quat",
+    )
     keys = state_keys if state_keys else default_state_keys
-    state_parts = [np.asarray(obs[k]).flatten() for k in keys if k in obs]
+    state_parts = [_to_numpy(obs[k]).flatten() for k in keys if k in obs]
     state = np.concatenate(state_parts).astype(np.float32) if state_parts else np.zeros(0, dtype=np.float32)
     if observation_state_size is not None:
         n = observation_state_size

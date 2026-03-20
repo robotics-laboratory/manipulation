@@ -72,6 +72,21 @@ from camera_json_loader import apply_camera_json_to_env_cfg
 from camera_usd_loader import apply_camera_usd_to_env_cfg
 from env_wrapper import IsaacEEWrapper
 
+_CANONICAL_CAMERA_OBS_KEYS = {
+    "CameraTop": (
+        "observation.images.top",
+        "observation.images_top",
+        "observation.images.side",
+        "observation.images_side",
+    ),
+    "CameraWrist": (
+        "observation.images.wrist",
+        "observation.images_wrist",
+        "observation.images.up",
+        "observation.images_up",
+    ),
+}
+
 
 def _print_camera_offsets(env_cfg) -> None:
     scene = getattr(env_cfg, "scene", None)
@@ -139,6 +154,17 @@ def _to_uint8_rgb(img: np.ndarray, env_index: int = 0) -> np.ndarray:
     return img
 
 
+def _pick_camera_observation_keys(flat_obs: dict) -> dict[str, str]:
+    """Pick one observation key per canonical camera name."""
+    selected = {}
+    for camera_name, candidates in _CANONICAL_CAMERA_OBS_KEYS.items():
+        for key in candidates:
+            if key in flat_obs and _is_image_array(flat_obs[key]):
+                selected[camera_name] = key
+                break
+    return selected
+
+
 def main():
     task_id = args_cli.task
     reg = gym.envs.registry
@@ -177,21 +203,28 @@ def main():
         print("PIL not found. Install with: pip install Pillow", file=sys.stderr)
         sys.exit(1)
 
+    selected_keys = _pick_camera_observation_keys(flat)
     saved = 0
-    for key, value in flat.items():
-        if not _is_image_array(value):
+    for camera_name in ("CameraTop", "CameraWrist"):
+        key = selected_keys.get(camera_name)
+        if key is None:
             continue
+        value = flat[key]
         img = _to_uint8_rgb(value, env_index)
-        safe_name = key.replace(".", "_").replace(" ", "_")
-        path = out_dir / f"{safe_name}.png"
+        path = out_dir / f"{camera_name}.png"
         Image.fromarray(img).save(path)
-        print(f"  Saved {path} ({img.shape[0]}x{img.shape[1]})")
+        print(f"  Saved {camera_name} from '{key}' -> {path} ({img.shape[0]}x{img.shape[1]})")
         saved += 1
 
     env.close()
     if saved == 0:
         print("[save_env_cameras] No image observations found. Ensure the task has cameras and --enable_cameras is set.")
         print("  Observation keys:", list(flat.keys()))
+    elif saved < 2:
+        missing = [name for name in ("CameraTop", "CameraWrist") if name not in selected_keys]
+        print(f"[save_env_cameras] Warning: missing camera observations for {missing}")
+        print(f"[save_env_cameras] Available image-like keys: {[k for k, v in flat.items() if _is_image_array(v)]}")
+        print(f"[save_env_cameras] Done. Saved {saved} image(s) to {out_dir.absolute()}")
     else:
         print(f"[save_env_cameras] Done. Saved {saved} image(s) to {out_dir.absolute()}")
 
