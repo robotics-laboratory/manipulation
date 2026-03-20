@@ -7,13 +7,13 @@
 ## 1. Архитектура конфигов
 
 
-| Файл                              | Назначение                                                                                                                                 |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Файл                              | Назначение                                                                                                                               |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `tasks/lift/lift_env_cfg.py`      | Базовый **LiftEnvCfg**: сцена (стол, свет, камеры), команды, действия, **наблюдения**, **награды** по умолчанию, терминации, куррикулум. |
-| `tasks/lift/joint_pos_env_cfg.py` | Конкретные таски SO-101: робот **SO_ARM101**, joint-position действия, куб, `ee_frame`, варианты **Dense / Sparse / Play**.                |
-| `tasks/lift/guided_env_cfg.py`    | Варианты **Guided** (trajectory / discriminator) поверх joint-pos конфигов.                                                                |
-| `tasks/lift/mdp/rewards.py`       | Реализации наград, в т.ч. trajectory / discriminator guidance.                                                                             |
-| `tasks/lift/__init__.py`          | Регистрация Gym ID → `env_cfg_entry_point` + `rsl_rl_cfg_entry_point`.                                                                     |
+| `tasks/lift/joint_pos_env_cfg.py` | Конкретные таски SO-101: робот **SO_ARM101**, joint-position действия, куб, `ee_frame`, варианты **Dense / Sparse / Play**.              |
+| `tasks/lift/guided_env_cfg.py`    | Варианты **Guided** (trajectory / discriminator) поверх joint-pos конфигов.                                                              |
+| `tasks/lift/mdp/rewards.py`       | Реализации наград, в т.ч. trajectory / discriminator guidance.                                                                           |
+| `tasks/lift/__init__.py`          | Регистрация Gym ID → `env_cfg_entry_point` + `rsl_rl_cfg_entry_point`.                                                                   |
 
 
 При `gym.make("Isaac-…-v0")` Isaac Lab по строке `env_cfg_entry_point` **импортирует класс** конфига и строит `ManagerBasedRLEnv` по этому `cfg`.
@@ -175,7 +175,7 @@ $$
 
 ### Guided Sparse (`Isaac-SO-ARM101-Guided-Lift-Cube-Sparse-v0`)
 
-Наследует Sparse: плотные task-шейпы отключены, `**lifting_object`** вес **1.0**, `**action_rate` / `joint_vel`** и куррикулум для них **убраны** (`None`), плотный сигнал идёт от **trajectory_guidance** (+ слабый отладочный компонент награды для логов).
+Наследует Sparse: плотные task-шейпы отключены, `**lifting_object`** вес **1.0**, `**action_rate`** / `**joint_vel**` и куррикулум для них **убраны** (`None`), плотный сигнал идёт от **trajectory_guidance** (+ слабый отладочный компонент награды для логов).
 
 ---
 
