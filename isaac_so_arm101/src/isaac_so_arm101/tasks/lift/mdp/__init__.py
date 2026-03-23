@@ -12,6 +12,10 @@
 
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
-from .observations import *  # noqa: F401, F403
+# Import local ``rewards`` before ``observations``: star-import above binds ``rewards`` to
+# ``isaaclab.envs.mdp.rewards``; loading our ``rewards.py`` first overwrites that so
+# ``observations.py``'s ``from . import rewards`` resolves to this package.
 from .rewards import *  # noqa: F401, F403
+from .events import *  # noqa: F401, F403
+from .observations import *  # noqa: F401, F403
 from .terminations import *  # noqa: F401, F403

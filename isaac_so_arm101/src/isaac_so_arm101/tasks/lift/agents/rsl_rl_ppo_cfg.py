@@ -46,5 +46,12 @@ class LiftCubePPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class FixedLayoutLiftCubePPORunnerCfg(LiftCubePPORunnerCfg):
+    """Same hyperparameters as :class:`LiftCubePPORunnerCfg`; separate log folder for fixed-layout tasks."""
+
+    experiment_name = "lift_fixed_layout"
+
+
+@configclass
 class TargetCubePPORunnerCfg(LiftCubePPORunnerCfg):
     experiment_name = "target_cube"

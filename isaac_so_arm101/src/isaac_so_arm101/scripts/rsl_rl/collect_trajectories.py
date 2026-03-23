@@ -110,6 +110,12 @@ def _current_signals(base_env):
     return ee_pos_w, object_pos_w, goal_pos_w
 
 
+def _gripper_joint_pos(base_env, gripper_joint_idx: int) -> torch.Tensor:
+    """Gripper joint position (rad), shape ``(num_envs,)``. Matches SO-101 lift config (0 closed, 0.5 open)."""
+    robot = base_env.scene["robot"]
+    return robot.data.joint_pos[:, gripper_joint_idx]
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -148,33 +154,54 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.load(str(checkpoint_path))
     policy = runner.get_inference_policy(device=base_env.device)
 
+    robot = base_env.scene["robot"]
+    gripper_ids, gripper_names = robot.find_joints("gripper")
+    if len(gripper_ids) != 1:
+        raise RuntimeError(f"Expected exactly one 'gripper' joint, got {gripper_names!r}")
+    gripper_joint_idx = gripper_ids[0]
+    print(f"[INFO] Recording gripper joint index {gripper_joint_idx} ({gripper_names[0]!r})")
+
     num_envs = env.num_envs
     active_ee = [[] for _ in range(num_envs)]
+    active_gripper = [[] for _ in range(num_envs)]
     active_initial_object_pos = [None for _ in range(num_envs)]
+    active_initial_object_pos_local = [None for _ in range(num_envs)]
     active_goal_pos = [None for _ in range(num_envs)]
+    active_goal_pos_local = [None for _ in range(num_envs)]
     active_max_height = torch.full((num_envs,), -1.0e9, dtype=torch.float32, device=base_env.device)
     active_min_goal_dist = torch.full((num_envs,), 1.0e9, dtype=torch.float32, device=base_env.device)
     use_goal_distance_for_success = "target-cube" in args_cli.task.lower()
 
     obs = env.get_observations()
     _, object_pos_w, goal_pos_w = _current_signals(base_env)
+    env_origins = base_env.scene.env_origins[:, :3]
     for env_id in range(num_envs):
         active_initial_object_pos[env_id] = object_pos_w[env_id].detach().cpu().to(torch.float32)
+        active_initial_object_pos_local[env_id] = (object_pos_w[env_id] - env_origins[env_id]).detach().cpu().to(
+            torch.float32
+        )
         active_goal_pos[env_id] = goal_pos_w[env_id].detach().cpu().to(torch.float32)
+        active_goal_pos_local[env_id] = (goal_pos_w[env_id] - env_origins[env_id]).detach().cpu().to(torch.float32)
 
     collected_initial_object_pos: list[torch.Tensor] = []
+    collected_initial_object_pos_local: list[torch.Tensor] = []
     collected_goal_pos: list[torch.Tensor] = []
+    collected_goal_pos_local: list[torch.Tensor] = []
+    collected_initial_ee_pos_local: list[torch.Tensor] = []
     collected_ee_traj: list[torch.Tensor] = []
+    collected_gripper_traj: list[torch.Tensor] = []
     collected_lengths: list[int] = []
     collected_success: list[bool] = []
 
     while len(collected_ee_traj) < args_cli.num_episodes and simulation_app.is_running():
         ee_pos_w, object_pos_w, goal_pos_w = _current_signals(base_env)
+        gripper_pos = _gripper_joint_pos(base_env, gripper_joint_idx)
         goal_dist = torch.norm(object_pos_w - goal_pos_w, dim=1)
         active_max_height = torch.maximum(active_max_height, object_pos_w[:, 2])
         active_min_goal_dist = torch.minimum(active_min_goal_dist, goal_dist)
         for env_id in range(num_envs):
             active_ee[env_id].append(ee_pos_w[env_id].detach().cpu().to(torch.float32))
+            active_gripper[env_id].append(gripper_pos[env_id].detach().cpu().to(torch.float32))
 
         with torch.inference_mode():
             actions = policy(obs)
@@ -198,15 +225,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
                 if args_cli.keep_failed or is_success:
                     collected_initial_object_pos.append(active_initial_object_pos[env_id])
+                    collected_initial_object_pos_local.append(active_initial_object_pos_local[env_id])
                     collected_goal_pos.append(active_goal_pos[env_id])
+                    collected_goal_pos_local.append(active_goal_pos_local[env_id])
+                    # First EE sample of the episode (env-local) — used at reset for IK to teacher start.
+                    collected_initial_ee_pos_local.append(
+                        (traj[0] - env_origins[env_id].detach().cpu()).to(torch.float32)
+                    )
                     collected_ee_traj.append(torch.stack(traj, dim=0))
+                    collected_gripper_traj.append(torch.stack(active_gripper[env_id], dim=0))
                     collected_lengths.append(len(traj))
                     collected_success.append(is_success)
 
                 _, next_object_pos_w, next_goal_pos_w = _current_signals(base_env)
                 active_initial_object_pos[env_id] = next_object_pos_w[env_id].detach().cpu().to(torch.float32)
+                active_initial_object_pos_local[env_id] = (next_object_pos_w[env_id] - env_origins[env_id]).detach().cpu().to(
+                    torch.float32
+                )
                 active_goal_pos[env_id] = next_goal_pos_w[env_id].detach().cpu().to(torch.float32)
+                active_goal_pos_local[env_id] = (next_goal_pos_w[env_id] - env_origins[env_id]).detach().cpu().to(
+                    torch.float32
+                )
                 active_ee[env_id] = []
+                active_gripper[env_id] = []
                 active_max_height[env_id] = -1.0e9
                 active_min_goal_dist[env_id] = 1.0e9
 
@@ -220,13 +261,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     max_len = max(collected_lengths)
     padded = torch.zeros((len(collected_ee_traj), max_len, 3), dtype=torch.float32)
+    padded_gripper = torch.zeros((len(collected_gripper_traj), max_len), dtype=torch.float32)
     for i, traj in enumerate(collected_ee_traj):
         padded[i, : traj.shape[0], :] = traj
+    for i, gtraj in enumerate(collected_gripper_traj):
+        padded_gripper[i, : gtraj.shape[0]] = gtraj
 
     dataset = {
         "initial_object_pos": torch.stack(collected_initial_object_pos, dim=0),
         "goal_pos": torch.stack(collected_goal_pos, dim=0),
+        "initial_object_pos_local": torch.stack(collected_initial_object_pos_local, dim=0),
+        "goal_pos_local": torch.stack(collected_goal_pos_local, dim=0),
+        "initial_ee_pos_local": torch.stack(collected_initial_ee_pos_local, dim=0),
         "ee_trajectories": padded,
+        "gripper_trajectories": padded_gripper,
         "trajectory_lengths": torch.tensor(collected_lengths, dtype=torch.long),
         "success": torch.tensor(collected_success, dtype=torch.bool),
         "meta": {
@@ -239,6 +287,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "success_minimal_height": float(args_cli.success_minimal_height),
             "use_goal_distance_for_success": bool(use_goal_distance_for_success),
             "keep_failed": bool(args_cli.keep_failed),
+            "has_gripper": True,
+            "gripper_semantics": "joint_pos_rad (0 closed, 0.5 open per BinaryJointPositionActionCfg)",
+            "has_local_layout": True,
+            "has_initial_ee_local": True,
+            "layout_note": "initial_*_local / goal_pos_local / initial_ee_pos_local are w.r.t. env_origin; "
+            "guided RL: row match by layout; EE aligned via IK at reset (not teacher joint replay).",
         },
     }
 

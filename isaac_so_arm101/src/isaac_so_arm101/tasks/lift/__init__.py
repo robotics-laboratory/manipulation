@@ -175,3 +175,64 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Fixed cube + fixed goal (aligned dense teacher → trajectory dataset → guided student)
+gym.register(
+    id="Isaac-SO-ARM101-FixedLayout-Lift-Cube-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.fixed_layout_env_cfg:SoArm101FixedLayoutLiftCubeEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FixedLayoutLiftCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-FixedLayout-Lift-Cube-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.fixed_layout_env_cfg:SoArm101FixedLayoutLiftCubeEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FixedLayoutLiftCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-FixedLayout-Lift-Cube-Sparse-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.fixed_layout_env_cfg:SoArm101FixedLayoutLiftCubeSparseEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FixedLayoutLiftCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-FixedLayout-Lift-Cube-Sparse-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.fixed_layout_env_cfg:SoArm101FixedLayoutLiftCubeSparseEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FixedLayoutLiftCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-FixedLayout-Guided-Lift-Cube-Sparse-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.fixed_layout_env_cfg:SoArm101FixedLayoutGuidedLiftCubeSparseEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_guided_ppo_cfg:FixedLayoutGuidedLiftCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-FixedLayout-Guided-Lift-Cube-Sparse-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.fixed_layout_env_cfg:SoArm101FixedLayoutGuidedLiftCubeSparseEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_guided_ppo_cfg:FixedLayoutGuidedLiftCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)

@@ -3,6 +3,8 @@
 Chronological notes on RL / transfer runs: what we tried, how it was configured, and what we learned.  
 **Path:** `manipulation/docs/EXPERIMENTS.md` (versioned in git).
 
+**References:** curated papers — [`KEY_PAPERS.md`](KEY_PAPERS.md); sparse reward deep dive — [`SPARSE_REWARD.md`](SPARSE_REWARD.md).
+
 ---
 
 ## How to add an entry

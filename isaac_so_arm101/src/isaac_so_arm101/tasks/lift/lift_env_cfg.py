@@ -302,6 +302,9 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     # If True, do not spawn task cameras and disable image observation terms.
     # This is useful for state-only RL training where cameras are unnecessary.
     disable_task_cameras: bool = False
+    # If set, trajectory-guided rewards skip ``TrajectoryStore.match`` and use this dataset row index
+    # (same teacher polyline for every env — e.g. fixed cube / fixed goal experiments).
+    trajectory_guidance_fixed_traj_index: int | None = None
 
     def __post_init__(self):
         """Post initialization."""

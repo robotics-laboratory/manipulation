@@ -21,7 +21,7 @@ import os
 
 
 def rsl_rl_root() -> str:
-    """Parent directory of per-experiment folders (``lift/``, ``guided_lift_cube/``, ...)."""
+    """Parent directory of per-experiment folders (``lift/``, ``lift_fixed_layout/``, ``guided_lift_cube/``, ...)."""
     return os.environ.get(
         "ISAAC_SO_ARM101_RSL_RL_LOG_ROOT",
         os.path.join("isaac_so_arm101", "logs", "rsl_rl"),

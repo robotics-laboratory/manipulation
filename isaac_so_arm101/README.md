@@ -58,6 +58,11 @@ Evaluate a trained policy.
 uv run play --task SO-ARM100-Reach-Play-v0
 ```
 
+## Trajectory-guided lift (teacher polylines)
+
+Trajectory datasets, reset ordering (`post_command_reset`), and layout snapping are documented in
+[`docs/TRAJECTORY_DATASET.md`](docs/TRAJECTORY_DATASET.md).
+
 ## Sim2Real Transfer
 
 _Work in progress._

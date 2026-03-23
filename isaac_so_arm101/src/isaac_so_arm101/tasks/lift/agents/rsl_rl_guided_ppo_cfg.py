@@ -10,6 +10,13 @@ class GuidedLiftCubePPORunnerCfg(LiftCubePPORunnerCfg):
 
 
 @configclass
+class FixedLayoutGuidedLiftCubePPORunnerCfg(GuidedLiftCubePPORunnerCfg):
+    """Same as :class:`GuidedLiftCubePPORunnerCfg`; logs under ``guided_lift_cube_fixed_layout/``."""
+
+    experiment_name = "guided_lift_cube_fixed_layout"
+
+
+@configclass
 class GuidedDiscriminatorLiftCubePPORunnerCfg(LiftCubePPORunnerCfg):
     """PPO settings tuned for discriminator-shaped rewards (avoid critic/actor blow-up)."""
 

@@ -111,6 +111,10 @@ def _trajectory_goal_pos_w(env: ManagerBasedRLEnv, command_name: str, robot_cfg:
 def _get_or_create_trajectory_state(env: ManagerBasedRLEnv, trajectory_file: str):
     state = getattr(env, "_trajectory_guidance_state", None)
     if state is not None and state.get("trajectory_file") == trajectory_file:
+        if "last_progress" not in state:
+            state["last_progress"] = torch.zeros((env.num_envs,), dtype=torch.float32, device=env.device)
+        if "path_milestone_max" not in state:
+            state["path_milestone_max"] = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
         return state
 
     store = TrajectoryStore(path=trajectory_file, device=str(env.device))
@@ -119,35 +123,176 @@ def _get_or_create_trajectory_state(env: ManagerBasedRLEnv, trajectory_file: str
         "store": store,
         "traj_indices": torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device),
         "last_episode_length": torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device),
+        "last_progress": torch.zeros((env.num_envs,), dtype=torch.float32, device=env.device),
+        "path_milestone_max": torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device),
     }
     setattr(env, "_trajectory_guidance_state", state)
     return state
 
 
-def trajectory_guidance_reward(
+def _resolve_gripper_joint_idx(env: ManagerBasedRLEnv, robot_cfg: SceneEntityCfg) -> int:
+    cache_key = "_so101_gripper_joint_idx"
+    if hasattr(env, cache_key):
+        return int(getattr(env, cache_key))
+    robot = env.scene[robot_cfg.name]
+    ids, names = robot.find_joints("gripper")
+    if len(ids) != 1:
+        raise RuntimeError(f"Expected one gripper joint, got {names!r}")
+    setattr(env, cache_key, int(ids[0]))
+    return int(ids[0])
+
+
+def _student_gripper_pos(env: ManagerBasedRLEnv, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    idx = _resolve_gripper_joint_idx(env, robot_cfg)
+    robot = env.scene[robot_cfg.name]
+    return robot.data.joint_pos[:, idx]
+
+
+def _env_cfg_fixed_traj_index(env: ManagerBasedRLEnv) -> int | None:
+    """Optional ``trajectory_guidance_fixed_traj_index`` on env config (fixed-layout guided training)."""
+    cfg = getattr(env, "cfg", None)
+    if cfg is None:
+        return None
+    v = getattr(cfg, "trajectory_guidance_fixed_traj_index", None)
+    if v is None:
+        return None
+    return int(v)
+
+
+def _trajectory_guidance_ensure_matched(
     env: ManagerBasedRLEnv,
     trajectory_file: str,
-    std: float,
-    command_name: str = "object_pose",
-    match_mode: str = "object_goal",
-    exact_match_tol: float = 1.0e-3,
-    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
-) -> torch.Tensor:
-    """Reward alignment between student EE and matched teacher trajectory EE."""
-    distance = _trajectory_guidance_distance(
-        env=env,
-        trajectory_file=trajectory_file,
-        std=std,
-        command_name=command_name,
-        match_mode=match_mode,
-        exact_match_tol=exact_match_tol,
-        object_cfg=object_cfg,
-        robot_cfg=robot_cfg,
-        ee_frame_cfg=ee_frame_cfg,
+    command_name: str,
+    match_mode: str,
+    exact_match_tol: float,
+    object_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
+    ee_frame_cfg: SceneEntityCfg,
+) -> dict:
+    """Run trajectory matching and student EE once per sim step (shared by all guidance terms)."""
+    state = _get_or_create_trajectory_state(env, trajectory_file)
+    step_id = getattr(env, "_sim_step_counter", None)
+    if step_id is not None and state.get("trajectory_match_step_id") == step_id:
+        return state
+
+    store: TrajectoryStore = state["store"]
+    traj_indices = state["traj_indices"]
+    last_episode_length = state["last_episode_length"]
+    last_progress = state["last_progress"]
+    path_milestone_max = state["path_milestone_max"]
+
+    object_asset: RigidObject = env.scene[object_cfg.name]
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+    object_pos_w = object_asset.data.root_pos_w[:, :3]
+    goal_pos_w = _trajectory_goal_pos_w(env, command_name=command_name, robot_cfg=robot_cfg)
+    student_ee = ee_frame.data.target_pos_w[..., 0, :]
+    current_episode_length = env.episode_length_buf.to(dtype=torch.long)
+
+    fixed_traj_idx = _env_cfg_fixed_traj_index(env)
+
+    new_episode_mask = (traj_indices < 0) | (current_episode_length <= last_episode_length)
+    if torch.any(new_episode_mask):
+        reset_ids = new_episode_mask.nonzero(as_tuple=False).squeeze(-1)
+        if fixed_traj_idx is not None:
+            n_traj = store.initial_object_pos.shape[0]
+            idx = max(0, min(fixed_traj_idx, n_traj - 1))
+            traj_indices[reset_ids] = int(idx)
+        else:
+            origins = env.scene.env_origins[reset_ids, :3]
+            matched = store.match(
+                object_pos_w[reset_ids],
+                goal_pos_w[reset_ids],
+                mode=match_mode,
+                exact_tol=exact_match_tol,
+                env_origins=origins,
+            )
+            traj_indices[reset_ids] = matched
+        last_progress[reset_ids] = 0.0
+        path_milestone_max[reset_ids] = -1
+    last_episode_length[:] = current_episode_length
+
+    state["trajectory_match_step_id"] = step_id
+    state["student_ee_buf"] = student_ee
+    state["last_new_episode_mask"] = new_episode_mask.detach()
+    return state
+
+
+def _trajectory_guidance_get_cached_path_geometry(
+    env: ManagerBasedRLEnv,
+    trajectory_file: str,
+    command_name: str,
+    match_mode: str,
+    exact_match_tol: float,
+    object_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
+    ee_frame_cfg: SceneEntityCfg,
+) -> dict:
+    """Polyline projection + path-aligned teacher gripper, computed **once per sim step** (cached).
+
+    Shared by trajectory guidance rewards, gripper alignment reward, debug term, and observations
+    to avoid repeated ``project_ee_to_progress*`` / Python loops over envs.
+    """
+    state = _trajectory_guidance_ensure_matched(
+        env,
+        trajectory_file,
+        command_name,
+        match_mode,
+        exact_match_tol,
+        object_cfg,
+        robot_cfg,
+        ee_frame_cfg,
     )
-    return 1 - torch.tanh(distance / std)
+    step_id = getattr(env, "_sim_step_counter", None)
+    ck = "path_proj_step_id"
+    if (
+        step_id is not None
+        and state.get(ck) == step_id
+        and "proj_progress" in state
+        and "proj_lateral" in state
+        and "proj_arc_len" in state
+        and "proj_total_len" in state
+    ):
+        store: TrajectoryStore = state["store"]
+        return {
+            "state": state,
+            "store": store,
+            "progress": state["proj_progress"],
+            "lateral": state["proj_lateral"],
+            "arc_len": state["proj_arc_len"],
+            "total_len": state["proj_total_len"],
+            "teacher_gripper": state.get("proj_teacher_gripper"),
+            "has_gripper": store.has_gripper,
+        }
+
+    store = state["store"]
+    traj_indices = state["traj_indices"]
+    student_ee = state["student_ee_buf"]
+    progress, lateral, arc_len, total_len = store.project_ee_to_progress_detailed(student_ee, traj_indices)
+
+    teacher_g: torch.Tensor | None = None
+    if store.has_gripper:
+        lengths = store.trajectory_lengths[traj_indices].clamp(min=1)
+        t_align = torch.round(progress * (lengths - 1).to(dtype=torch.float32)).long().clamp(min=0)
+        teacher_g = store.get_gripper(traj_indices, t_align)
+
+    if step_id is not None:
+        state[ck] = step_id
+        state["proj_progress"] = progress
+        state["proj_lateral"] = lateral
+        state["proj_arc_len"] = arc_len
+        state["proj_total_len"] = total_len
+        state["proj_teacher_gripper"] = teacher_g
+
+    return {
+        "state": state,
+        "store": store,
+        "progress": progress,
+        "lateral": lateral,
+        "arc_len": arc_len,
+        "total_len": total_len,
+        "teacher_gripper": teacher_g,
+        "has_gripper": store.has_gripper,
+    }
 
 
 def _trajectory_guidance_distance(
@@ -161,50 +306,172 @@ def _trajectory_guidance_distance(
     robot_cfg: SceneEntityCfg,
     ee_frame_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Compute/cached teacher-student EE distance for the current sim step."""
-    state = _get_or_create_trajectory_state(env, trajectory_file)
-
-    # Cache to avoid recomputing distance if multiple reward terms are evaluated.
-    # `_sim_step_counter` is incremented inside the environment step.
+    """Time-synchronized teacher EE vs student EE distance (cached per step)."""
+    del std  # unused; kept for signature compatibility with reward term params
+    state = _trajectory_guidance_ensure_matched(
+        env,
+        trajectory_file,
+        command_name,
+        match_mode,
+        exact_match_tol,
+        object_cfg,
+        robot_cfg,
+        ee_frame_cfg,
+    )
     step_id = getattr(env, "_sim_step_counter", None)
-    if step_id is not None and state.get("last_compute_step_id") == step_id and "last_distance" in state:
-        return state["last_distance"]
+    if (
+        step_id is not None
+        and state.get("last_time_sync_distance_step_id") == step_id
+        and "last_time_sync_distance" in state
+    ):
+        return state["last_time_sync_distance"]
 
     store: TrajectoryStore = state["store"]
     traj_indices = state["traj_indices"]
-    last_episode_length = state["last_episode_length"]
-
-    object_asset: RigidObject = env.scene[object_cfg.name]
-    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    object_pos_w = object_asset.data.root_pos_w[:, :3]
-    goal_pos_w = _trajectory_goal_pos_w(env, command_name=command_name, robot_cfg=robot_cfg)
+    student_ee = state["student_ee_buf"]
     current_episode_length = env.episode_length_buf.to(dtype=torch.long)
 
-    new_episode_mask = (traj_indices < 0) | (current_episode_length <= last_episode_length)
-    if torch.any(new_episode_mask):
-        reset_ids = new_episode_mask.nonzero(as_tuple=False).squeeze(-1)
-        matched = store.match(
-            object_pos_w[reset_ids],
-            goal_pos_w[reset_ids],
-            mode=match_mode,
-            exact_tol=exact_match_tol,
-        )
-        traj_indices[reset_ids] = matched
-
     teacher_ee = store.get_ee_pos(traj_indices, timesteps=torch.clamp(current_episode_length - 1, min=0))
-    student_ee = ee_frame.data.target_pos_w[..., 0, :]
     distance = torch.norm(student_ee - teacher_ee, dim=1)
 
-    last_episode_length[:] = current_episode_length
-
-    # Cache for debug terms.
+    state["last_time_sync_distance_step_id"] = step_id
+    state["last_time_sync_distance"] = distance.detach()
     state["last_compute_step_id"] = step_id
-    state["last_distance"] = distance.detach()
-    state["last_new_episode_mask"] = new_episode_mask.detach()
     return distance
 
 
-def trajectory_guidance_debug_distance_over_std(
+def trajectory_guidance_reward(
+    env: ManagerBasedRLEnv,
+    trajectory_file: str,
+    std: float,
+    command_name: str = "object_pose",
+    match_mode: str = "object_goal",
+    exact_match_tol: float = 1.0e-3,
+    guidance_mode: str = "path_progress",
+    path_progress_delta_std: float = 0.05,
+    path_progress_scale: float = 1.0,
+    lateral_penalty_weight: float = 0.0,
+    lateral_std: float = 0.1,
+    only_forward_progress: bool = True,
+    backward_progress_penalty_weight: float = 0.0,
+    progress_lateral_gate: float | None = None,
+    num_path_milestones: int = 8,
+    max_milestone_jump: int = 1,
+    milestone_reward_scale: float = 1.0,
+    milestone_lateral_gate: float = 0.08,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+) -> torch.Tensor:
+    """Reward alignment with a matched teacher EE trajectory.
+
+    - ``time_sync``: same sim step index as the teacher recording — ``1 - tanh(||Δ||/std)``.
+    - ``path_progress``: reward **forward motion along the teacher polyline** (arc-length progress).
+    - ``path_progress_milestones``: ordered **milestones** along arc length; limits spatial shortcuts when
+      combined with ``milestone_lateral_gate`` and ``max_milestone_jump``.
+    """
+    if guidance_mode == "time_sync":
+        distance = _trajectory_guidance_distance(
+            env=env,
+            trajectory_file=trajectory_file,
+            std=std,
+            command_name=command_name,
+            match_mode=match_mode,
+            exact_match_tol=exact_match_tol,
+            object_cfg=object_cfg,
+            robot_cfg=robot_cfg,
+            ee_frame_cfg=ee_frame_cfg,
+        )
+        return 1.0 - torch.tanh(distance / std)
+
+    if guidance_mode not in ("path_progress", "path_progress_milestones"):
+        raise ValueError(f"Unknown guidance_mode: {guidance_mode}")
+
+    state = _trajectory_guidance_ensure_matched(
+        env,
+        trajectory_file,
+        command_name,
+        match_mode,
+        exact_match_tol,
+        object_cfg,
+        robot_cfg,
+        ee_frame_cfg,
+    )
+    step_id = getattr(env, "_sim_step_counter", None)
+    if (
+        step_id is not None
+        and state.get("last_path_reward_step_id") == step_id
+        and "path_reward" in state
+    ):
+        return state["path_reward"]
+
+    geom = _trajectory_guidance_get_cached_path_geometry(
+        env,
+        trajectory_file,
+        command_name,
+        match_mode,
+        exact_match_tol,
+        object_cfg,
+        robot_cfg,
+        ee_frame_cfg,
+    )
+    state = geom["state"]
+    last_progress = state["last_progress"]
+    path_milestone_max = state["path_milestone_max"]
+
+    progress = geom["progress"]
+    lateral = geom["lateral"]
+    arc_len = geom["arc_len"]
+    total_len = geom["total_len"]
+
+    if guidance_mode == "path_progress_milestones":
+        K = max(2, int(num_path_milestones))
+        bin_w = total_len / float(K)
+        eligible_bin = torch.floor(arc_len / (bin_w + 1.0e-8)).long().clamp(0, K - 1)
+        lateral_ok = lateral <= float(milestone_lateral_gate)
+        effective_eligible = torch.where(lateral_ok, eligible_bin, path_milestone_max)
+
+        cap = path_milestone_max + int(max_milestone_jump)
+        next_max = torch.minimum(effective_eligible, cap)
+        next_max = torch.maximum(next_max, path_milestone_max)
+
+        r = float(milestone_reward_scale) * (next_max - path_milestone_max).to(dtype=torch.float32)
+        path_milestone_max[:] = next_max
+        last_progress[:] = progress
+
+        state["last_path_reward_step_id"] = step_id
+        state["last_compute_step_id"] = step_id
+        state["path_reward"] = r.detach()
+        state["last_path_progress"] = progress.detach()
+        state["last_path_lateral"] = lateral.detach()
+        state["last_path_delta_raw"] = torch.zeros_like(progress)
+        return r
+
+    delta_raw = progress - last_progress
+    if progress_lateral_gate is not None:
+        gated = lateral <= float(progress_lateral_gate)
+        delta_raw = torch.where(gated, delta_raw, torch.zeros_like(delta_raw))
+    delta = torch.relu(delta_raw) if only_forward_progress else delta_raw
+
+    r = path_progress_scale * torch.tanh(delta / float(path_progress_delta_std))
+    if only_forward_progress and float(backward_progress_penalty_weight) > 0.0:
+        back = torch.relu(-delta_raw)
+        r = r - float(backward_progress_penalty_weight) * torch.tanh(back / float(path_progress_delta_std))
+    if lateral_penalty_weight > 0.0:
+        r = r - float(lateral_penalty_weight) * torch.tanh(lateral / float(lateral_std))
+
+    last_progress[:] = progress
+
+    state["last_path_reward_step_id"] = step_id
+    state["last_compute_step_id"] = step_id
+    state["path_reward"] = r.detach()
+    state["last_path_progress"] = progress.detach()
+    state["last_path_lateral"] = lateral.detach()
+    state["last_path_delta_raw"] = delta_raw.detach()
+    return r
+
+
+def teacher_gripper_alignment_reward(
     env: ManagerBasedRLEnv,
     trajectory_file: str,
     std: float,
@@ -215,22 +482,95 @@ def trajectory_guidance_debug_distance_over_std(
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
 ) -> torch.Tensor:
-    """Debug signal: (||student_ee - teacher_ee|| / std).
+    """Match student gripper joint to teacher gripper at path-aligned time index.
 
-    This should ideally decrease as the policy learns to follow the teacher trajectory.
+    Teacher index ``t = round(progress * (T-1))`` where ``progress`` comes from EE projection on the
+    polyline. If the dataset has no ``gripper_trajectories``, returns zeros.
     """
-    distance = _trajectory_guidance_distance(
-        env=env,
-        trajectory_file=trajectory_file,
-        std=std,
-        command_name=command_name,
-        match_mode=match_mode,
-        exact_match_tol=exact_match_tol,
-        object_cfg=object_cfg,
-        robot_cfg=robot_cfg,
-        ee_frame_cfg=ee_frame_cfg,
+    geom = _trajectory_guidance_get_cached_path_geometry(
+        env,
+        trajectory_file,
+        command_name,
+        match_mode,
+        exact_match_tol,
+        object_cfg,
+        robot_cfg,
+        ee_frame_cfg,
     )
-    return distance / std
+    state = geom["state"]
+    step_id = getattr(env, "_sim_step_counter", None)
+    if (
+        step_id is not None
+        and state.get("last_gripper_reward_step_id") == step_id
+        and "gripper_reward" in state
+    ):
+        return state["gripper_reward"]
+
+    if not geom["has_gripper"] or geom["teacher_gripper"] is None:
+        z = torch.zeros((env.num_envs,), dtype=torch.float32, device=env.device)
+        state["gripper_reward"] = z
+        state["last_gripper_reward_step_id"] = step_id
+        return z
+
+    teacher_g = geom["teacher_gripper"]
+    student_g = _student_gripper_pos(env, robot_cfg)
+    err = torch.abs(student_g - teacher_g)
+    r = 1.0 - torch.tanh(err / float(std))
+
+    state["last_gripper_reward_step_id"] = step_id
+    state["last_compute_step_id"] = step_id
+    state["gripper_reward"] = r.detach()
+    return r
+
+
+def trajectory_guidance_debug_distance_over_std(
+    env: ManagerBasedRLEnv,
+    trajectory_file: str,
+    std: float,
+    command_name: str = "object_pose",
+    match_mode: str = "object_goal",
+    exact_match_tol: float = 1.0e-3,
+    guidance_mode: str = "path_progress",
+    lateral_std: float = 0.1,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+) -> torch.Tensor:
+    """Debug signal for trajectory guidance.
+
+    - ``time_sync``: ``norm(student_ee - teacher_ee(t)) / std`` (should shrink when tracking improves).
+    - ``path_progress``: **lateral distance to the teacher polyline** / ``lateral_std`` (off-path error;
+      uses cached tensors from the main reward when evaluated after it on the same step).
+    """
+    if guidance_mode == "time_sync":
+        distance = _trajectory_guidance_distance(
+            env=env,
+            trajectory_file=trajectory_file,
+            std=std,
+            command_name=command_name,
+            match_mode=match_mode,
+            exact_match_tol=exact_match_tol,
+            object_cfg=object_cfg,
+            robot_cfg=robot_cfg,
+            ee_frame_cfg=ee_frame_cfg,
+        )
+        return distance / std
+
+    if guidance_mode not in ("path_progress", "path_progress_milestones"):
+        raise ValueError(f"Unknown guidance_mode for debug: {guidance_mode}")
+
+    geom = _trajectory_guidance_get_cached_path_geometry(
+        env,
+        trajectory_file,
+        command_name,
+        match_mode,
+        exact_match_tol,
+        object_cfg,
+        robot_cfg,
+        ee_frame_cfg,
+    )
+    lateral = geom["lateral"]
+    return lateral / float(lateral_std)
 
 
 def _get_or_create_discriminator_state(env: ManagerBasedRLEnv, discriminator_file: str):
