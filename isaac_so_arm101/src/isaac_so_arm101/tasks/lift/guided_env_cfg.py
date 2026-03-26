@@ -82,7 +82,7 @@ class GuidedEEAlignEventCfg(EventCfg):
         params={
             "trajectory_file": _DEFAULT_TRAJECTORY_FILE,
             "max_envs_to_draw": 1,
-            "marker_radius": 0.01,
+            "marker_radius": 0.005,
             "subsample_step": 2,
         },
     )
@@ -113,7 +113,7 @@ class GuidedDiscriminatorEEAlignEventCfg(DiscriminatorDiagnosticsEventCfg):
         params={
             "trajectory_file": _DEFAULT_TRAJECTORY_FILE,
             "max_envs_to_draw": 1,
-            "marker_radius": 0.01,
+            "marker_radius": 0.005,
             "subsample_step": 2,
         },
     )
@@ -161,22 +161,6 @@ class GuidedRewardsCfg(RewardsCfg):
             "exact_match_tol": 5.0e-3,
         },
         weight=5.0,
-    )
-
-    # Debug: time_sync -> norm(student - teacher(t))/std; path_progress -> lateral distance to polyline / lateral_std.
-    # Shows up as `Episode_Reward/trajectory_guidance_debug_distance_over_std`.
-    trajectory_guidance_debug_distance_over_std = RewTerm(
-        func=mdp.trajectory_guidance_debug_distance_over_std,
-        params={
-            "trajectory_file": _DEFAULT_TRAJECTORY_FILE,
-            "std": 0.10,
-            "command_name": "object_pose",
-            "match_mode": "object_only",
-            "exact_match_tol": 5.0e-3,
-            "guidance_mode": "path_progress",
-            "lateral_std": 0.1,
-        },
-        weight=1.0e-3,
     )
 
     discriminator_guidance = RewTerm(
@@ -227,20 +211,6 @@ class GuidedDiscriminatorRewardsCfg(RewardsCfg):
             "command_name": "object_pose",
             "match_mode": "object_only",
             "exact_match_tol": 5.0e-3,
-        },
-        weight=0.0,
-    )
-
-    trajectory_guidance_debug_distance_over_std = RewTerm(
-        func=mdp.trajectory_guidance_debug_distance_over_std,
-        params={
-            "trajectory_file": _DEFAULT_TRAJECTORY_FILE,
-            "std": 0.10,
-            "command_name": "object_pose",
-            "match_mode": "object_only",
-            "exact_match_tol": 5.0e-3,
-            "guidance_mode": "path_progress",
-            "lateral_std": 0.1,
         },
         weight=0.0,
     )
@@ -301,12 +271,12 @@ class SoArm101GuidedLiftCubeSparseEnvCfg(SoArm101LiftCubeSparseEnvCfg):
         super().__post_init__()
         # Dense task rewards stay OFF (inherited from SoArm101LiftCubeSparseEnvCfg):
         #   reaching_object = 0, object_goal_tracking = 0, fine_grained = 0.
-        # Sparse task signal:
-        self.rewards.lifting_object.weight = 1.0
+        # Sparse task signal (main success objective — scale vs dense shaping):
+        self.rewards.lifting_object.weight = 100.0
         self.rewards.lifting_object.params["minimal_height"] = 0.025
-        # Trajectory guidance is the sole dense exploration hint:
-        self.rewards.trajectory_guidance.weight = 5.0
-        self.rewards.teacher_gripper_alignment.weight = 5.0
+        # Weak teacher dense shaping (no post-lift suppression — lift stays primary via weighting).
+        self.rewards.trajectory_guidance.weight = 0.35
+        self.rewards.teacher_gripper_alignment.weight = 0.35
         # Disable curriculum ramp — it dominates the path-progress signal.
         self.curriculum.action_rate = None
         self.curriculum.joint_vel = None
@@ -333,7 +303,7 @@ class SoArm101GuidedLiftCubeSparseDiscriminatorEnvCfg(SoArm101LiftCubeSparseEnvC
     def __post_init__(self):
         super().__post_init__()
         # Dense task rewards stay OFF (sparse base).
-        self.rewards.lifting_object.weight = 1.0
+        self.rewards.lifting_object.weight = 100.0
         self.rewards.lifting_object.params["minimal_height"] = 0.025
         self.curriculum.action_rate = None
         self.curriculum.joint_vel = None

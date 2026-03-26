@@ -297,29 +297,30 @@ def visualize_teacher_trajectory(
     marker_radius: float = 0.004,
     subsample_step: int = 2,
 ) -> None:
-    """Draw matched teacher EE trajectories as small spheres in the viewport.
+    """Draw color-coded teacher EE trajectories with a live projection marker.
 
-    Intended as a global-interval event (``mode="interval"``). Reads ``_trajectory_guidance_state``
-    populated by the reward manager — if it does not exist yet (first step), the call is a no-op.
+    Marker prototypes (indexed 0–3):
 
-    Trajectories are converted from the recording world frame to each training env's world frame
-    using the stored ``initial_ee_pos_local`` offsets, so the polyline appears at the correct
-    position even when training with many parallel envs.
+    * **0 — past** (gray): waypoints behind ``current_segment_idx - window``.
+    * **1 — window** (green): waypoints inside the active search window.
+    * **2 — future** (dim blue): waypoints ahead of the window.
+    * **3 — projection** (red, larger): polyline vertex closest to the student EE.
 
-    For performance, waypoints are subsampled (``subsample_step``) and only the first
-    ``max_envs_to_draw`` environments are visualized.  The marker positions are cached and only
-    recomputed when the matched trajectory index changes (i.e. after an episode reset).
+    Waypoint *positions* are cached per trajectory index (only recomputed on
+    episode reset).  Marker *colors* and the projection point are recomputed
+    every call so the visualization tracks the robot's live progress.
 
     Args:
         env: Vectorized RL environment.
         env_ids: Unused (global interval callback).
-        trajectory_file: Path to the teacher trajectory ``.pt`` dataset (must match the file
-            used by trajectory guidance rewards so that the shared state is found).
+        trajectory_file: Path to the teacher trajectory ``.pt`` dataset.
         max_envs_to_draw: Number of environments (starting from env 0) to visualize.
         marker_radius: Radius of the waypoint sphere markers (metres).
         subsample_step: Take every N-th waypoint to reduce marker count.
     """
     del env_ids
+
+    from isaac_so_arm101.tasks.lift.mdp.rewards import _TRAJECTORY_PROJ_WINDOW
 
     state = getattr(env, "_trajectory_guidance_state", None)
     if state is None or state.get("trajectory_file") != trajectory_file:
@@ -328,50 +329,111 @@ def visualize_teacher_trajectory(
     store = state["store"]
     traj_indices = state["traj_indices"]
     origin_delta = state["origin_delta"]
+    current_seg = state.get("current_segment_idx")
 
     n_draw = min(int(max_envs_to_draw), env.num_envs)
     if n_draw <= 0 or torch.all(traj_indices[:n_draw] < 0):
         return
 
+    # -- create markers on first call (4 prototypes) --
     vis_state = getattr(env, "_teacher_traj_vis_state", None)
     if vis_state is None:
         import isaaclab.sim as sim_utils
         from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
+        r = float(marker_radius)
         marker_cfg = VisualizationMarkersCfg(
             prim_path="/World/Visuals/TeacherTrajectory",
             markers={
-                "waypoint": sim_utils.SphereCfg(
-                    radius=float(marker_radius),
+                "past": sim_utils.SphereCfg(
+                    radius=r,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.5, 0.5)),
+                ),
+                "window": sim_utils.SphereCfg(
+                    radius=r * 1.3,
                     visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 1.0, 0.3)),
+                ),
+                "future": sim_utils.SphereCfg(
+                    radius=r * 0.8,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.3, 0.3, 0.6)),
+                ),
+                "projection": sim_utils.SphereCfg(
+                    radius=r * 2.5,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.15, 0.3)),
                 ),
             },
         )
         markers = VisualizationMarkers(marker_cfg)
-        vis_state = {"markers": markers, "last_traj_key": None}
+        vis_state = {"markers": markers, "last_traj_key": None, "cached_pts": None, "env_pt_counts": None}
         env._teacher_traj_vis_state = vis_state
 
     markers = vis_state["markers"]
-
-    traj_key = tuple(traj_indices[:n_draw].tolist())
-    if vis_state.get("last_traj_key") == traj_key:
-        return
-
     step = max(1, int(subsample_step))
-    all_waypoints: list[torch.Tensor] = []
-    for i in range(n_draw):
-        idx = int(traj_indices[i].item())
-        if idx < 0:
-            continue
-        tlen = int(store.trajectory_lengths[idx].item())
-        pts = store.ee_trajectories[idx, :tlen:step, :]
+    window = int(_TRAJECTORY_PROJ_WINDOW)
 
-        pts_world = pts + origin_delta[i].unsqueeze(0)
-        all_waypoints.append(pts_world)
+    # -- recompute waypoint positions only when matched trajectory changes --
+    traj_key = tuple(traj_indices[:n_draw].tolist())
+    if vis_state.get("last_traj_key") != traj_key:
+        all_waypoints: list[torch.Tensor] = []
+        env_pt_counts: list[int] = []
+        for i in range(n_draw):
+            idx = int(traj_indices[i].item())
+            if idx < 0:
+                env_pt_counts.append(0)
+                continue
+            tlen = int(store.trajectory_lengths[idx].item())
+            pts = store.ee_trajectories[idx, :tlen:step, :]
+            pts_world = pts + origin_delta[i].unsqueeze(0)
+            all_waypoints.append(pts_world)
+            env_pt_counts.append(pts_world.shape[0])
 
-    if len(all_waypoints) == 0:
+        if len(all_waypoints) == 0:
+            return
+
+        vis_state["cached_pts"] = torch.cat(all_waypoints, dim=0)
+        vis_state["env_pt_counts"] = env_pt_counts
+        vis_state["last_traj_key"] = traj_key
+
+    cached_pts = vis_state.get("cached_pts")
+    env_pt_counts = vis_state.get("env_pt_counts")
+    if cached_pts is None or env_pt_counts is None:
         return
 
-    all_pts = torch.cat(all_waypoints, dim=0)
-    markers.visualize(translations=all_pts)
-    vis_state["last_traj_key"] = traj_key
+    # -- compute per-waypoint color indices + projection point every call --
+    all_indices: list[int] = []
+    proj_pts: list[torch.Tensor] = []
+    offset = 0
+    for i in range(n_draw):
+        n_pts = env_pt_counts[i]
+        if n_pts == 0:
+            continue
+
+        seg = int(current_seg[i].item()) if current_seg is not None else 0
+        idx = int(traj_indices[i].item())
+        tlen = int(store.trajectory_lengths[idx].item())
+
+        for k in range(n_pts):
+            orig_seg = k * step
+            if orig_seg < seg - window:
+                all_indices.append(0)  # past
+            elif orig_seg > seg + window:
+                all_indices.append(2)  # future
+            else:
+                all_indices.append(1)  # window
+
+        # projection point: polyline vertex at current_segment_idx
+        proj_seg = min(seg, tlen - 1)
+        proj_pt = store.ee_trajectories[idx, proj_seg, :] + origin_delta[i]
+        proj_pts.append(proj_pt.unsqueeze(0))
+
+        offset += n_pts
+
+    if len(proj_pts) == 0:
+        return
+
+    proj_tensor = torch.cat(proj_pts, dim=0)
+    all_pts = torch.cat([cached_pts, proj_tensor], dim=0)
+    all_indices.extend([3] * proj_tensor.shape[0])
+
+    marker_indices = torch.tensor(all_indices, dtype=torch.int32, device=cached_pts.device)
+    markers.visualize(translations=all_pts, marker_indices=marker_indices)

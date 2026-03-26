@@ -191,17 +191,13 @@ $$
 
 В policy-вектор добавляется один терм **`teacher_gripper_cmd_and_close_hint`** (форма `N×2`): колонка 0 — целевое положение захвата учителя по пути, колонка 1 — бинарный признак «закрыть» (ниже порога `close_threshold`). Расчёт использует **общий кэш** проекции EE на полилинию с наградами траектории (одна проекция на шаг).
 
-### 8.2. `trajectory_guidance_debug_distance_over_std`
-
-**Вес** $10^{-3}$ (слабо влияет на обучение). В режимах `path_progress` / `path_progress_milestones` в лог уходит **латеральная** ошибка $\ell_t / \sigma_{\ell}$; в режиме `time_sync` — $d_t / \sigma$, как раньше.
-
-### 8.3. `discriminator_guidance`
+### 8.2. `discriminator_guidance`
 
 В **`GuidedRewardsCfg`** **вес 0** — дискриминатор не грузится.
 
 ### Guided Sparse (`Isaac-SO-ARM101-Guided-Lift-Cube-Sparse-v0`)
 
-Наследует Sparse: плотные task-шейпы отключены, **`lifting_object`** вес **1.0**. Лёгкие **`action_rate`** / **`joint_vel`** и куррикулум к ним **как в обычном Sparse** ($-10^{-4}$ → $-0.1$ по шагам), чтобы снизить дрожание; плотный сигнал идёт от **trajectory_guidance** (+ слабый отладочный компонент награды для логов).
+Наследует Sparse: плотные task-шейпы отключены, **`lifting_object`** вес **1.0**. Лёгкие **`action_rate`** / **`joint_vel`** и куррикулум к ним **как в обычном Sparse** ($-10^{-4}$ → $-0.1$ по шагам), чтобы снизить дрожание; плотный сигнал идёт от **trajectory_guidance** и **`teacher_gripper_alignment`** (актуальные веса см. `guided_env_cfg.py`).
 
 ---
 

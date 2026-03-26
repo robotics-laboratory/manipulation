@@ -92,7 +92,6 @@ def _patch_trajectory_file(env_cfg, trajectory_file: str) -> None:
     for term in (
         env_cfg.rewards.trajectory_guidance,
         env_cfg.rewards.teacher_gripper_alignment,
-        env_cfg.rewards.trajectory_guidance_debug_distance_over_std,
     ):
         if hasattr(term, "params") and "trajectory_file" in term.params:
             term.params["trajectory_file"] = trajectory_file
@@ -120,10 +119,10 @@ class SoArm101FixedLayoutGuidedLiftCubeSparseEnvCfg(SoArm101FixedLayoutLiftCubeS
         super().__post_init__()
         _patch_trajectory_file(self, _DEFAULT_FIXED_LAYOUT_TRAJECTORY_FILE)
         # Dense task rewards stay OFF (sparse base).
-        self.rewards.lifting_object.weight = 1.0
+        self.rewards.lifting_object.weight = 100.0
         self.rewards.lifting_object.params["minimal_height"] = 0.025
-        self.rewards.trajectory_guidance.weight = 5.0
-        self.rewards.teacher_gripper_alignment.weight = 5.0
+        self.rewards.trajectory_guidance.weight = 0.35
+        self.rewards.teacher_gripper_alignment.weight = 0.35
         self.curriculum.action_rate = None
         self.curriculum.joint_vel = None
 

@@ -305,6 +305,14 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     # If set, trajectory-guided rewards skip ``TrajectoryStore.match`` and use this dataset row index
     # (same teacher polyline for every env — e.g. fixed cube / fixed goal experiments).
     trajectory_guidance_fixed_traj_index: int | None = None
+    # When True, teacher trajectory / gripper dense rewards are zeroed after the object first exceeds
+    # ``lift_suppression_min_height`` (same condition as ``lifting_object``).
+    # Stored on env cfg so Hydra/from_dict cannot drop it from reward term kwargs (see ``mdp/rewards.py``).
+    suppress_dense_teacher_rewards_after_lift: bool = False
+    lift_suppression_min_height: float | None = None
+    # ``episode``: per-env — teacher dense off from first lift in that env until its episode reset.
+    # ``global``: first lift in **any** env disables teacher dense for **all** envs until the process exits.
+    suppress_dense_teacher_after_lift_scope: str = "episode"
 
     def __post_init__(self):
         """Post initialization."""

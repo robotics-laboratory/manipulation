@@ -119,6 +119,8 @@ def _get_or_create_trajectory_state(env: ManagerBasedRLEnv, trajectory_file: str
             state["origin_delta"] = torch.zeros((env.num_envs, 3), dtype=torch.float32, device=env.device)
         if "current_segment_idx" not in state:
             state["current_segment_idx"] = torch.zeros((env.num_envs,), dtype=torch.long, device=env.device)
+        if "dense_suppressed_after_lift" not in state:
+            state["dense_suppressed_after_lift"] = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
         return state
 
     store = TrajectoryStore(path=trajectory_file, device=str(env.device))
@@ -135,6 +137,8 @@ def _get_or_create_trajectory_state(env: ManagerBasedRLEnv, trajectory_file: str
         "origin_delta": torch.zeros((env.num_envs, 3), dtype=torch.float32, device=env.device),
         # Windowed projection: current segment index per env (prevents spatial shortcuts).
         "current_segment_idx": torch.zeros((env.num_envs,), dtype=torch.long, device=env.device),
+        # Once True, trajectory / gripper dense rewards are zeroed until episode reset (optional experiment).
+        "dense_suppressed_after_lift": torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device),
     }
     setattr(env, "_trajectory_guidance_state", state)
     return state
@@ -158,6 +162,23 @@ def _student_gripper_pos(env: ManagerBasedRLEnv, robot_cfg: SceneEntityCfg) -> t
     return robot.data.joint_pos[:, idx]
 
 
+def _resolve_dense_suppression_from_env_cfg(
+    env: ManagerBasedRLEnv,
+    suppress_dense_after_lift: bool,
+    lift_suppression_min_height: float,
+) -> tuple[bool, float]:
+    """Merge reward-term kwargs with env cfg flags (Hydra may omit kwargs → False defaults)."""
+    cfg = getattr(env, "cfg", None)
+    if cfg is None:
+        return suppress_dense_after_lift, lift_suppression_min_height
+    if getattr(cfg, "suppress_dense_teacher_rewards_after_lift", False):
+        suppress_dense_after_lift = True
+    mh = getattr(cfg, "lift_suppression_min_height", None)
+    if mh is not None:
+        lift_suppression_min_height = float(mh)
+    return suppress_dense_after_lift, lift_suppression_min_height
+
+
 def _env_cfg_fixed_traj_index(env: ManagerBasedRLEnv) -> int | None:
     """Optional ``trajectory_guidance_fixed_traj_index`` on env config (fixed-layout guided training)."""
     cfg = getattr(env, "cfg", None)
@@ -178,10 +199,41 @@ def _trajectory_guidance_ensure_matched(
     object_cfg: SceneEntityCfg,
     robot_cfg: SceneEntityCfg,
     ee_frame_cfg: SceneEntityCfg,
+    suppress_dense_after_lift: bool = False,
+    lift_suppression_min_height: float = 0.025,
 ) -> dict:
     """Run trajectory matching and student EE once per sim step (shared by all guidance terms)."""
     state = _get_or_create_trajectory_state(env, trajectory_file)
     step_id = getattr(env, "_sim_step_counter", None)
+
+    # When enabled: after ``object z > lift_suppression_min_height`` (same as ``lifting_object``), teacher
+    # dense rewards are masked. Scope ``episode`` = per-env until reset; ``global`` = any-env lift → all envs
+    # off for the rest of the training process. Must run before the early return below.
+    if suppress_dense_after_lift:
+        cfg = getattr(env, "cfg", None)
+        scope = getattr(cfg, "suppress_dense_teacher_after_lift_scope", "episode") if cfg is not None else "episode"
+        object_asset: RigidObject = env.scene[object_cfg.name]
+        object_pos_w = object_asset.data.root_pos_w[:, :3]
+        lifted = object_pos_w[:, 2] > float(lift_suppression_min_height)
+
+        if scope == "global":
+            if "global_teacher_dense_off" not in state:
+                state["global_teacher_dense_off"] = torch.tensor(False, dtype=torch.bool, device=env.device)
+            state["global_teacher_dense_off"] = state["global_teacher_dense_off"] | torch.any(lifted)
+            state["_teacher_dense_suppress_mask"] = state["global_teacher_dense_off"].expand(env.num_envs)
+        else:
+            if "dense_suppressed_after_lift" not in state:
+                state["dense_suppressed_after_lift"] = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+            current_episode_length = env.episode_length_buf.to(dtype=torch.long)
+            last_episode_length = state["last_episode_length"]
+            traj_indices = state["traj_indices"]
+            new_episode_mask = (traj_indices < 0) | (current_episode_length <= last_episode_length)
+            if torch.any(new_episode_mask):
+                reset_ids = new_episode_mask.nonzero(as_tuple=False).squeeze(-1)
+                state["dense_suppressed_after_lift"][reset_ids] = False
+            state["dense_suppressed_after_lift"] = state["dense_suppressed_after_lift"] | lifted
+            state["_teacher_dense_suppress_mask"] = state["dense_suppressed_after_lift"]
+
     if step_id is not None and state.get("trajectory_match_step_id") == step_id:
         return state
 
@@ -254,13 +306,24 @@ _TRAJECTORY_MAX_SEG_ADVANCE: int = 5
 """Max segment advance per RL step.  Prevents "speed-running" through the trajectory."""
 
 _TRAJECTORY_ADVANCE_LATERAL_GATE: float = 0.10
-"""Lateral distance (metres) within which the agent is considered "on the path".
+"""Horizontal (XY) distance (metres) within which the segment pointer may advance.
 
-The segment pointer only advances when the agent is closer than this threshold
-to the current projection, forcing it to physically follow each section of the
-trajectory instead of cutting corners.  10 cm tolerates small deviations from
-grasping (cube shifts the EE) while still preventing large spatial shortcuts.
+Uses **XY-only** distance to the projected polyline point so vertical lift (large
+3D offset from a table-height teacher path) does not freeze segment progression.
+The segment pointer only advances when this horizontal offset is below the
+threshold, limiting planar shortcuts while allowing upward motion after grasp.
 """
+
+
+def _mask_dense_if_lift_suppressed(state: dict, r: torch.Tensor) -> torch.Tensor:
+    """Zero dense teacher reward using ``_teacher_dense_suppress_mask`` or ``dense_suppressed_after_lift``."""
+    m = state.get("_teacher_dense_suppress_mask")
+    if m is not None:
+        return torch.where(m, torch.zeros_like(r), r)
+    sup = state.get("dense_suppressed_after_lift")
+    if sup is None:
+        return r
+    return torch.where(sup, torch.zeros_like(r), r)
 
 
 def _trajectory_guidance_get_cached_path_geometry(
@@ -272,6 +335,8 @@ def _trajectory_guidance_get_cached_path_geometry(
     object_cfg: SceneEntityCfg,
     robot_cfg: SceneEntityCfg,
     ee_frame_cfg: SceneEntityCfg,
+    suppress_dense_after_lift: bool = False,
+    lift_suppression_min_height: float = 0.025,
 ) -> dict:
     """Strict sequential polyline projection + path-aligned teacher gripper (cached once per step).
 
@@ -280,8 +345,8 @@ def _trajectory_guidance_get_cached_path_geometry(
     1. Projection searches only a forward-biased window around ``current_segment_idx``.
     2. The segment pointer **never moves backward**.
     3. Per-step advance is capped at ``_TRAJECTORY_MAX_SEG_ADVANCE``.
-    4. Advance is only allowed when lateral distance < ``_TRAJECTORY_ADVANCE_LATERAL_GATE``
-       (the agent must physically be close to the path to "unlock" the next section).
+    4. Advance is only allowed when **XY** lateral distance < ``_TRAJECTORY_ADVANCE_LATERAL_GATE``
+       (3D distance is still reported as ``lateral`` for penalties / logging).
 
     On episode reset ``current_segment_idx`` is set to 0, forcing the agent to
     traverse the entire trajectory from the start every episode.
@@ -295,6 +360,8 @@ def _trajectory_guidance_get_cached_path_geometry(
         object_cfg,
         robot_cfg,
         ee_frame_cfg,
+        suppress_dense_after_lift=suppress_dense_after_lift,
+        lift_suppression_min_height=lift_suppression_min_height,
     )
     step_id = getattr(env, "_sim_step_counter", None)
     ck = "path_proj_step_id"
@@ -303,6 +370,7 @@ def _trajectory_guidance_get_cached_path_geometry(
         and state.get(ck) == step_id
         and "proj_progress" in state
         and "proj_lateral" in state
+        and "proj_lateral_xy" in state
         and "proj_arc_len" in state
         and "proj_total_len" in state
     ):
@@ -312,6 +380,7 @@ def _trajectory_guidance_get_cached_path_geometry(
             "store": store,
             "progress": state["proj_progress"],
             "lateral": state["proj_lateral"],
+            "lateral_xy": state["proj_lateral_xy"],
             "arc_len": state["proj_arc_len"],
             "total_len": state["proj_total_len"],
             "teacher_gripper": state.get("proj_teacher_gripper"),
@@ -325,7 +394,7 @@ def _trajectory_guidance_get_cached_path_geometry(
     student_ee_in_rec = student_ee - origin_delta
     current_seg = state["current_segment_idx"]
 
-    progress, lateral, arc_len, total_len, best_seg = store.project_ee_to_progress_windowed(
+    progress, lateral, arc_len, total_len, best_seg, lateral_xy = store.project_ee_to_progress_windowed(
         student_ee_in_rec, traj_indices, current_seg, window=_TRAJECTORY_PROJ_WINDOW,
     )
 
@@ -334,8 +403,8 @@ def _trajectory_guidance_get_cached_path_geometry(
     new_seg = torch.maximum(best_seg, current_seg)
     # 2. Cap per-step forward advance.
     new_seg = torch.minimum(new_seg, current_seg + _TRAJECTORY_MAX_SEG_ADVANCE)
-    # 3. Only advance when the agent is actually close to the path (lateral gate).
-    close_enough = lateral <= _TRAJECTORY_ADVANCE_LATERAL_GATE
+    # 3. Only advance when horizontally close to the path (XY gate; avoids lift freeze).
+    close_enough = lateral_xy <= _TRAJECTORY_ADVANCE_LATERAL_GATE
     new_seg = torch.where(close_enough, new_seg, current_seg)
 
     state["current_segment_idx"] = new_seg
@@ -350,6 +419,7 @@ def _trajectory_guidance_get_cached_path_geometry(
         state[ck] = step_id
         state["proj_progress"] = progress
         state["proj_lateral"] = lateral
+        state["proj_lateral_xy"] = lateral_xy
         state["proj_arc_len"] = arc_len
         state["proj_total_len"] = total_len
         state["proj_teacher_gripper"] = teacher_g
@@ -359,6 +429,7 @@ def _trajectory_guidance_get_cached_path_geometry(
         "store": store,
         "progress": progress,
         "lateral": lateral,
+        "lateral_xy": lateral_xy,
         "arc_len": arc_len,
         "total_len": total_len,
         "teacher_gripper": teacher_g,
@@ -436,6 +507,8 @@ def trajectory_guidance_reward(
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    suppress_dense_after_lift: bool = False,
+    lift_suppression_min_height: float = 0.025,
 ) -> torch.Tensor:
     """Reward alignment with a matched teacher EE trajectory.
 
@@ -443,8 +516,25 @@ def trajectory_guidance_reward(
     - ``path_progress``: reward **forward motion along the teacher polyline** (arc-length progress).
     - ``path_progress_milestones``: ordered **milestones** along arc length; limits spatial shortcuts when
       combined with ``milestone_lateral_gate`` and ``max_milestone_jump``.
+    - ``suppress_dense_after_lift``: if True, zero this reward after the object first exceeds
+      ``lift_suppression_min_height`` (same condition as ``lifting_object``) until episode reset.
     """
+    suppress_dense_after_lift, lift_suppression_min_height = _resolve_dense_suppression_from_env_cfg(
+        env, suppress_dense_after_lift, lift_suppression_min_height
+    )
     if guidance_mode == "time_sync":
+        state_ts = _trajectory_guidance_ensure_matched(
+            env,
+            trajectory_file,
+            command_name,
+            match_mode,
+            exact_match_tol,
+            object_cfg,
+            robot_cfg,
+            ee_frame_cfg,
+            suppress_dense_after_lift=suppress_dense_after_lift,
+            lift_suppression_min_height=lift_suppression_min_height,
+        )
         distance = _trajectory_guidance_distance(
             env=env,
             trajectory_file=trajectory_file,
@@ -456,7 +546,8 @@ def trajectory_guidance_reward(
             robot_cfg=robot_cfg,
             ee_frame_cfg=ee_frame_cfg,
         )
-        return 1.0 - torch.tanh(distance / std)
+        r = 1.0 - torch.tanh(distance / std)
+        return _mask_dense_if_lift_suppressed(state_ts, r)
 
     if guidance_mode not in ("path_progress", "path_progress_milestones"):
         raise ValueError(f"Unknown guidance_mode: {guidance_mode}")
@@ -470,6 +561,8 @@ def trajectory_guidance_reward(
         object_cfg,
         robot_cfg,
         ee_frame_cfg,
+        suppress_dense_after_lift=suppress_dense_after_lift,
+        lift_suppression_min_height=lift_suppression_min_height,
     )
     step_id = getattr(env, "_sim_step_counter", None)
     if (
@@ -477,7 +570,7 @@ def trajectory_guidance_reward(
         and state.get("last_path_reward_step_id") == step_id
         and "path_reward" in state
     ):
-        return state["path_reward"]
+        return _mask_dense_if_lift_suppressed(state, state["path_reward"])
 
     geom = _trajectory_guidance_get_cached_path_geometry(
         env,
@@ -488,6 +581,8 @@ def trajectory_guidance_reward(
         object_cfg,
         robot_cfg,
         ee_frame_cfg,
+        suppress_dense_after_lift=suppress_dense_after_lift,
+        lift_suppression_min_height=lift_suppression_min_height,
     )
     state = geom["state"]
     last_progress = state["last_progress"]
@@ -495,6 +590,7 @@ def trajectory_guidance_reward(
 
     progress = geom["progress"]
     lateral = geom["lateral"]
+    lateral_xy = geom["lateral_xy"]
     arc_len = geom["arc_len"]
     total_len = geom["total_len"]
 
@@ -502,7 +598,7 @@ def trajectory_guidance_reward(
         K = max(2, int(num_path_milestones))
         bin_w = total_len / float(K)
         eligible_bin = torch.floor(arc_len / (bin_w + 1.0e-8)).long().clamp(0, K - 1)
-        lateral_ok = lateral <= float(milestone_lateral_gate)
+        lateral_ok = lateral_xy <= float(milestone_lateral_gate)
         effective_eligible = torch.where(lateral_ok, eligible_bin, path_milestone_max)
 
         cap = path_milestone_max + int(max_milestone_jump)
@@ -519,11 +615,11 @@ def trajectory_guidance_reward(
         state["last_path_progress"] = progress.detach()
         state["last_path_lateral"] = lateral.detach()
         state["last_path_delta_raw"] = torch.zeros_like(progress)
-        return r
+        return _mask_dense_if_lift_suppressed(state, r)
 
     delta_raw = progress - last_progress
     if progress_lateral_gate is not None:
-        gated = lateral <= float(progress_lateral_gate)
+        gated = lateral_xy <= float(progress_lateral_gate)
         delta_raw = torch.where(gated, delta_raw, torch.zeros_like(delta_raw))
     delta = torch.relu(delta_raw) if only_forward_progress else delta_raw
 
@@ -542,7 +638,7 @@ def trajectory_guidance_reward(
     state["last_path_progress"] = progress.detach()
     state["last_path_lateral"] = lateral.detach()
     state["last_path_delta_raw"] = delta_raw.detach()
-    return r
+    return _mask_dense_if_lift_suppressed(state, r)
 
 
 def teacher_gripper_alignment_reward(
@@ -557,6 +653,8 @@ def teacher_gripper_alignment_reward(
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    suppress_dense_after_lift: bool = False,
+    lift_suppression_min_height: float = 0.025,
 ) -> torch.Tensor:
     """Match student gripper joint to teacher gripper at path-aligned time index.
 
@@ -567,6 +665,9 @@ def teacher_gripper_alignment_reward(
     segments where the teacher gripper is below ``close_threshold`` (grasping phase),
     giving extra incentive to actually close the gripper around the object.
     """
+    suppress_dense_after_lift, lift_suppression_min_height = _resolve_dense_suppression_from_env_cfg(
+        env, suppress_dense_after_lift, lift_suppression_min_height
+    )
     geom = _trajectory_guidance_get_cached_path_geometry(
         env,
         trajectory_file,
@@ -576,6 +677,8 @@ def teacher_gripper_alignment_reward(
         object_cfg,
         robot_cfg,
         ee_frame_cfg,
+        suppress_dense_after_lift=suppress_dense_after_lift,
+        lift_suppression_min_height=lift_suppression_min_height,
     )
     state = geom["state"]
     step_id = getattr(env, "_sim_step_counter", None)
@@ -584,13 +687,13 @@ def teacher_gripper_alignment_reward(
         and state.get("last_gripper_reward_step_id") == step_id
         and "gripper_reward" in state
     ):
-        return state["gripper_reward"]
+        return _mask_dense_if_lift_suppressed(state, state["gripper_reward"])
 
     if not geom["has_gripper"] or geom["teacher_gripper"] is None:
         z = torch.zeros((env.num_envs,), dtype=torch.float32, device=env.device)
         state["gripper_reward"] = z
         state["last_gripper_reward_step_id"] = step_id
-        return z
+        return _mask_dense_if_lift_suppressed(state, z)
 
     teacher_g = geom["teacher_gripper"]
     student_g = _student_gripper_pos(env, robot_cfg)
@@ -604,57 +707,7 @@ def teacher_gripper_alignment_reward(
     state["last_gripper_reward_step_id"] = step_id
     state["last_compute_step_id"] = step_id
     state["gripper_reward"] = r.detach()
-    return r
-
-
-def trajectory_guidance_debug_distance_over_std(
-    env: ManagerBasedRLEnv,
-    trajectory_file: str,
-    std: float,
-    command_name: str = "object_pose",
-    match_mode: str = "object_goal",
-    exact_match_tol: float = 1.0e-3,
-    guidance_mode: str = "path_progress",
-    lateral_std: float = 0.1,
-    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
-) -> torch.Tensor:
-    """Debug signal for trajectory guidance.
-
-    - ``time_sync``: ``norm(student_ee - teacher_ee(t)) / std`` (should shrink when tracking improves).
-    - ``path_progress``: **lateral distance to the teacher polyline** / ``lateral_std`` (off-path error;
-      uses cached tensors from the main reward when evaluated after it on the same step).
-    """
-    if guidance_mode == "time_sync":
-        distance = _trajectory_guidance_distance(
-            env=env,
-            trajectory_file=trajectory_file,
-            std=std,
-            command_name=command_name,
-            match_mode=match_mode,
-            exact_match_tol=exact_match_tol,
-            object_cfg=object_cfg,
-            robot_cfg=robot_cfg,
-            ee_frame_cfg=ee_frame_cfg,
-        )
-        return distance / std
-
-    if guidance_mode not in ("path_progress", "path_progress_milestones"):
-        raise ValueError(f"Unknown guidance_mode for debug: {guidance_mode}")
-
-    geom = _trajectory_guidance_get_cached_path_geometry(
-        env,
-        trajectory_file,
-        command_name,
-        match_mode,
-        exact_match_tol,
-        object_cfg,
-        robot_cfg,
-        ee_frame_cfg,
-    )
-    lateral = geom["lateral"]
-    return lateral / float(lateral_std)
+    return _mask_dense_if_lift_suppressed(state, r)
 
 
 def _get_or_create_discriminator_state(env: ManagerBasedRLEnv, discriminator_file: str):
