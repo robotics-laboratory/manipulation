@@ -150,6 +150,44 @@ ln -s "$TORCH_DIR" /isaac-sim/exts/omni.isaac.ml_archive/pip_prebundle/torch
    `site.getsitepackages()` since Isaac Sim's Python environment is
    non-standard.
 
+## Namespace Package vs inspect.getfile (tensordict crash)
+
+### The Error
+
+After the torch 2.7.0 install, running any script that imports `rsl_rl`
+crashes with:
+
+```
+TypeError: <module 'isaaclab' (<_frozen_importlib_external.NamespaceLoader ...>)> is a built-in module
+```
+
+### Root Cause
+
+`tensordict` calls `torch.compiler.allow_in_graph` at module scope, which
+triggers `import torch._dynamo`. Deep inside `torch._dynamo`, the decorator
+`@torch.library.register_fake` calls `inspect.getframeinfo` to record source
+info. `inspect.getframeinfo` → `inspect.getmodule` → `inspect.getfile`
+walks the call stack and encounters the `isaaclab` module.
+
+`isaaclab` is a **namespace package** (loaded via `NamespaceLoader`, no
+`__file__` attribute). `torch.package.package_importer` has monkey-patched
+`inspect.getfile`, but its fallback to the original `getfile` raises
+`TypeError` for modules without `__file__`.
+
+### The Fix
+
+Set `isaaclab.__file__` before `rsl_rl` (and thus `tensordict`) is imported:
+
+```python
+import isaaclab as _isaaclab_ns
+if not getattr(_isaaclab_ns, "__file__", None):
+    _isaaclab_ns.__file__ = next(iter(_isaaclab_ns.__path__), __file__)
+```
+
+Applied to all scripts in `scripts/rsl_rl/` that import `rsl_rl`:
+`train.py`, `play.py`, `collect_trajectories.py`, `collect_bc_dataset.py`,
+`train_bc.py`.
+
 ## References
 
 - https://github.com/isaac-sim/IsaacLab/issues/2652

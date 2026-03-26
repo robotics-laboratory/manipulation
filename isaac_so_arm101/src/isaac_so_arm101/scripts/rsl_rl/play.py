@@ -60,6 +60,13 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+# Workaround: isaaclab is a namespace package (no __file__).
+# tensordict → torch._dynamo → inspect.getfile crashes on namespace modules.
+import isaaclab as _isaaclab_ns
+
+if not getattr(_isaaclab_ns, "__file__", None):
+    _isaaclab_ns.__file__ = next(iter(_isaaclab_ns.__path__), __file__)
+
 import gymnasium as gym
 import os
 import time

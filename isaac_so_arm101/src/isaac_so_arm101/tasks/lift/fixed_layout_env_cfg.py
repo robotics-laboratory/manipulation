@@ -12,11 +12,20 @@ polyline start via IK (not by replaying recorded joint vectors).
 
 from __future__ import annotations
 
+import os
+
 import isaac_so_arm101.tasks.lift.mdp as lift_mdp
 from isaaclab.utils import configclass
 
 from .guided_env_cfg import GuidedEEAlignEventCfg, GuidedObservationsCfg, GuidedRewardsCfg
 from .joint_pos_env_cfg import SoArm101LiftCubeEnvCfg, SoArm101LiftCubeSparseEnvCfg
+
+_DEFAULT_FIXED_LAYOUT_TRAJECTORY_FILE = os.environ.get(
+    "ISAAC_SO_ARM101_TRAJECTORY_FILE",
+    os.path.join(
+        "isaac_so_arm101", "logs", "rsl_rl", "teacher_trajectories", "so101_fixed_layout_teacher.pt"
+    ),
+)
 
 
 def apply_so101_fixed_layout_to_cfg(env_cfg) -> None:
@@ -78,9 +87,27 @@ class SoArm101FixedLayoutLiftCubeSparseEnvCfg_PLAY(SoArm101FixedLayoutLiftCubeSp
         self.observations.policy.enable_corruption = False
 
 
+def _patch_trajectory_file(env_cfg, trajectory_file: str) -> None:
+    """Override ``trajectory_file`` in every reward/event term that references it."""
+    for term in (
+        env_cfg.rewards.trajectory_guidance,
+        env_cfg.rewards.teacher_gripper_alignment,
+        env_cfg.rewards.trajectory_guidance_debug_distance_over_std,
+    ):
+        if hasattr(term, "params") and "trajectory_file" in term.params:
+            term.params["trajectory_file"] = trajectory_file
+    if hasattr(env_cfg.rewards, "discriminator_guidance"):
+        # discriminator uses discriminator_file, not trajectory_file — skip
+        pass
+    for term_name in ("align_ee_to_teacher_trajectory_start", "visualize_teacher_trajectory"):
+        term = getattr(env_cfg.events, term_name, None)
+        if term is not None and hasattr(term, "params") and "trajectory_file" in term.params:
+            term.params["trajectory_file"] = trajectory_file
+
+
 @configclass
 class SoArm101FixedLayoutGuidedLiftCubeSparseEnvCfg(SoArm101FixedLayoutLiftCubeSparseEnvCfg):
-    """Guided sparse lift on fixed layout — match teacher trajectories collected on the same task."""
+    """Sparse lift + trajectory guidance on fixed layout (no dense task shaping)."""
 
     # Use dataset row 0 (typical single-layout ``collect_trajectories``) and skip ``cdist`` matching each reset.
     trajectory_guidance_fixed_traj_index: int | None = 0
@@ -91,11 +118,12 @@ class SoArm101FixedLayoutGuidedLiftCubeSparseEnvCfg(SoArm101FixedLayoutLiftCubeS
 
     def __post_init__(self):
         super().__post_init__()
-        self.rewards.reaching_object.weight = 0.0
-        self.rewards.object_goal_tracking.weight = 0.0
-        self.rewards.object_goal_tracking_fine_grained.weight = 0.0
+        _patch_trajectory_file(self, _DEFAULT_FIXED_LAYOUT_TRAJECTORY_FILE)
+        # Dense task rewards stay OFF (sparse base).
         self.rewards.lifting_object.weight = 1.0
         self.rewards.lifting_object.params["minimal_height"] = 0.025
+        self.rewards.trajectory_guidance.weight = 5.0
+        self.rewards.teacher_gripper_alignment.weight = 5.0
         self.curriculum.action_rate = None
         self.curriculum.joint_vel = None
 

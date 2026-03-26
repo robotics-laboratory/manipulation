@@ -3,7 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Reset events for trajectory-guided lift: align EE to the start of a **chosen** teacher polyline."""
+"""Reset events for trajectory-guided lift: align EE to the start of a **chosen** teacher polyline.
+
+Also provides :func:`visualize_teacher_trajectory` — a global-interval event that draws matched
+teacher EE polylines as small sphere markers in the viewport (useful for visual debugging during
+training or play).
+"""
 
 from __future__ import annotations
 
@@ -109,6 +114,17 @@ def reset_object_pose_from_trajectory_dataset(
     path_milestone_max[eids] = -1
     last_episode_length[eids] = 0
 
+    origin_delta = state.get("origin_delta")
+    if origin_delta is not None:
+        training_origins = env.scene.env_origins[eids, :3]
+        if store.use_ee_local:
+            recording_origins = store.ee_trajectories[chosen, 0, :] - store.initial_ee_pos_local[chosen]
+        elif store.use_local_layout:
+            recording_origins = store.initial_object_pos[chosen] - store.initial_object_pos_local[chosen]
+        else:
+            recording_origins = torch.zeros_like(training_origins)
+        origin_delta[eids] = training_origins - recording_origins
+
     _write_object_root_from_trajectory_row(env, env_ids, store, chosen, object_cfg)
 
 
@@ -199,6 +215,19 @@ def align_ee_to_teacher_trajectory_start(
     # So `_trajectory_guidance_ensure_matched` does not treat the next step as a new episode rematch.
     last_episode_length[eids] = 0
 
+    # Compute origin_delta (training_origin − recording_origin) so reward projections
+    # use the correct coordinate frame.
+    origin_delta = state.get("origin_delta")
+    if origin_delta is not None:
+        training_origins = env.scene.env_origins[eids, :3]
+        if store.use_ee_local:
+            recording_origins = store.ee_trajectories[chosen, 0, :] - store.initial_ee_pos_local[chosen]
+        elif store.use_local_layout:
+            recording_origins = store.initial_object_pos[chosen] - store.initial_object_pos_local[chosen]
+        else:
+            recording_origins = torch.zeros_like(training_origins)
+        origin_delta[eids] = training_origins - recording_origins
+
     if reset_object_from_dataset:
         _write_object_root_from_trajectory_row(env, env_ids, store, chosen, object_cfg)
 
@@ -258,3 +287,91 @@ def align_ee_to_teacher_trajectory_start(
         zv = torch.zeros_like(jp_full)
         robot.write_joint_state_to_sim(jp_full, zv)
         robot.set_joint_position_target(jp_full)
+
+
+def visualize_teacher_trajectory(
+    env: ManagerBasedRLEnv,
+    env_ids,
+    trajectory_file: str,
+    max_envs_to_draw: int = 1,
+    marker_radius: float = 0.004,
+    subsample_step: int = 2,
+) -> None:
+    """Draw matched teacher EE trajectories as small spheres in the viewport.
+
+    Intended as a global-interval event (``mode="interval"``). Reads ``_trajectory_guidance_state``
+    populated by the reward manager — if it does not exist yet (first step), the call is a no-op.
+
+    Trajectories are converted from the recording world frame to each training env's world frame
+    using the stored ``initial_ee_pos_local`` offsets, so the polyline appears at the correct
+    position even when training with many parallel envs.
+
+    For performance, waypoints are subsampled (``subsample_step``) and only the first
+    ``max_envs_to_draw`` environments are visualized.  The marker positions are cached and only
+    recomputed when the matched trajectory index changes (i.e. after an episode reset).
+
+    Args:
+        env: Vectorized RL environment.
+        env_ids: Unused (global interval callback).
+        trajectory_file: Path to the teacher trajectory ``.pt`` dataset (must match the file
+            used by trajectory guidance rewards so that the shared state is found).
+        max_envs_to_draw: Number of environments (starting from env 0) to visualize.
+        marker_radius: Radius of the waypoint sphere markers (metres).
+        subsample_step: Take every N-th waypoint to reduce marker count.
+    """
+    del env_ids
+
+    state = getattr(env, "_trajectory_guidance_state", None)
+    if state is None or state.get("trajectory_file") != trajectory_file:
+        return
+
+    store = state["store"]
+    traj_indices = state["traj_indices"]
+    origin_delta = state["origin_delta"]
+
+    n_draw = min(int(max_envs_to_draw), env.num_envs)
+    if n_draw <= 0 or torch.all(traj_indices[:n_draw] < 0):
+        return
+
+    vis_state = getattr(env, "_teacher_traj_vis_state", None)
+    if vis_state is None:
+        import isaaclab.sim as sim_utils
+        from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/World/Visuals/TeacherTrajectory",
+            markers={
+                "waypoint": sim_utils.SphereCfg(
+                    radius=float(marker_radius),
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 1.0, 0.3)),
+                ),
+            },
+        )
+        markers = VisualizationMarkers(marker_cfg)
+        vis_state = {"markers": markers, "last_traj_key": None}
+        env._teacher_traj_vis_state = vis_state
+
+    markers = vis_state["markers"]
+
+    traj_key = tuple(traj_indices[:n_draw].tolist())
+    if vis_state.get("last_traj_key") == traj_key:
+        return
+
+    step = max(1, int(subsample_step))
+    all_waypoints: list[torch.Tensor] = []
+    for i in range(n_draw):
+        idx = int(traj_indices[i].item())
+        if idx < 0:
+            continue
+        tlen = int(store.trajectory_lengths[idx].item())
+        pts = store.ee_trajectories[idx, :tlen:step, :]
+
+        pts_world = pts + origin_delta[i].unsqueeze(0)
+        all_waypoints.append(pts_world)
+
+    if len(all_waypoints) == 0:
+        return
+
+    all_pts = torch.cat(all_waypoints, dim=0)
+    markers.visualize(translations=all_pts)
+    vis_state["last_traj_key"] = traj_key

@@ -79,6 +79,18 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 """Rest everything follows."""
 
+# ------------------------------------------------------------------
+# Workaround: isaaclab is a namespace package (no __file__).
+# tensordict → torch._dynamo → torch.library.register_fake walks the
+# call stack via inspect.getframeinfo, hits the isaaclab module, and
+# inspect.getfile raises TypeError for namespace packages.
+# Setting __file__ on the module prevents the crash.
+# ------------------------------------------------------------------
+import isaaclab as _isaaclab_ns
+
+if not getattr(_isaaclab_ns, "__file__", None):
+    _isaaclab_ns.__file__ = next(iter(_isaaclab_ns.__path__), __file__)
+
 import gymnasium as gym
 import os
 import torch

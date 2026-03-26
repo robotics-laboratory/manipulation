@@ -108,6 +108,91 @@ def project_points_to_polyline_detailed_batched(
     return progress, lateral, arc_closest, total_b
 
 
+def project_points_to_polyline_windowed(
+    p: torch.Tensor,
+    pts: torch.Tensor,
+    current_seg: torch.Tensor,
+    window: int = 20,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Windowed polyline projection — each point searches only nearby segments.
+
+    Instead of projecting onto the *entire* polyline (which lets the agent skip
+    trajectory sections that loop back spatially), we restrict the search to
+    ``[current_seg - window, current_seg + window]`` for each batch element.
+
+    Args:
+        p: ``(B, 3)`` query points (student EE positions).
+        pts: ``(T, 3)`` polyline vertices (single trajectory, same for all batch elements).
+        current_seg: ``(B,)`` long tensor — current segment index per env.
+        window: half-width of the search window (in segments).
+
+    Returns:
+        ``progress (B,)``, ``lateral (B,)``, ``arc_to_closest (B,)``,
+        ``total_len (B,)``, ``best_seg (B,)`` — the winning segment index
+        (absolute, in ``[0, S-1]`` where ``S = T - 1``).
+    """
+    if p.ndim != 2 or p.shape[1] != 3:
+        raise ValueError("p must have shape (B, 3)")
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("pts must have shape (T, 3)")
+    T = pts.shape[0]
+    B = p.shape[0]
+    device, dtype = p.device, p.dtype
+    S = T - 1  # number of segments
+
+    if T == 0:
+        raise ValueError("empty polyline")
+    if T == 1:
+        lateral = torch.norm(p - pts[0].unsqueeze(0), dim=-1)
+        z = torch.zeros(B, device=device, dtype=dtype)
+        tl = torch.full((B,), eps, device=device, dtype=dtype)
+        return z, lateral, z, tl, torch.zeros(B, device=device, dtype=torch.long)
+
+    a = pts[:-1]  # (S, 3)
+    b = pts[1:]   # (S, 3)
+    ab = b - a
+    seg_lens = torch.norm(ab, dim=-1)  # (S,)
+    ab_len_sq = (ab * ab).sum(dim=-1).clamp(min=eps)  # (S,)
+
+    cum_at_vertex = torch.zeros(T, device=device, dtype=dtype)
+    cum_at_vertex[1:] = torch.cumsum(seg_lens, dim=0)
+    total_len_scalar = seg_lens.sum().clamp(min=eps)
+
+    lo = (current_seg - window).clamp(min=0)         # (B,)
+    hi = (current_seg + window).clamp(max=S - 1)     # (B,)
+    win_size = (hi - lo + 1).max().item()             # uniform pad width
+
+    seg_range = torch.arange(win_size, device=device).unsqueeze(0) + lo.unsqueeze(1)  # (B, W)
+    seg_range = seg_range.clamp(0, S - 1)
+
+    a_win = a[seg_range]          # (B, W, 3)
+    ab_win = ab[seg_range]        # (B, W, 3)
+    ab_lsq_win = ab_len_sq[seg_range]  # (B, W)
+    sl_win = seg_lens[seg_range]  # (B, W)
+    cum_win = cum_at_vertex[:-1][seg_range]  # (B, W)
+
+    ap = p.unsqueeze(1) - a_win                        # (B, W, 3)
+    t = (ap * ab_win).sum(dim=-1) / ab_lsq_win         # (B, W)
+    t = t.clamp(0.0, 1.0)
+    closest = a_win + t.unsqueeze(-1) * ab_win          # (B, W, 3)
+    lateral_seg = torch.norm(p.unsqueeze(1) - closest, dim=-1)  # (B, W)
+
+    valid_mask = torch.arange(win_size, device=device).unsqueeze(0) <= (hi - lo).unsqueeze(1)
+    lateral_seg = torch.where(valid_mask, lateral_seg, torch.full_like(lateral_seg, 1e9))
+
+    win_best = lateral_seg.argmin(dim=1)  # (B,) index within window
+    best_seg_abs = torch.gather(seg_range, 1, win_best.unsqueeze(1)).squeeze(1)  # (B,)
+
+    arc_to = cum_win + t * sl_win  # (B, W)
+    arc_closest = torch.gather(arc_to, 1, win_best.unsqueeze(1)).squeeze(1)  # (B,)
+    lateral = torch.gather(lateral_seg, 1, win_best.unsqueeze(1)).squeeze(1)  # (B,)
+
+    progress = (arc_closest / total_len_scalar).clamp(0.0, 1.0)
+    total_b = total_len_scalar.expand(B)
+    return progress, lateral, arc_closest, total_b, best_seg_abs
+
+
 class TrajectoryStore:
     """Stores teacher trajectories and provides batched matching/lookups."""
 
@@ -288,6 +373,53 @@ class TrajectoryStore:
         clamped_t = torch.clamp(timesteps, min=0)
         clamped_t = torch.minimum(clamped_t, lengths - 1)
         return self.gripper_trajectories[traj_indices, clamped_t]
+
+    def project_ee_to_progress_windowed(
+        self,
+        student_ee: torch.Tensor,
+        traj_indices: torch.Tensor,
+        current_seg: torch.Tensor,
+        window: int = 20,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Windowed projection: search only ``[current_seg ± window]`` segments.
+
+        Only supports the fast path where all envs share the same trajectory index.
+        Falls back to a per-env loop otherwise.
+
+        Returns:
+            ``progress (B,)``, ``lateral (B,)``, ``arc_len (B,)``,
+            ``total_len (B,)``, ``best_seg (B,)`` — winning segment index.
+        """
+        student_ee = student_ee.to(self.device, dtype=torch.float32)
+        traj_indices = traj_indices.to(self.device, dtype=torch.long).flatten()
+        current_seg = current_seg.to(self.device, dtype=torch.long).flatten()
+        bsz = student_ee.shape[0]
+
+        if bsz > 0 and torch.all(traj_indices == traj_indices[0]):
+            idx = int(traj_indices[0].item())
+            tlen = int(self.trajectory_lengths[idx].item())
+            pts = self.ee_trajectories[idx, :tlen, :]
+            return project_points_to_polyline_windowed(student_ee, pts, current_seg, window=window)
+
+        progress_out = torch.empty(bsz, device=self.device, dtype=torch.float32)
+        lateral_out = torch.empty(bsz, device=self.device, dtype=torch.float32)
+        arc_out = torch.empty(bsz, device=self.device, dtype=torch.float32)
+        total_out = torch.empty(bsz, device=self.device, dtype=torch.float32)
+        seg_out = torch.empty(bsz, device=self.device, dtype=torch.long)
+        for b in range(bsz):
+            idx = int(traj_indices[b].item())
+            tlen = int(self.trajectory_lengths[idx].item())
+            pts = self.ee_trajectories[idx, :tlen, :]
+            cs = current_seg[b:b + 1]
+            prog, lat, arc_c, tot, bseg = project_points_to_polyline_windowed(
+                student_ee[b:b + 1], pts, cs, window=window,
+            )
+            progress_out[b] = prog[0]
+            lateral_out[b] = lat[0]
+            arc_out[b] = arc_c[0]
+            total_out[b] = tot[0]
+            seg_out[b] = bseg[0]
+        return progress_out, lateral_out, arc_out, total_out, seg_out
 
     def project_ee_to_progress(
         self, student_ee: torch.Tensor, traj_indices: torch.Tensor

@@ -115,6 +115,10 @@ def _get_or_create_trajectory_state(env: ManagerBasedRLEnv, trajectory_file: str
             state["last_progress"] = torch.zeros((env.num_envs,), dtype=torch.float32, device=env.device)
         if "path_milestone_max" not in state:
             state["path_milestone_max"] = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+        if "origin_delta" not in state:
+            state["origin_delta"] = torch.zeros((env.num_envs, 3), dtype=torch.float32, device=env.device)
+        if "current_segment_idx" not in state:
+            state["current_segment_idx"] = torch.zeros((env.num_envs,), dtype=torch.long, device=env.device)
         return state
 
     store = TrajectoryStore(path=trajectory_file, device=str(env.device))
@@ -125,6 +129,12 @@ def _get_or_create_trajectory_state(env: ManagerBasedRLEnv, trajectory_file: str
         "last_episode_length": torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device),
         "last_progress": torch.zeros((env.num_envs,), dtype=torch.float32, device=env.device),
         "path_milestone_max": torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device),
+        # Per-env offset: training_env_origin − recording_env_origin.
+        # Add to recording-frame points to get training-world-frame points (or subtract from
+        # student world-frame coords to project into the recording frame).
+        "origin_delta": torch.zeros((env.num_envs, 3), dtype=torch.float32, device=env.device),
+        # Windowed projection: current segment index per env (prevents spatial shortcuts).
+        "current_segment_idx": torch.zeros((env.num_envs,), dtype=torch.long, device=env.device),
     }
     setattr(env, "_trajectory_guidance_state", state)
     return state
@@ -190,6 +200,8 @@ def _trajectory_guidance_ensure_matched(
 
     fixed_traj_idx = _env_cfg_fixed_traj_index(env)
 
+    origin_delta = state["origin_delta"]
+
     new_episode_mask = (traj_indices < 0) | (current_episode_length <= last_episode_length)
     if torch.any(new_episode_mask):
         reset_ids = new_episode_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -209,12 +221,46 @@ def _trajectory_guidance_ensure_matched(
             traj_indices[reset_ids] = matched
         last_progress[reset_ids] = 0.0
         path_milestone_max[reset_ids] = -1
+        state["current_segment_idx"][reset_ids] = 0
+
+        # Compute per-env origin offset so we can convert between recording and training frames.
+        # origin_delta = training_origin − recording_origin
+        reset_matched = traj_indices[reset_ids]
+        training_origins = env.scene.env_origins[reset_ids, :3]
+        if store.use_ee_local:
+            recording_origins = (
+                store.ee_trajectories[reset_matched, 0, :] - store.initial_ee_pos_local[reset_matched]
+            )
+        elif store.use_local_layout:
+            recording_origins = (
+                store.initial_object_pos[reset_matched] - store.initial_object_pos_local[reset_matched]
+            )
+        else:
+            recording_origins = torch.zeros_like(training_origins)
+        origin_delta[reset_ids] = training_origins - recording_origins
+
     last_episode_length[:] = current_episode_length
 
     state["trajectory_match_step_id"] = step_id
     state["student_ee_buf"] = student_ee
     state["last_new_episode_mask"] = new_episode_mask.detach()
     return state
+
+
+_TRAJECTORY_PROJ_WINDOW: int = 15
+"""Forward-looking search window (segments) for windowed polyline projection."""
+
+_TRAJECTORY_MAX_SEG_ADVANCE: int = 5
+"""Max segment advance per RL step.  Prevents "speed-running" through the trajectory."""
+
+_TRAJECTORY_ADVANCE_LATERAL_GATE: float = 0.10
+"""Lateral distance (metres) within which the agent is considered "on the path".
+
+The segment pointer only advances when the agent is closer than this threshold
+to the current projection, forcing it to physically follow each section of the
+trajectory instead of cutting corners.  10 cm tolerates small deviations from
+grasping (cube shifts the EE) while still preventing large spatial shortcuts.
+"""
 
 
 def _trajectory_guidance_get_cached_path_geometry(
@@ -227,10 +273,18 @@ def _trajectory_guidance_get_cached_path_geometry(
     robot_cfg: SceneEntityCfg,
     ee_frame_cfg: SceneEntityCfg,
 ) -> dict:
-    """Polyline projection + path-aligned teacher gripper, computed **once per sim step** (cached).
+    """Strict sequential polyline projection + path-aligned teacher gripper (cached once per step).
 
-    Shared by trajectory guidance rewards, gripper alignment reward, debug term, and observations
-    to avoid repeated ``project_ee_to_progress*`` / Python loops over envs.
+    Enforces that the agent follows the trajectory **in order**:
+
+    1. Projection searches only a forward-biased window around ``current_segment_idx``.
+    2. The segment pointer **never moves backward**.
+    3. Per-step advance is capped at ``_TRAJECTORY_MAX_SEG_ADVANCE``.
+    4. Advance is only allowed when lateral distance < ``_TRAJECTORY_ADVANCE_LATERAL_GATE``
+       (the agent must physically be close to the path to "unlock" the next section).
+
+    On episode reset ``current_segment_idx`` is set to 0, forcing the agent to
+    traverse the entire trajectory from the start every episode.
     """
     state = _trajectory_guidance_ensure_matched(
         env,
@@ -267,7 +321,24 @@ def _trajectory_guidance_get_cached_path_geometry(
     store = state["store"]
     traj_indices = state["traj_indices"]
     student_ee = state["student_ee_buf"]
-    progress, lateral, arc_len, total_len = store.project_ee_to_progress_detailed(student_ee, traj_indices)
+    origin_delta = state["origin_delta"]
+    student_ee_in_rec = student_ee - origin_delta
+    current_seg = state["current_segment_idx"]
+
+    progress, lateral, arc_len, total_len, best_seg = store.project_ee_to_progress_windowed(
+        student_ee_in_rec, traj_indices, current_seg, window=_TRAJECTORY_PROJ_WINDOW,
+    )
+
+    # --- strict sequential advancement ---
+    # 1. Never go backward.
+    new_seg = torch.maximum(best_seg, current_seg)
+    # 2. Cap per-step forward advance.
+    new_seg = torch.minimum(new_seg, current_seg + _TRAJECTORY_MAX_SEG_ADVANCE)
+    # 3. Only advance when the agent is actually close to the path (lateral gate).
+    close_enough = lateral <= _TRAJECTORY_ADVANCE_LATERAL_GATE
+    new_seg = torch.where(close_enough, new_seg, current_seg)
+
+    state["current_segment_idx"] = new_seg
 
     teacher_g: torch.Tensor | None = None
     if store.has_gripper:
@@ -329,10 +400,13 @@ def _trajectory_guidance_distance(
     store: TrajectoryStore = state["store"]
     traj_indices = state["traj_indices"]
     student_ee = state["student_ee_buf"]
+    origin_delta = state["origin_delta"]
     current_episode_length = env.episode_length_buf.to(dtype=torch.long)
 
     teacher_ee = store.get_ee_pos(traj_indices, timesteps=torch.clamp(current_episode_length - 1, min=0))
-    distance = torch.norm(student_ee - teacher_ee, dim=1)
+    # teacher_ee is in recording world frame; shift to training world frame.
+    teacher_ee_w = teacher_ee + origin_delta
+    distance = torch.norm(student_ee - teacher_ee_w, dim=1)
 
     state["last_time_sync_distance_step_id"] = step_id
     state["last_time_sync_distance"] = distance.detach()
@@ -478,6 +552,8 @@ def teacher_gripper_alignment_reward(
     command_name: str = "object_pose",
     match_mode: str = "object_goal",
     exact_match_tol: float = 1.0e-3,
+    close_threshold: float = 0.15,
+    close_boost: float = 2.0,
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
@@ -486,6 +562,10 @@ def teacher_gripper_alignment_reward(
 
     Teacher index ``t = round(progress * (T-1))`` where ``progress`` comes from EE projection on the
     polyline. If the dataset has no ``gripper_trajectories``, returns zeros.
+
+    When ``close_boost > 1`` the reward is multiplied by ``close_boost`` on trajectory
+    segments where the teacher gripper is below ``close_threshold`` (grasping phase),
+    giving extra incentive to actually close the gripper around the object.
     """
     geom = _trajectory_guidance_get_cached_path_geometry(
         env,
@@ -516,6 +596,10 @@ def teacher_gripper_alignment_reward(
     student_g = _student_gripper_pos(env, robot_cfg)
     err = torch.abs(student_g - teacher_g)
     r = 1.0 - torch.tanh(err / float(std))
+
+    if float(close_boost) > 1.0:
+        teacher_closed = (teacher_g < float(close_threshold)).to(dtype=r.dtype)
+        r = r * (1.0 + teacher_closed * (float(close_boost) - 1.0))
 
     state["last_gripper_reward_step_id"] = step_id
     state["last_compute_step_id"] = step_id
