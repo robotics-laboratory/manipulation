@@ -10,10 +10,8 @@
 
 from dataclasses import MISSING
 
-import isaaclab.sim as sim_utils
-
-# from . import mdp
 import isaac_so_arm101.tasks.lift.mdp as mdp
+import isaaclab.sim as sim_utils
 from isaaclab.assets import (
     ArticulationCfg,
     AssetBaseCfg,
@@ -35,10 +33,9 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdF
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
-# from isaaclab.utils.offset import OffsetCfg
-# from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-# from isaaclab.utils.visualizer import FRAME_MARKER_CFG
-# from isaaclab.utils.assets import RigidBodyPropertiesCfg
+##
+# Scene definition
+##
 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
@@ -46,16 +43,11 @@ CAMERA_FOCAL_LENGTH = 18.15
 CAMERA_HORIZONTAL_APERTURE = 20.955
 
 
-##
-# Scene definition
-##
-
-
 @configclass
 class ObjectTableSceneCfg(InteractiveSceneCfg):
     """Configuration for the lift scene with a robot and a object.
-    This is the abstract base implementation, the exact scene is defined in the derived classes
-    which need to set the target object, robot and end-effector frames
+
+    The exact scene is defined in the derived classes which set the target object, robot and EE frames.
     """
 
     # robots: will be populated by agent env cfg
@@ -85,13 +77,10 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
     )
 
-    # Dataset-aligned camera defaults (legalaspro/so101-pick-and-place-cube-lerobot-50hz):
-    # - observation.images.top: static overhead camera in world frame
-    # - observation.images.wrist: camera attached to gripper_link
+    # Dataset-style cameras: top + side (static) + wrist (gripper).
     camera_top = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/CameraTop",
         offset=TiledCameraCfg.OffsetCfg(
-            # Updated from manual Isaac Sim camera transform.
             pos=(0.06488, 0.00395, 1.06841),
             rot=(0.700464905, -0.087983463, -0.008909328, -0.708186734),
             convention="opengl",
@@ -109,9 +98,25 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
     camera_wrist = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/gripper_link/CameraWrist",
         offset=TiledCameraCfg.OffsetCfg(
-            # Updated from manual Isaac Sim camera transform.
             pos=(0.00165, 0.10846, -0.02989),
             rot=(0.902356149, -0.419715014, -0.068417350, -0.070083908),
+            convention="opengl",
+        ),
+        data_types=["rgb"],
+        width=CAMERA_WIDTH,
+        height=CAMERA_HEIGHT,
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=CAMERA_FOCAL_LENGTH,
+            focus_distance=400.0,
+            horizontal_aperture=CAMERA_HORIZONTAL_APERTURE,
+            clipping_range=(0.1, 1.0e5),
+        ),
+    )
+    camera_side = TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/CameraSide",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.52, -0.64128, 0.35135),
+            rot=(0.809384006, 0.523186174, 0.192846850, 0.184347092),
             convention="opengl",
         ),
         data_types=["rgb"],
@@ -137,7 +142,7 @@ class CommandsCfg:
 
     object_pose = mdp.UniformPoseCommandCfg(
         asset_name="robot",
-        body_name=MISSING,  # will be set by agent env cfg
+        body_name=MISSING,
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
@@ -155,7 +160,6 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    # will be set by agent env cfg
     arm_action: mdp.JointPositionActionCfg | mdp.DifferentialInverseKinematicsActionCfg = MISSING
     gripper_action: mdp.BinaryJointPositionActionCfg = MISSING
 
@@ -190,10 +194,9 @@ class ObservationsCfg:
             func=mdp.image,
             params={"sensor_cfg": SceneEntityCfg("camera_wrist"), "data_type": "rgb", "normalize": False},
         )
-        # Backward-compatible aliases for existing scripts/checkpoints.
         images_side = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("camera_top"), "data_type": "rgb", "normalize": False},
+            params={"sensor_cfg": SceneEntityCfg("camera_side"), "data_type": "rgb", "normalize": False},
         )
         images_up = ObsTerm(
             func=mdp.image,
@@ -203,7 +206,6 @@ class ObservationsCfg:
         def __post_init__(self):
             self.concatenate_terms = False
 
-    # observation groups
     policy: PolicyCfg = PolicyCfg()
     observation: ImagesCfg = ImagesCfg()
 
@@ -245,7 +247,6 @@ class RewardsCfg:
         weight=5.0,
     )
 
-    # action penalty
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
 
     joint_vel = RewTerm(
@@ -288,40 +289,26 @@ class CurriculumCfg:
 class LiftEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the lifting environment."""
 
-    # Scene settings
     scene: ObjectTableSceneCfg = ObjectTableSceneCfg(num_envs=4096, env_spacing=2.5)
-    # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
-    # MDP settings
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
-    # If True, do not spawn task cameras and disable image observation terms.
-    # This is useful for state-only RL training where cameras are unnecessary.
+
     disable_task_cameras: bool = False
-    # If set, trajectory-guided rewards skip ``TrajectoryStore.match`` and use this dataset row index
-    # (same teacher polyline for every env — e.g. fixed cube / fixed goal experiments).
     trajectory_guidance_fixed_traj_index: int | None = None
-    # When True, teacher trajectory / gripper dense rewards are zeroed after the object first exceeds
-    # ``lift_suppression_min_height`` (same condition as ``lifting_object``).
-    # Stored on env cfg so Hydra/from_dict cannot drop it from reward term kwargs (see ``mdp/rewards.py``).
     suppress_dense_teacher_rewards_after_lift: bool = False
     lift_suppression_min_height: float | None = None
-    # ``episode``: per-env — teacher dense off from first lift in that env until its episode reset.
-    # ``global``: first lift in **any** env disables teacher dense for **all** envs until the process exits.
     suppress_dense_teacher_after_lift_scope: str = "episode"
 
     def __post_init__(self):
-        """Post initialization."""
-        # general settings
         self.decimation = 2
         self.episode_length_s = 5.0
         self.viewer.eye = (2.5, 2.5, 1.5)
-        # simulation settings
-        self.sim.dt = 0.01  # 100Hz
+        self.sim.dt = 0.01
         self.sim.render_interval = self.decimation
 
         self.sim.physx.bounce_threshold_velocity = 0.2
@@ -329,11 +316,12 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
         self.sim.physx.friction_correlation_distance = 0.00625
-        self.image_obs_list = ["camera_top", "camera_wrist"]
+        self.image_obs_list = ["camera_top", "camera_wrist", "camera_side"]
 
         if self.disable_task_cameras:
             self.scene.camera_top = None
             self.scene.camera_wrist = None
+            self.scene.camera_side = None
             self.image_obs_list = []
             self.observations.observation.images_top = None
             self.observations.observation.images_wrist = None

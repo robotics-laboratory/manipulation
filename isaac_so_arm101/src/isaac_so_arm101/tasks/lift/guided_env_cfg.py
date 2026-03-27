@@ -139,14 +139,14 @@ class GuidedRewardsCfg(RewardsCfg):
             # Smaller sigma => tanh reacts more to typical Δs per RL step; scale boosts raw term.
             "path_progress_delta_std": 0.02,
             "path_progress_scale": 2.0,
-            "lateral_penalty_weight": 0.0,
-            "lateral_std": 0.1,
+            "lateral_penalty_weight": 0.4,
+            "lateral_std": 0.22,
             "only_forward_progress": True,
             "progress_lateral_gate": None,
             "num_path_milestones": 8,
             "max_milestone_jump": 1,
             "milestone_reward_scale": 1.0,
-            "milestone_lateral_gate": 0.08,
+            "milestone_lateral_gate": 0.12,
         },
         weight=12.0,
     )
@@ -191,14 +191,14 @@ class GuidedDiscriminatorRewardsCfg(RewardsCfg):
             "guidance_mode": "path_progress",
             "path_progress_delta_std": 0.02,
             "path_progress_scale": 2.0,
-            "lateral_penalty_weight": 0.0,
-            "lateral_std": 0.1,
+            "lateral_penalty_weight": 0.4,
+            "lateral_std": 0.22,
             "only_forward_progress": True,
             "progress_lateral_gate": None,
             "num_path_milestones": 8,
             "max_milestone_jump": 1,
             "milestone_reward_scale": 1.0,
-            "milestone_lateral_gate": 0.08,
+            "milestone_lateral_gate": 0.12,
         },
         weight=0.0,
     )
@@ -274,9 +274,9 @@ class SoArm101GuidedLiftCubeSparseEnvCfg(SoArm101LiftCubeSparseEnvCfg):
         # Sparse task signal (main success objective — scale vs dense shaping):
         self.rewards.lifting_object.weight = 100.0
         self.rewards.lifting_object.params["minimal_height"] = 0.025
-        # Weak teacher dense shaping (no post-lift suppression — lift stays primary via weighting).
-        self.rewards.trajectory_guidance.weight = 0.35
-        self.rewards.teacher_gripper_alignment.weight = 0.35
+        # Teacher dense shaping: strong enough vs sparse lift; lateral_penalty in params pulls back to path.
+        self.rewards.trajectory_guidance.weight = 5.0
+        self.rewards.teacher_gripper_alignment.weight = 1.0
         # Disable curriculum ramp — it dominates the path-progress signal.
         self.curriculum.action_rate = None
         self.curriculum.joint_vel = None

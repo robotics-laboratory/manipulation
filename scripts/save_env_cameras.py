@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Load the Isaac Lab SO-101 env with cameras enabled, run one reset, and save
-the rendered camera images to PNGs. Use this to inspect how the env's
-top/wrist (or other) camera views look.
+the rendered camera images to PNGs (``CameraTop.png``, ``CameraSide.png``,
+``CameraWrist.png`` when those observation terms exist).
 
 Usage:
   ./isaaclab.sh -p scripts/save_env_cameras.py
@@ -76,6 +76,8 @@ _CANONICAL_CAMERA_OBS_KEYS = {
     "CameraTop": (
         "observation.images.top",
         "observation.images_top",
+    ),
+    "CameraSide": (
         "observation.images.side",
         "observation.images_side",
     ),
@@ -86,6 +88,9 @@ _CANONICAL_CAMERA_OBS_KEYS = {
         "observation.images_up",
     ),
 }
+
+# Order used when saving PNGs (lift-cube tasks with task cameras).
+_SAVE_CAMERA_ORDER = ("CameraTop", "CameraSide", "CameraWrist")
 
 
 def _print_camera_offsets(env_cfg) -> None:
@@ -205,7 +210,7 @@ def main():
 
     selected_keys = _pick_camera_observation_keys(flat)
     saved = 0
-    for camera_name in ("CameraTop", "CameraWrist"):
+    for camera_name in _SAVE_CAMERA_ORDER:
         key = selected_keys.get(camera_name)
         if key is None:
             continue
@@ -220,8 +225,8 @@ def main():
     if saved == 0:
         print("[save_env_cameras] No image observations found. Ensure the task has cameras and --enable_cameras is set.")
         print("  Observation keys:", list(flat.keys()))
-    elif saved < 2:
-        missing = [name for name in ("CameraTop", "CameraWrist") if name not in selected_keys]
+    elif saved < len(_SAVE_CAMERA_ORDER):
+        missing = [name for name in _SAVE_CAMERA_ORDER if name not in selected_keys]
         print(f"[save_env_cameras] Warning: missing camera observations for {missing}")
         print(f"[save_env_cameras] Available image-like keys: {[k for k, v in flat.items() if _is_image_array(v)]}")
         print(f"[save_env_cameras] Done. Saved {saved} image(s) to {out_dir.absolute()}")

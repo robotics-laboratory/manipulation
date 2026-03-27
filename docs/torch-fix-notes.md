@@ -188,6 +188,19 @@ Applied to all scripts in `scripts/rsl_rl/` that import `rsl_rl`:
 `train.py`, `play.py`, `collect_trajectories.py`, `collect_bc_dataset.py`,
 `train_bc.py`.
 
+## Torchvision + `inspect` + `isaaclab` namespace (`run_smolvla_isaac.py`)
+
+If LeRobot is imported **after** `from isaaclab.app import AppLauncher`, importing
+`torchvision` (via `lerobot.datasets` → …) can trigger
+`torch.library.register_fake` in torchvision, which calls `inspect.getsource`.
+That path may fail with:
+
+`TypeError: <module 'isaaclab' (...NamespaceLoader...)> is a built-in module`
+
+**Fix:** In `scripts/run_smolvla_isaac.py`, import `torch`, `torchvision`, and
+`SmolVLAPolicy` / `make_pre_post_processors` **before** `AppLauncher` so torchvision
+initializes while the stack is not polluted by the `isaaclab` namespace package.
+
 ## References
 
 - https://github.com/isaac-sim/IsaacLab/issues/2652

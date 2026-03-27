@@ -121,8 +121,8 @@ class SoArm101FixedLayoutGuidedLiftCubeSparseEnvCfg(SoArm101FixedLayoutLiftCubeS
         # Dense task rewards stay OFF (sparse base).
         self.rewards.lifting_object.weight = 100.0
         self.rewards.lifting_object.params["minimal_height"] = 0.025
-        self.rewards.trajectory_guidance.weight = 0.35
-        self.rewards.teacher_gripper_alignment.weight = 0.35
+        self.rewards.trajectory_guidance.weight = 5.0
+        self.rewards.teacher_gripper_alignment.weight = 1.0
         self.curriculum.action_rate = None
         self.curriculum.joint_vel = None
 

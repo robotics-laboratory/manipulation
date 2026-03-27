@@ -12,6 +12,10 @@ Expected JSON shape:
   "camera_wrist": {
     "translate": [x, y, z],
     "orient": [rx_deg, ry_deg, rz_deg]
+  },
+  "camera_side": {
+    "translate": [x, y, z],
+    "orient": [rx_deg, ry_deg, rz_deg]
   }
 }
 
@@ -129,6 +133,7 @@ def apply_camera_json_to_env_cfg(env_cfg, json_path: str | Path):
     Recognized camera keys:
     - camera_top
     - camera_wrist
+    - camera_side
     """
     json_path = Path(json_path).resolve()
     if not json_path.exists():
@@ -145,7 +150,7 @@ def apply_camera_json_to_env_cfg(env_cfg, json_path: str | Path):
         return
 
     applied = 0
-    for key in ("camera_top", "camera_wrist"):
+    for key in ("camera_top", "camera_wrist", "camera_side"):
         cam_cfg_data = data.get(key)
         if cam_cfg_data is None:
             continue
@@ -153,4 +158,6 @@ def apply_camera_json_to_env_cfg(env_cfg, json_path: str | Path):
             applied += 1
 
     if applied == 0:
-        raise ValueError("No compatible camera entries found in JSON (expected camera_top and/or camera_wrist)")
+        raise ValueError(
+            "No compatible camera entries found in JSON (expected camera_top, camera_wrist, and/or camera_side)"
+        )

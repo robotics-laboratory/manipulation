@@ -305,13 +305,15 @@ _TRAJECTORY_PROJ_WINDOW: int = 15
 _TRAJECTORY_MAX_SEG_ADVANCE: int = 5
 """Max segment advance per RL step.  Prevents "speed-running" through the trajectory."""
 
-_TRAJECTORY_ADVANCE_LATERAL_GATE: float = 0.10
+_TRAJECTORY_ADVANCE_LATERAL_GATE: float = 0.25
 """Horizontal (XY) distance (metres) within which the segment pointer may advance.
 
 Uses **XY-only** distance to the projected polyline point so vertical lift (large
 3D offset from a table-height teacher path) does not freeze segment progression.
 The segment pointer only advances when this horizontal offset is below the
 threshold, limiting planar shortcuts while allowing upward motion after grasp.
+Looser than a tight 10 cm gate avoids a dead zone where exploration leaves the path
+and ``path_progress`` stays at zero with no gradient back (pair with ``lateral_penalty_weight``).
 """
 
 
@@ -503,7 +505,7 @@ def trajectory_guidance_reward(
     num_path_milestones: int = 8,
     max_milestone_jump: int = 1,
     milestone_reward_scale: float = 1.0,
-    milestone_lateral_gate: float = 0.08,
+    milestone_lateral_gate: float = 0.12,
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
@@ -516,6 +518,8 @@ def trajectory_guidance_reward(
     - ``path_progress``: reward **forward motion along the teacher polyline** (arc-length progress).
     - ``path_progress_milestones``: ordered **milestones** along arc length; limits spatial shortcuts when
       combined with ``milestone_lateral_gate`` and ``max_milestone_jump``.
+    - ``lateral_penalty_weight`` / ``lateral_std``: optional **standing** pull toward the path in **XY**
+      via ``-weight * tanh(lateral_xy / std)`` (helps when Δprogress ≈ 0 off-path).
     - ``suppress_dense_after_lift``: if True, zero this reward after the object first exceeds
       ``lift_suppression_min_height`` (same condition as ``lifting_object``) until episode reset.
     """
@@ -628,7 +632,7 @@ def trajectory_guidance_reward(
         back = torch.relu(-delta_raw)
         r = r - float(backward_progress_penalty_weight) * torch.tanh(back / float(path_progress_delta_std))
     if lateral_penalty_weight > 0.0:
-        r = r - float(lateral_penalty_weight) * torch.tanh(lateral / float(lateral_std))
+        r = r - float(lateral_penalty_weight) * torch.tanh(lateral_xy / float(lateral_std))
 
     last_progress[:] = progress
 

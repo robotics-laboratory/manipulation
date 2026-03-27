@@ -9,5 +9,11 @@
     "translate": [0.00165, 0.10846, -0.02989],
     "orient": [-49.519, -10.504, -4.027],
     "convention": "opengl"
+  },
+  "camera_side": {
+    "translate": [0.52, -0.64128, 0.35135],
+    "orient": [64.013, 30.336, 6.428],
+    "euler_mode": "ui",
+    "convention": "opengl"
   }
 }

@@ -12,8 +12,6 @@ import json
 import sys
 from pathlib import Path
 
-from isaaclab.app import AppLauncher
-
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
 
@@ -36,6 +34,21 @@ if str(_SRC_DIR) not in sys.path:
 _EXTENSION_SRC = _PROJECT_ROOT / "isaac_so_arm101" / "src"
 if _EXTENSION_SRC.exists() and str(_EXTENSION_SRC) not in sys.path:
     sys.path.insert(0, str(_EXTENSION_SRC))
+
+# Import torch / torchvision / LeRobot *before* ``isaaclab`` (via AppLauncher). Otherwise
+# ``torchvision``'s ``@torch.library.register_fake`` runs after ``isaaclab`` is loaded as a
+# namespace package and ``inspect.getsource`` / ``getfile`` can raise
+# ``TypeError: ... 'isaaclab' ... is a built-in module`` inside Isaac Sim's Kit Python.
+try:
+    import torch
+    import torchvision  # noqa: F401 — ensure torchvision fake ops register early
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+except ImportError as err:
+    print("LeRobot/SmolVLA not installed. Install with: pip install 'lerobot[smolvla]'", file=sys.stderr)
+    raise SystemExit(1) from err
+
+from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="SmolVLA inference on Isaac Lab SO-101 env")
 parser.add_argument("--task", type=str, default="Isaac-SO-ARM101-Lift-Cube-v0", help="Gym task id")
@@ -321,14 +334,6 @@ def main():
         if "top" in lower or "side" in lower:
             return "observation.images.top"
         return f"observation.images.{sensor_name}"
-
-    try:
-        import torch
-        from lerobot.policies.factory import make_pre_post_processors
-        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-    except ImportError as err:
-        print("LeRobot/SmolVLA not installed. Install with: pip install 'lerobot[smolvla]'", file=sys.stderr)
-        raise SystemExit(1) from err
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Policy] Loading from: {args_cli.policy}")
