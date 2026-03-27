@@ -150,14 +150,14 @@ _CANONICAL_CAMERA_KEYS = {
     "observation.images.top": (
         "observation.images.top",
         "observation.images_top",
-        "observation.images.side",
-        "observation.images_side",
-    ),
-    "observation.images.wrist": (
-        "observation.images.wrist",
-        "observation.images_wrist",
         "observation.images.up",
         "observation.images_up",
+    ),
+    "observation.images.side": (
+        "observation.images.side",
+        "observation.images_side",
+        "observation.images.wrist",
+        "observation.images_wrist",
     ),
 }
 
@@ -208,23 +208,24 @@ def _default_rename_map_for_policy(policy) -> dict[str, str] | None:
         return None
 
     # Candidate destinations by preference.
-    top_candidates = ("observation.images.top", "observation.images.side", "observation.images.camera1")
-    wrist_candidates = ("observation.images.wrist", "observation.images.up", "observation.images.camera2")
+    # Dataset trained with "up" (overhead) → camera1, "side" → camera2.
+    top_candidates = ("observation.images.top", "observation.images.up", "observation.images.camera1")
+    side_candidates = ("observation.images.side", "observation.images.wrist", "observation.images.camera2")
 
     top_dst = next((k for k in top_candidates if k in keys), None)
-    wrist_dst = next((k for k in wrist_candidates if k in keys), None)
+    side_dst = next((k for k in side_candidates if k in keys), None)
 
     # Fallback: first two keys from policy if semantic names absent.
     if top_dst is None and len(keys) >= 1:
         top_dst = keys[0]
-    if wrist_dst is None and len(keys) >= 2:
-        wrist_dst = keys[1] if keys[1] != top_dst else (keys[2] if len(keys) >= 3 else None)
+    if side_dst is None and len(keys) >= 2:
+        side_dst = keys[1] if keys[1] != top_dst else (keys[2] if len(keys) >= 3 else None)
 
     out: dict[str, str] = {}
     if top_dst is not None:
         out["observation.images.top"] = top_dst
-    if wrist_dst is not None:
-        out["observation.images.wrist"] = wrist_dst
+    if side_dst is not None:
+        out["observation.images.side"] = side_dst
     return out or None
 
 
@@ -300,7 +301,11 @@ def _extract_dataset_joint_state(env, robot_name: str | None) -> np.ndarray | No
         return None
     joint_pos = joint_pos[0] if hasattr(joint_pos, "shape") and len(joint_pos.shape) >= 2 else joint_pos
     joint_pos_np = joint_pos.detach().cpu().numpy() if hasattr(joint_pos, "detach") else np.asarray(joint_pos)
-    return np.asarray([joint_pos_np[idx_by_name[name]] for name in _SO101_STATE_JOINT_ORDER], dtype=np.float32)
+    state = np.asarray([joint_pos_np[idx_by_name[name]] for name in _SO101_STATE_JOINT_ORDER], dtype=np.float32)
+    # Isaac returns joint positions in radians; LeRobot SO-101 datasets use degrees.
+    # Convert to degrees so the MEAN_STD normalizer (trained on degree values) works correctly.
+    state = np.degrees(state)
+    return state
 
 
 def _normalize_camera_obs_keys(obs: dict[str, object]) -> None:
@@ -339,9 +344,11 @@ def main():
 
     def _camera_obs_key(sensor_name: str) -> str:
         lower = sensor_name.lower()
-        if "wrist" in lower or "up" in lower:
+        if "wrist" in lower:
             return "observation.images.wrist"
-        if "top" in lower or "side" in lower:
+        if "side" in lower:
+            return "observation.images.side"
+        if "top" in lower or "up" in lower:
             return "observation.images.top"
         return f"observation.images.{sensor_name}"
 
