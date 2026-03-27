@@ -100,6 +100,16 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--policy-action-in-degrees",
+    dest="policy_action_in_degrees",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "Convert first 5 arm joint targets from degrees to radians (LeRobot SO-101 / SmolVLA finetunes). "
+        "Disable with --no-policy-action-in-degrees if the policy already outputs radians."
+    ),
+)
+parser.add_argument(
     "--rename_map",
     type=str,
     default=None,
@@ -510,12 +520,19 @@ def main():
                 action = policy.select_action(batch)
             action = postprocess(action)
             action = action.cpu().numpy() if hasattr(action, "cpu") else np.asarray(action)
+            action = np.asarray(action, dtype=np.float32).flatten()
+            # LeRobot SO-101 datasets use degrees for joint targets; Isaac JointPositionAction expects radians.
+            if args_cli.policy_action_in_degrees and action.shape[0] >= 5:
+                action = action.copy()
+                action[:5] = action[:5] * (np.pi / 180.0)
             action = _remap_policy_action_to_env_order(
                 action,
                 env_arm_joint_order=env_arm_joint_order,
                 gripper_binary_threshold=args_cli.gripper_binary_threshold,
             )
             if ep == 0 and step == 0:
+                if args_cli.policy_action_in_degrees:
+                    print("[Policy] Arm joint commands converted from degrees to radians (first 5 dims).")
                 a = np.asarray(action).flatten()
                 print(f"[Policy] First-step action stats: min={a.min():.4f} max={a.max():.4f} mean={a.mean():.4f}")
 
