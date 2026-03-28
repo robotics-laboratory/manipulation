@@ -110,6 +110,18 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--missing-camera-fill",
+    type=str,
+    choices=("last", "first", "camera1", "camera2", "zeros"),
+    default="first",
+    help=(
+        "If rename_map does not fill all three policy cameras, fill missing slots by "
+        "duplicating: 'first' (default) = first filled slot (typical: cam3 ← overhead/cam1); "
+        "'last' = duplicate last filled slot; 'camera1'/'camera2' = that slot if present; "
+        "'zeros' = black images."
+    ),
+)
+parser.add_argument(
     "--rename_map",
     type=str,
     default=None,
@@ -156,6 +168,8 @@ _CANONICAL_CAMERA_KEYS = {
     "observation.images.side": (
         "observation.images.side",
         "observation.images_side",
+    ),
+    "observation.images.wrist": (
         "observation.images.wrist",
         "observation.images_wrist",
     ),
@@ -202,30 +216,34 @@ def _policy_image_keys(policy) -> list[str]:
 
 
 def _default_rename_map_for_policy(policy) -> dict[str, str] | None:
-    """Map env top/wrist cameras to whichever keys the current policy expects."""
+    """Map env cameras to policy keys. Default: top → cam1, wrist → cam2 (SO-101 top+wrist finetunes)."""
     keys = _policy_image_keys(policy)
     if not keys:
         return None
 
-    # Candidate destinations by preference.
-    # Dataset trained with "up" (overhead) → camera1, "side" → camera2.
+    # Policy-side destination names (prefer semantic keys, then camera1/2/3).
     top_candidates = ("observation.images.top", "observation.images.up", "observation.images.camera1")
-    side_candidates = ("observation.images.side", "observation.images.wrist", "observation.images.camera2")
+    second_candidates = (
+        "observation.images.wrist",
+        "observation.images.side",
+        "observation.images.camera2",
+    )
 
     top_dst = next((k for k in top_candidates if k in keys), None)
-    side_dst = next((k for k in side_candidates if k in keys), None)
+    second_dst = next((k for k in second_candidates if k in keys), None)
 
-    # Fallback: first two keys from policy if semantic names absent.
     if top_dst is None and len(keys) >= 1:
         top_dst = keys[0]
-    if side_dst is None and len(keys) >= 2:
-        side_dst = keys[1] if keys[1] != top_dst else (keys[2] if len(keys) >= 3 else None)
+    if second_dst is None and len(keys) >= 2:
+        second_dst = keys[1] if keys[1] != top_dst else (keys[2] if len(keys) >= 3 else None)
 
     out: dict[str, str] = {}
     if top_dst is not None:
         out["observation.images.top"] = top_dst
-    if side_dst is not None:
-        out["observation.images.side"] = side_dst
+    if second_dst is not None:
+        # Env source: wrist matches most SO-101 SmolVLA datasets (top + wrist).
+        # For top + side only, pass --rename_map with observation.images.side → camera2.
+        out["observation.images.wrist"] = second_dst
     return out or None
 
 
@@ -497,11 +515,13 @@ def main():
                 observation_state_size=args_cli.observation_state_size,
                 rename_map=rename_map,
                 empty_cameras=resolved_empty_cameras,
+                missing_camera_fill=args_cli.missing_camera_fill,
             )
 
             if ep == 0 and step == 0:
                 print(f"[Images] Env observation keys: {list(single_obs.keys())}")
                 print(f"[Images] rename_map: {rename_map}")
+                print(f"[Images] missing_camera_fill={args_cli.missing_camera_fill}")
                 if "observation.state" in single_obs:
                     state_np = np.asarray(single_obs["observation.state"]).flatten()
                     print(f"[State] observation.state: shape={state_np.shape} values={np.array2string(state_np, precision=4)}")

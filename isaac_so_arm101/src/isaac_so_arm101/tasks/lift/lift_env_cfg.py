@@ -77,7 +77,8 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
     )
 
-    # Dataset-style cameras: top + side (static) + wrist (gripper).
+    # Cameras: top + wrist (+ optional side). Many SmolVLA finetunes use top + wrist only;
+    # use --rename_map if your policy expects side/up instead of wrist for the 2nd view.
     camera_top = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/CameraTop",
         offset=TiledCameraCfg.OffsetCfg(

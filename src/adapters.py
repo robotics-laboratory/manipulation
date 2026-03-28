@@ -63,6 +63,71 @@ def _empty_image_batch() -> np.ndarray:
     return np.expand_dims(np.zeros((3, IMAGE_SHAPE[1], IMAGE_SHAPE[2]), dtype=np.float32), axis=0)
 
 
+# When rename_map uses dataset-style keys (e.g. ``up``) but Isaac env exposes
+# ``top``/``wrist`` for the same physical views, resolve to whichever key exists.
+_RENAME_SRC_EQUIVALENTS: dict[str, tuple[str, ...]] = {
+    "observation.images.up": (
+        "observation.images.up",
+        "observation.images_up",
+        "observation.images.top",
+        "observation.images_top",
+    ),
+    "observation.images.top": (
+        "observation.images.top",
+        "observation.images_top",
+        "observation.images.up",
+        "observation.images_up",
+    ),
+    "observation.images.side": (
+        "observation.images.side",
+        "observation.images_side",
+        "observation.images.wrist",
+        "observation.images_wrist",
+    ),
+    "observation.images.wrist": (
+        "observation.images.wrist",
+        "observation.images_wrist",
+        "observation.images.side",
+        "observation.images_side",
+    ),
+}
+
+
+def _resolve_rename_src_obs_key(obs: dict[str, Any], src_key: str) -> str | None:
+    """Return the observation key to read for ``src_key``, or None if no image found."""
+    if src_key in obs:
+        return src_key
+    for candidate in _RENAME_SRC_EQUIVALENTS.get(src_key, ()):
+        if candidate in obs:
+            return candidate
+    return None
+
+
+def _fallback_tensor_for_missing_cameras(
+    frame: dict[str, Any],
+    present_camera_slots: list[str],
+    strategy: str,
+) -> np.ndarray:
+    """Pick a (1,3,H,W) tensor to copy into missing camera slots."""
+    if strategy == "zeros" or not present_camera_slots:
+        return _empty_image_batch()
+    if strategy == "last":
+        return np.array(frame[present_camera_slots[-1]], copy=True)
+    if strategy == "first":
+        return np.array(frame[present_camera_slots[0]], copy=True)
+    if strategy == "camera1":
+        k = "observation.images.camera1"
+        if k in frame:
+            return np.array(frame[k], copy=True)
+        return np.array(frame[present_camera_slots[0]], copy=True)
+    if strategy == "camera2":
+        k = "observation.images.camera2"
+        if k in frame:
+            return np.array(frame[k], copy=True)
+        return np.array(frame[present_camera_slots[-1]], copy=True)
+    return np.array(frame[present_camera_slots[-1]], copy=True)
+
+
 def isaac_obs_to_policy_frame(
     obs: dict[str, Any],
     language_instruction: str = "Pick the cube.",
@@ -71,11 +136,16 @@ def isaac_obs_to_policy_frame(
     observation_state_size: int | None = None,
     rename_map: dict[str, str] | None = None,
     empty_cameras: int = 0,
+    missing_camera_fill: str = "first",
 ) -> dict[str, Any]:
     """
     Build a policy frame from Isaac env observation.
 
     rename_map maps env observation key -> policy key.
+
+    missing_camera_fill: when fewer than three views are mapped, how to fill
+    ``observation.images.camera*`` gaps (``first`` ≈ duplicate top/camera1 for
+    cam2/3 — common for 2-camera SO-101 finetunes; ``last`` = legacy behavior).
     """
     frame = {LANGUAGE_KEY: language_instruction, TASK_KEY: language_instruction}
     image_key_map = image_key_map or {}
@@ -83,9 +153,10 @@ def isaac_obs_to_policy_frame(
 
     if rename_map:
         for src_key, dst_key in rename_map.items():
-            if src_key not in obs:
+            resolved = _resolve_rename_src_obs_key(obs, src_key)
+            if resolved is None:
                 continue
-            img = _resize_to_chw(_to_numpy(obs[src_key]), (IMAGE_SHAPE[1], IMAGE_SHAPE[2]))
+            img = _resize_to_chw(_to_numpy(obs[resolved]), (IMAGE_SHAPE[1], IMAGE_SHAPE[2]))
             if img.shape[0] == 1:
                 img = np.repeat(img, 3, axis=0)
             frame[dst_key] = np.expand_dims(img.astype(np.float32), axis=0)
@@ -94,10 +165,12 @@ def isaac_obs_to_policy_frame(
         present_camera_slots = [k for k in CAMERA_KEYS if k in frame]
 
         # Base SmolVLA expects camera1/2/3 and often uses empty_cameras=0.
-        # If we have some camera slots but not all, duplicate the latest available
-        # image so all three slots are present and marked valid.
+        # If we have some camera slots but not all, fill missing slots (duplicate
+        # another view or zeros — see ``missing_camera_fill``).
         if empty_cameras <= 0 and present_camera_slots:
-            fallback = frame[present_camera_slots[-1]]
+            fallback = _fallback_tensor_for_missing_cameras(
+                frame, present_camera_slots, missing_camera_fill
+            )
             for key in CAMERA_KEYS:
                 if key not in frame:
                     frame[key] = np.array(fallback, copy=True)
