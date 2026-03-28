@@ -153,11 +153,13 @@ _CANONICAL_CAMERA_KEYS = {
         "observation.images.up",
         "observation.images_up",
     ),
+    "observation.images.wrist": (
+        "observation.images.wrist",
+        "observation.images_wrist",
+    ),
     "observation.images.side": (
         "observation.images.side",
         "observation.images_side",
-        "observation.images.wrist",
-        "observation.images_wrist",
     ),
 }
 
@@ -176,6 +178,37 @@ _SO101_ARM_JOINT_ORDER = (
     "wrist_flex",
     "wrist_roll",
 )
+
+# Index of the gripper dimension in the 6-D SO-101 action vector.
+_GRIPPER_ACTION_IDX = 5
+
+
+def _infer_gripper_threshold(policy) -> float | None:
+    """Derive a gripper open/close threshold from the policy's action normalizer.
+
+    LeRobot MEAN_STD normalizers store the training-set mean for every action
+    dimension.  The mean of the gripper dimension is a reasonable boundary
+    between "open" and "closed" for binary thresholding, because the
+    SO-101 gripper range is strictly non-negative (0-55 deg) and the mean
+    sits between the two modes.
+
+    Returns the threshold in the original (denormalized / degree) scale,
+    or ``None`` if the stats are unavailable.
+    """
+    # normalize_targets is the output (action) normalizer in LeRobot SmolVLA.
+    normalizer = getattr(policy, "normalize_targets", None)
+    if normalizer is None:
+        return None
+    mean = getattr(normalizer, "mean", None)
+    if mean is None:
+        return None
+    try:
+        mean_np = mean.detach().cpu().numpy().flatten()
+    except Exception:
+        mean_np = np.asarray(mean).flatten()
+    if mean_np.size <= _GRIPPER_ACTION_IDX:
+        return None
+    return float(mean_np[_GRIPPER_ACTION_IDX])
 
 
 def _policy_image_keys(policy) -> list[str]:
@@ -202,28 +235,43 @@ def _policy_image_keys(policy) -> list[str]:
 
 
 def _default_rename_map_for_policy(policy) -> dict[str, str] | None:
-    """Map env top/wrist cameras to whichever keys the current policy expects."""
+    """Map env top/wrist/side cameras to whichever keys the current policy expects.
+
+    Default convention for SO-101 finetunes:
+        top (overhead)  → camera1
+        wrist           → camera2
+        side            → camera3
+    The adapters layer fills any missing camera slot via duplication so models
+    trained with fewer real cameras (e.g. 2 out of 3) still work.
+    """
     keys = _policy_image_keys(policy)
     if not keys:
         return None
 
-    # Candidate destinations by preference.
-    # Dataset trained with "up" (overhead) → camera1, "side" → camera2.
+    # Candidate destinations by preference — match env camera → policy slot.
     top_candidates = ("observation.images.top", "observation.images.up", "observation.images.camera1")
-    side_candidates = ("observation.images.side", "observation.images.wrist", "observation.images.camera2")
+    wrist_candidates = ("observation.images.wrist", "observation.images.camera2")
+    side_candidates = ("observation.images.side", "observation.images.camera3")
 
     top_dst = next((k for k in top_candidates if k in keys), None)
+    wrist_dst = next((k for k in wrist_candidates if k in keys), None)
     side_dst = next((k for k in side_candidates if k in keys), None)
 
-    # Fallback: first two keys from policy if semantic names absent.
-    if top_dst is None and len(keys) >= 1:
-        top_dst = keys[0]
-    if side_dst is None and len(keys) >= 2:
-        side_dst = keys[1] if keys[1] != top_dst else (keys[2] if len(keys) >= 3 else None)
+    # Fallback: assign remaining policy keys in order if semantic names absent.
+    used = {top_dst, wrist_dst, side_dst} - {None}
+    remaining = [k for k in keys if k not in used]
+    if top_dst is None and remaining:
+        top_dst = remaining.pop(0)
+    if wrist_dst is None and remaining:
+        wrist_dst = remaining.pop(0)
+    if side_dst is None and remaining:
+        side_dst = remaining.pop(0)
 
     out: dict[str, str] = {}
     if top_dst is not None:
         out["observation.images.top"] = top_dst
+    if wrist_dst is not None:
+        out["observation.images.wrist"] = wrist_dst
     if side_dst is not None:
         out["observation.images.side"] = side_dst
     return out or None
@@ -394,6 +442,16 @@ def main():
         else int(getattr(policy.config, "empty_cameras", 0))
     )
     print(f"[Policy] empty_cameras={resolved_empty_cameras} (resolved)")
+
+    # Auto-detect gripper threshold from policy normalization stats when not
+    # explicitly provided.  This makes SO-101 finetunes with non-negative
+    # gripper ranges (0-55 deg) work out of the box with the env's sign-based
+    # BinaryJointPositionAction.
+    if args_cli.gripper_binary_threshold is None:
+        auto_threshold = _infer_gripper_threshold(policy)
+        if auto_threshold is not None:
+            args_cli.gripper_binary_threshold = auto_threshold
+            print(f"[Gripper] Auto threshold: {auto_threshold:.2f} (from policy action stats)")
 
     task_id = args_cli.task
     reg = gym.envs.registry
