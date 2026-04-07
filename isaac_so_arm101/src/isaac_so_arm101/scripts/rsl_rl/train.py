@@ -30,6 +30,38 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
+parser.add_argument(
+    "--disable_task_cameras",
+    action="store_true",
+    default=False,
+    help="Disable TiledCamera sensors in the env (faster MLP training, no RGB rendering).",
+)
+# --- SO-ARM101-specific env overrides ---
+parser.add_argument(
+    "--trajectory_guidance_fixed_traj_index",
+    type=int,
+    default=None,
+    help="Pin guided-lift tasks to a fixed teacher-trajectory index (default: sample randomly).",
+)
+parser.add_argument(
+    "--suppress_dense_teacher_rewards_after_lift",
+    action="store_true",
+    default=False,
+    help="Zero out dense teacher-guidance rewards once the cube has been lifted.",
+)
+parser.add_argument(
+    "--lift_suppression_min_height",
+    type=float,
+    default=None,
+    help="Height threshold (m) above which teacher rewards are suppressed (requires --suppress_dense_teacher_rewards_after_lift).",
+)
+parser.add_argument(
+    "--suppress_dense_teacher_after_lift_scope",
+    type=str,
+    default=None,
+    choices=["episode", "step"],
+    help="Whether suppression persists for the rest of the episode or only the current step.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -76,6 +108,26 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def _apply_so_arm101_overrides(env_cfg, args_cli) -> None:
+    """Apply SO-ARM101 custom env-cfg overrides from CLI args (no-op for other tasks)."""
+    if args_cli.disable_task_cameras and hasattr(env_cfg, "disable_task_cameras"):
+        env_cfg.disable_task_cameras = True
+    if args_cli.trajectory_guidance_fixed_traj_index is not None and hasattr(
+        env_cfg, "trajectory_guidance_fixed_traj_index"
+    ):
+        env_cfg.trajectory_guidance_fixed_traj_index = args_cli.trajectory_guidance_fixed_traj_index
+    if args_cli.suppress_dense_teacher_rewards_after_lift and hasattr(
+        env_cfg, "suppress_dense_teacher_rewards_after_lift"
+    ):
+        env_cfg.suppress_dense_teacher_rewards_after_lift = True
+    if args_cli.lift_suppression_min_height is not None and hasattr(env_cfg, "lift_suppression_min_height"):
+        env_cfg.lift_suppression_min_height = args_cli.lift_suppression_min_height
+    if args_cli.suppress_dense_teacher_after_lift_scope is not None and hasattr(
+        env_cfg, "suppress_dense_teacher_after_lift_scope"
+    ):
+        env_cfg.suppress_dense_teacher_after_lift_scope = args_cli.suppress_dense_teacher_after_lift_scope
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
@@ -104,6 +156,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):
         env_cfg.export_io_descriptors = False
+    _apply_so_arm101_overrides(env_cfg, args_cli)
     env_cfg.log_dir = log_dir
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

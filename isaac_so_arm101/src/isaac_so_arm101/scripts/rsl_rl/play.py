@@ -29,6 +29,38 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--disable_task_cameras",
+    action="store_true",
+    default=False,
+    help="Disable TiledCamera sensors in the env (no RGB rendering).",
+)
+# --- SO-ARM101-specific env overrides ---
+parser.add_argument(
+    "--trajectory_guidance_fixed_traj_index",
+    type=int,
+    default=None,
+    help="Pin guided-lift tasks to a fixed teacher-trajectory index.",
+)
+parser.add_argument(
+    "--suppress_dense_teacher_rewards_after_lift",
+    action="store_true",
+    default=False,
+    help="Zero out dense teacher-guidance rewards once the cube has been lifted.",
+)
+parser.add_argument(
+    "--lift_suppression_min_height",
+    type=float,
+    default=None,
+    help="Height threshold (m) above which teacher rewards are suppressed.",
+)
+parser.add_argument(
+    "--suppress_dense_teacher_after_lift_scope",
+    type=str,
+    default=None,
+    choices=["episode", "step"],
+    help="Whether suppression persists for the rest of the episode or only the current step.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -66,6 +98,26 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from log_paths import rsl_rl_root
 
 
+def _apply_so_arm101_overrides(env_cfg, args_cli) -> None:
+    """Apply SO-ARM101 custom env-cfg overrides from CLI args (no-op for other tasks)."""
+    if args_cli.disable_task_cameras and hasattr(env_cfg, "disable_task_cameras"):
+        env_cfg.disable_task_cameras = True
+    if args_cli.trajectory_guidance_fixed_traj_index is not None and hasattr(
+        env_cfg, "trajectory_guidance_fixed_traj_index"
+    ):
+        env_cfg.trajectory_guidance_fixed_traj_index = args_cli.trajectory_guidance_fixed_traj_index
+    if args_cli.suppress_dense_teacher_rewards_after_lift and hasattr(
+        env_cfg, "suppress_dense_teacher_rewards_after_lift"
+    ):
+        env_cfg.suppress_dense_teacher_rewards_after_lift = True
+    if args_cli.lift_suppression_min_height is not None and hasattr(env_cfg, "lift_suppression_min_height"):
+        env_cfg.lift_suppression_min_height = args_cli.lift_suppression_min_height
+    if args_cli.suppress_dense_teacher_after_lift_scope is not None and hasattr(
+        env_cfg, "suppress_dense_teacher_after_lift_scope"
+    ):
+        env_cfg.suppress_dense_teacher_after_lift_scope = args_cli.suppress_dense_teacher_after_lift_scope
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -85,6 +137,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     log_dir = os.path.dirname(resume_path)
     env_cfg.log_dir = log_dir
+    _apply_so_arm101_overrides(env_cfg, args_cli)
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
