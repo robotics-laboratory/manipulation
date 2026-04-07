@@ -55,7 +55,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "torch==2.7.0" --extra-index-url https://download.pytorch.org/whl/cu128 && \
     TORCH_DIR=$(/isaac-sim/python.sh -c "import torch, os; print(os.path.dirname(torch.__file__))") && \
     ln -s "$TORCH_DIR" /isaac-sim/exts/omni.isaac.ml_archive/pip_prebundle/torch && \
-    /isaac-sim/python.sh -m pip install --no-deps "lerobot[smolvla]==0.4.3" && \
+    /isaac-sim/python.sh -m pip install --no-deps \
+    "lerobot[smolvla] @ git+https://github.com/huggingface/lerobot.git@v0.4.3" && \
     /isaac-sim/python.sh -m pip install \
         "datasets>=4.0.0,<4.2.0" \
         "diffusers>=0.27.2,<0.36.0" \

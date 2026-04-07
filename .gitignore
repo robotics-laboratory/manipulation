@@ -46,3 +46,4 @@ Thumbs.db
 # LeRobot / HF cache (optional; uncomment to ignore)
 # .cache/
 # huggingface/
+*.mp4

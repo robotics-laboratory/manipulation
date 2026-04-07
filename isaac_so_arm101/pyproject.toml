@@ -17,6 +17,7 @@ dependencies = [
 train = "isaac_so_arm101.scripts.rsl_rl.train:main"
 play = "isaac_so_arm101.scripts.rsl_rl.play:main"
 collect_bc_dataset = "isaac_so_arm101.scripts.rsl_rl.collect_bc_dataset:main"
+collect_lerobot_dataset = "isaac_so_arm101.scripts.rsl_rl.collect_lerobot_dataset:main"
 train_bc = "isaac_so_arm101.scripts.rsl_rl.train_bc:main"
 list_envs = "isaac_so_arm101.scripts.list_envs:main"
 zero_agent = "isaac_so_arm101.scripts.zero_agent:main"
