@@ -220,6 +220,52 @@ simulation_app.close()
 
 For **EnvHub**: put this repo on the Hub and load with `make_env("username/your-repo", trust_remote_code=True)` from a process that has already started the Isaac app (e.g. a script launched with `isaaclab.sh`).
 
+## Collecting a LeRobot dataset (simulation, RSL-RL teacher)
+
+You can record a **LeRobot v3** dataset (Parquet + MP4) by rolling out a **trained RSL-RL MLP** policy in Isaac Sim: top + wrist RGB, proprioceptive joint state (degrees), and actions. This matches the workflow used for VLA / SmolVLA finetuning data.
+
+**Script:** `isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/collect_lerobot_dataset.py`
+
+**Run it with a file path** (not `python -m ...`): the script imports sibling modules (`cli_args`, `log_paths`) from the same directory, so `isaaclab` must be given the `.py` path. From this repo root (or `/workspace/isaac-bridge` in Docker):
+
+```bash
+isaaclab -p isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/collect_lerobot_dataset.py \
+  --task Isaac-SO-ARM101-FixedLayout-Lift-Cube-Play-v0 \
+  --checkpoint /path/to/lift_fixed_layout/.../model_1499.pt \
+  --num_episodes 50 \
+  --output_dir output/datasets/my_so101_lift \
+  --repo_id local/my-so101-lift \
+  --headless
+```
+
+**Typical flags**
+
+| Flag | Role |
+|------|------|
+| `--task` | Gym id; use the same MDP as the teacher (e.g. fixed-layout dense teacher → `Isaac-SO-ARM101-FixedLayout-Lift-Cube-Play-v0`). Prefer `*-Play-*` for clean observations. |
+| `--checkpoint` | Path to the RSL-RL checkpoint (`model_*.pt`). |
+| `--num_episodes` | Episodes to record. |
+| `--output_dir` | Local folder for the LeRobot dataset. |
+| `--repo_id` | Dataset id for metadata (e.g. `HF_USER/my-dataset`). |
+| `--task_description` | Language string stored per frame (default: pick-cube phrasing). |
+| `--success_only` | Drop episodes where the cube was never lifted. |
+| `--push_to_hub` | Upload after `finalize()`; requires Hub auth (see below). |
+| `--headless` | Use in Docker / no display; the script also forces headless when `DISPLAY` is unset. |
+
+**Teacher checkpoint:** Train the MLP on the matching task first (e.g. fixed-layout dense lift). See `docs/FIXED_LAYOUT_LIFT_EXPERIMENT.md` and run `isaaclab -p isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/train.py ...` (script path, same as above).
+
+**Docker:** `docker compose run --rm isaac-bridge` mounts `output/` on the host — save under `output/datasets/...` to keep data after the container exits. For Hub upload, pass a token, e.g. `docker compose run --rm -e HF_TOKEN isaac-bridge`. The image sets `PATH` so `hf` / `huggingface-cli` resolve; use `/isaac-sim/python.sh` if anything still resolves to the wrong interpreter.
+
+**Hugging Face upload:** `--push_to_hub` does not run unless you are logged in. Options: `export HF_TOKEN=hf_...`, or `hf auth login` using the same env as Isaac (`export PATH="/isaac-sim/kit/python/bin:$PATH"` and prefer `/isaac-sim/python.sh -m huggingface_hub.cli.hf auth login` if bare `hf` fails to import deps).
+
+**SmolVLA / `lerobot-train`:** Base policy configs expect image keys `observation.images.camera1`, `camera2`, `camera3`. This collector writes `observation.images.top` and `observation.images.wrist`. Pass a rename map when training, for example:
+
+```text
+--rename_map='{"observation.images.top": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2"}'
+```
+
+If training still expects a third view, check LeRobot / SmolVLA docs for padding or duplicate-camera behavior. Offline training also needs **FFmpeg** libraries for video decoding (`torchcodec`); the project `docker/Dockerfile` installs `ffmpeg` for that.
+
 ## Project layout
 
 | File / folder | Purpose |
@@ -228,7 +274,7 @@ For **EnvHub**: put this repo on the Hub and load with `make_env("username/your-
 | `scripts/` | Entrypoint scripts (`run_smolvla_isaac.py`, `save_env_cameras.py`, `view_training_cameras.py`). |
 | `docker/` | `Dockerfile` and `docker-compose.yaml`. Build with `cd docker && docker compose build`. |
 | `tools/` | Standalone utilities (`verify_versions.py`). |
-| `isaac_so_arm101/` | **In-repo extension**: SO-100/SO-101 URDFs, reach and lift-cube tasks. Run script adds `isaac_so_arm101/src` to the path to register envs. |
+| `isaac_so_arm101/` | **In-repo extension**: SO-100/SO-101 URDFs, reach and lift-cube tasks, RSL-RL scripts (`scripts/rsl_rl/train.py`, `collect_lerobot_dataset.py`, …). Run script adds `isaac_so_arm101/src` to the path to register envs. |
 | `requirements.txt` | Extra deps (lerobot[smolvla], gymnasium, torch, etc.). |
 | `README.md` | This file. |
 

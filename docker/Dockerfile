@@ -18,8 +18,11 @@ LABEL description="Isaac Lab SO-ARM101 + LeRobot/SmolVLA bridge environment"
 
 # ---- System deps ----
 USER root
+# ffmpeg: shared libs (libavutil, libavcodec, …) required by torchcodec when LeRobot
+# decodes dataset videos during lerobot-train (see lerobot/datasets/video_utils.py).
 RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
     git \
     libgl1-mesa-dri \
     libglx-mesa0 \
@@ -28,6 +31,15 @@ RUN --mount=type=cache,target=/var/cache/apt \
 
 # ---- Project directory ----
 ENV PROJECT_DIR=/workspace/isaac-bridge
+ENV PIP_DEFAULT_TIMEOUT=120
+ENV PIP_RETRIES=10
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV PIP_EXTRA_INDEX_URL=
+ENV PIP_CONFIG_FILE=/dev/null
+# Wheel links on mirrors often point at files.pythonhosted.org; trust both without using pypi.org as an index.
+ENV PIP_TRUSTED_HOST="mirrors.aliyun.com files.pythonhosted.org download.pytorch.org"
+# Pip-installed CLIs (huggingface-cli, hf, …) live next to Isaac Sim's Python.
+ENV PATH="/isaac-sim/kit/python/bin:${PATH}"
 WORKDIR ${PROJECT_DIR}
 
 # ---- Copy project files ----
@@ -57,7 +69,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ln -s "$TORCH_DIR" /isaac-sim/exts/omni.isaac.ml_archive/pip_prebundle/torch && \
     /isaac-sim/python.sh -m pip install --no-deps \
     "lerobot[smolvla] @ git+https://github.com/huggingface/lerobot.git@v0.4.3" && \
+    /isaac-sim/python.sh -m pip install --extra-index-url https://pypi.org/simple \
+        "num2words>=0.5.14,<0.6.0" && \
     /isaac-sim/python.sh -m pip install \
+        "typing_extensions>=4.12.0" \
+        "requests>=2.31.0" \
         "datasets>=4.0.0,<4.2.0" \
         "diffusers>=0.27.2,<0.36.0" \
         "huggingface-hub[hf-transfer,cli]>=0.34.2,<0.36.0" \
@@ -73,7 +89,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "gymnasium>=1.1.1,<2.0.0" \
         "deepdiff>=7.0.1,<9.0.0" \
         "imageio[ffmpeg]>=2.34.0,<3.0.0" \
-        "num2words>=0.5.14,<0.6.0" \
         "transformers>=4.57.1,<5.0.0" && \
     /isaac-sim/python.sh -c "import torch; print(f'torch {torch.__version__} OK')" && \
     /isaac-sim/python.sh -c "import numpy; print(f'numpy {numpy.__version__} OK')" && \

@@ -286,6 +286,30 @@ class CurriculumCfg:
 ##
 
 
+def apply_disable_task_cameras_if_set(env_cfg: ManagerBasedRLEnvCfg) -> None:
+    """Strip TiledCamera sensors and image obs when ``disable_task_cameras`` is True.
+
+    Call this when the flag is set **after** ``LiftEnvCfg.__post_init__`` (e.g. RSL-RL
+    ``train.py`` / ``play.py`` CLI overrides). Otherwise cameras remain in the scene
+    while ``AppLauncher`` has ``enable_cameras=False``, which triggers a runtime error.
+    """
+    if not getattr(env_cfg, "disable_task_cameras", False):
+        return
+    scene = getattr(env_cfg, "scene", None)
+    if scene is None:
+        return
+    for name in ("camera_top", "camera_wrist", "camera_side"):
+        if hasattr(scene, name):
+            setattr(scene, name, None)
+    if hasattr(env_cfg, "image_obs_list"):
+        env_cfg.image_obs_list = []
+    obs_grp = getattr(getattr(env_cfg, "observations", None), "observation", None)
+    if obs_grp is not None:
+        for term in ("images_top", "images_wrist", "images_side", "images_up"):
+            if hasattr(obs_grp, term):
+                setattr(obs_grp, term, None)
+
+
 @configclass
 class LiftEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the lifting environment."""
@@ -319,12 +343,4 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.friction_correlation_distance = 0.00625
         self.image_obs_list = ["camera_top", "camera_wrist", "camera_side"]
 
-        if self.disable_task_cameras:
-            self.scene.camera_top = None
-            self.scene.camera_wrist = None
-            self.scene.camera_side = None
-            self.image_obs_list = []
-            self.observations.observation.images_top = None
-            self.observations.observation.images_wrist = None
-            self.observations.observation.images_side = None
-            self.observations.observation.images_up = None
+        apply_disable_task_cameras_if_set(self)

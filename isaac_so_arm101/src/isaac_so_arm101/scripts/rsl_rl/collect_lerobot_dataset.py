@@ -16,6 +16,7 @@ Usage (from the manipulation/isaac_so_arm101 directory)::
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
 import sys
 
 # LeRobot (and torchvision it pulls in) must be imported BEFORE AppLauncher to
@@ -92,6 +93,24 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 args_cli.enable_cameras = True
 
+# Docker / SSH without X11: GLFW cannot open a display; without --headless, Kit may appear
+# stuck while retrying windowing. Force headless when no display is available.
+_has_display = bool(os.environ.get("DISPLAY", "").strip()) or bool(
+    os.environ.get("WAYLAND_DISPLAY", "").strip()
+)
+if not _has_display:
+    if not getattr(args_cli, "headless", False):
+        print(
+            "[INFO] No DISPLAY/WAYLAND_DISPLAY; forcing --headless (required for camera rendering in Docker).",
+            flush=True,
+        )
+    args_cli.headless = True
+
+print(
+    "[INFO] Launching Isaac Sim (first run after install can take several minutes; this is normal).",
+    flush=True,
+)
+
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
@@ -99,7 +118,6 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import os
 from pathlib import Path
 
 import gymnasium as gym

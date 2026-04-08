@@ -94,6 +94,7 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 import isaaclab_tasks  # noqa: F401
 import isaac_so_arm101.tasks.lift  # noqa: F401
 import isaac_so_arm101.tasks.reach  # noqa: F401
+from isaac_so_arm101.tasks.lift.lift_env_cfg import apply_disable_task_cameras_if_set
 
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -126,6 +127,8 @@ def _apply_so_arm101_overrides(env_cfg, args_cli) -> None:
         env_cfg, "suppress_dense_teacher_after_lift_scope"
     ):
         env_cfg.suppress_dense_teacher_after_lift_scope = args_cli.suppress_dense_teacher_after_lift_scope
+    # CLI toggles disable_task_cameras after Hydra built the cfg; re-apply camera stripping.
+    apply_disable_task_cameras_if_set(env_cfg)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
