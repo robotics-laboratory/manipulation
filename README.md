@@ -258,11 +258,33 @@ isaaclab -p isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/collect_lerobot_d
 
 **Hugging Face upload:** `--push_to_hub` does not run unless you are logged in. Options: `export HF_TOKEN=hf_...`, or `hf auth login` using the same env as Isaac (`export PATH="/isaac-sim/kit/python/bin:$PATH"` and prefer `/isaac-sim/python.sh -m huggingface_hub.cli.hf auth login` if bare `hf` fails to import deps).
 
-**SmolVLA / `lerobot-train`:** Base policy configs expect image keys `observation.images.camera1`, `camera2`, `camera3`. This collector writes `observation.images.top` and `observation.images.wrist`. Pass a rename map when training, for example:
+**SmolVLA / offline `lerobot-train`:** Base policy configs expect image keys `observation.images.camera1`, `camera2`, `camera3`. This collector writes `observation.images.top` and `observation.images.wrist`. Pass a **rename map** when training:
 
 ```text
 --rename_map='{"observation.images.top": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2"}'
 ```
+
+Run training with the **same Python** that has LeRobot installed (avoid a mismatched `lerobot-train` on `PATH`). Prefer the module form:
+
+```bash
+python3 -m lerobot.scripts.lerobot_train \
+  --policy.path=lerobot/smolvla_base \
+  --policy.repo_id=HF_USER/so101-fixed-layout-smolvla \
+  --policy.push_to_hub=true \
+  --dataset.repo_id=HF_USER/so101-fixed-layout-vla \
+  --rename_map='{"observation.images.top": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2"}' \
+  --steps=20000 \
+  --batch_size=32 \
+  --output_dir=outputs/train/so101_fixed_layout_smolvla \
+  --job_name=so101_fixed_layout_smolvla \
+  --policy.device=cuda \
+  --wandb.enable=false
+```
+
+- Replace **`HF_USER`** with your Hugging Face namespace (`--dataset.repo_id` = Hub dataset; `--policy.repo_id` = where the finetuned policy is pushed).
+- **`--output_dir`** must not already exist unless you resume a run; checkpoints and logs are written there locally.
+- If the process is **Killed** with no traceback, reduce **`batch_size`** / **`num_workers`** — usually host or container **OOM** (see LeRobot docs for `lerobot-train --help`).
+- Hub push requires login: `python3 -m huggingface_hub.cli.hf auth login` or `HF_TOKEN` on the same interpreter.
 
 If training still expects a third view, check LeRobot / SmolVLA docs for padding or duplicate-camera behavior. Offline training also needs **FFmpeg** libraries for video decoding (`torchcodec`); the project `docker/Dockerfile` installs `ffmpeg` for that.
 

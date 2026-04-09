@@ -11,6 +11,9 @@ Usage (from the manipulation/isaac_so_arm101 directory)::
         --num_episodes 50 \\
         --output_dir datasets/so101_lift_cube \\
         --repo_id local/so101-lift-cube
+
+If a previous run left corrupt Parquet under ``--output_dir``, pass ``--overwrite_dataset``
+or delete that folder and run again.
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -87,6 +90,15 @@ parser.add_argument(
     default=1,
     help="Number of parallel envs (1 recommended for sequential collection).",
 )
+parser.add_argument(
+    "--overwrite_dataset",
+    action="store_true",
+    default=False,
+    help=(
+        "If output_dir exists, delete it and create a new dataset. "
+        "Use after a crashed run left corrupt/incomplete Parquet files."
+    ),
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 
@@ -118,6 +130,7 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import shutil
 from pathlib import Path
 
 import gymnasium as gym
@@ -297,13 +310,33 @@ def main(
     fps = int(1.0 / (env_cfg.sim.dt * env_cfg.decimation))
     output_dir = os.path.abspath(args_cli.output_dir)
     dataset_dir = Path(output_dir)
+    if args_cli.overwrite_dataset and dataset_dir.exists():
+        print(
+            f"[INFO] --overwrite_dataset: removing existing directory {output_dir}",
+            flush=True,
+        )
+        shutil.rmtree(output_dir)
+
     if dataset_dir.exists():
         # Resume: load the existing dataset and keep appending
-        dataset = LeRobotDataset(
-            repo_id=args_cli.repo_id,
-            root=output_dir,
+        try:
+            dataset = LeRobotDataset(
+                repo_id=args_cli.repo_id,
+                root=output_dir,
+            )
+        except Exception as exc:
+            print(
+                "[ERROR] Could not open existing dataset (often incomplete Parquet after a crash).\n"
+                f"  Path: {output_dir}\n"
+                "  Fix: remove that directory, or re-run with --overwrite_dataset",
+                flush=True,
+            )
+            raise RuntimeError(
+                "LeRobotDataset load failed; see message above."
+            ) from exc
+        print(
+            f"[INFO] Resuming existing dataset ({dataset.num_episodes} episodes already recorded)"
         )
-        print(f"[INFO] Resuming existing dataset ({dataset.num_episodes} episodes already recorded)")
     else:
         # Fresh start: create from scratch
         dataset = LeRobotDataset.create(
