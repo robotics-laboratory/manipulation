@@ -5,6 +5,8 @@ Usage (from the manipulation/isaac_so_arm101 directory)::
     isaaclab -p src/isaac_so_arm101/scripts/rsl_rl/play.py \\
         --task Isaac-SO-ARM101-FixedLayout-Lift-Cube-Play-v0 \\
         --checkpoint logs/rsl_rl/lift_fixed_layout/2026-03-25_20-04-03/model_1499.pt
+
+Pass ``--export_policy`` to also write ``policy.pt`` / ``policy.onnx`` under ``<checkpoint_dir>/exported/``.
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -63,6 +65,12 @@ parser.add_argument(
     default=None,
     choices=["episode", "step"],
     help="Whether suppression persists for the rest of the episode or only the current step.",
+)
+parser.add_argument(
+    "--export_policy",
+    action="store_true",
+    default=False,
+    help="Write TorchScript (policy.pt) and ONNX (policy.onnx) under <checkpoint_dir>/exported/.",
 )
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -185,9 +193,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         normalizer = None
 
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    if args_cli.export_policy:
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 

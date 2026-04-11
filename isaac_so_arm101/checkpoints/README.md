@@ -41,6 +41,8 @@ If you still hit `FileNotFoundError`, use an absolute path inside the container:
 
 `/workspace/isaac-bridge/isaac_so_arm101/checkpoints/so101_lift_cube.pt`
 
+By default, `play.py` does **not** write JIT/ONNX under `exported/`. Pass **`--export_policy`** if you want `policy.pt` and `policy.onnx` next to the checkpoint.
+
 Override directory with env **`ISAAC_SO_ARM101_FINAL_CHECKPOINTS_DIR`** (see `log_paths.py`).
 
 Weight files (`*.pt`) are gitignored; only this README is tracked.
