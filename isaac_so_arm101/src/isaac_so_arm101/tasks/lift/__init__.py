@@ -237,6 +237,27 @@ gym.register(
     disable_env_checker=True,
 )
 
+# SmolVLA RWR (Reward-Weighted Regression) finetuning env
+gym.register(
+    id="Isaac-SO-ARM101-SmolVLA-RL-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.smolvla_rl_env_cfg:SoArm101SmolVLARLEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_smolvla_ppo_cfg:SmolVLAGuidedLiftCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-SmolVLA-RL-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.smolvla_rl_env_cfg:SoArm101SmolVLARLEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_smolvla_ppo_cfg:SmolVLAGuidedLiftCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
 # SmolVLA-backed PPO with trajectory guidance
 gym.register(
     id="Isaac-SO-ARM101-SmolVLA-Guided-Lift-Cube-v0",

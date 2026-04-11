@@ -12,6 +12,12 @@ Usage (from the manipulation/isaac_so_arm101 directory)::
 import argparse
 import sys
 
+# Torch must import before AppLauncher loads ``isaaclab`` as a namespace package; otherwise
+# ``torch.library.register_fake`` / dynamo can call ``inspect.getfile(isaaclab)`` and crash
+# inside Kit Python. See ``manipulation/scripts/run_smolvla_isaac.py``.
+import torch
+import torchvision  # noqa: F401
+
 from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip
@@ -82,7 +88,13 @@ import time
 from datetime import datetime
 
 import gymnasium as gym
-import torch
+
+# Namespace package has no __file__; tensordict/torch dynamo may call inspect.getfile.
+import isaaclab as _isaaclab_ns
+
+if not getattr(_isaaclab_ns, "__file__", None):
+    _isaaclab_ns.__file__ = next(iter(_isaaclab_ns.__path__), __file__)
+
 from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg, multi_agent_to_single_agent

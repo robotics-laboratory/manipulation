@@ -421,6 +421,11 @@ def main():
             task_id = alt
 
     env_cfg = parse_env_cfg(task_id, device=args_cli.device, num_envs=args_cli.num_envs)
+    # Disable debug visualizers so markers don't appear in camera RGB (matches dataset collection)
+    if hasattr(getattr(env_cfg, "scene", None), "ee_frame"):
+        env_cfg.scene.ee_frame.debug_vis = False
+    if hasattr(getattr(env_cfg, "commands", None), "object_pose"):
+        env_cfg.commands.object_pose.debug_vis = False
     if not args_cli.no_dataset_joint_action_space:
         arm_action_cfg = getattr(getattr(env_cfg, "actions", None), "arm_action", None)
         if arm_action_cfg is not None:

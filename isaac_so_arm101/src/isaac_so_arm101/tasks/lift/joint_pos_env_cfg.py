@@ -88,9 +88,6 @@ class SoArm100LiftCubeEnvCfg(LiftEnvCfg):
             ],
         )
 
-        # See ``SoArm101LiftCubeEnvCfg``: avoid inheriting 4096 parallel manipulation envs.
-        self.scene.num_envs = 2048
-
 
 @configclass
 class SoArm100LiftCubeEnvCfg_PLAY(SoArm100LiftCubeEnvCfg):
@@ -189,11 +186,6 @@ class SoArm101LiftCubeEnvCfg(LiftEnvCfg):
                 ),
             ],
         )
-
-        # ``LiftEnvCfg`` inherits ``num_envs=4096`` from the generic table scene (reach-scale).
-        # SO-101 + DexCube per env is much heavier; thousands of envs make each PPO iteration
-        # very slow and often GPU-bound. Use ``--num_envs`` on ``train.py`` to scale up.
-        self.scene.num_envs = 2048
 
 
 @configclass

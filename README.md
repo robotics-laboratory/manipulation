@@ -133,6 +133,8 @@ Model weights (HuggingFace), pip packages, and Isaac Sim caches are stored in Do
 
 The `output/` directory is mounted from the host, so any data saved there (logs, images, checkpoints) persists after the container exits.
 
+**Curated RSL-RL weights:** After training, copy your best `model_*.pt` into [`isaac_so_arm101/checkpoints/`](isaac_so_arm101/checkpoints/README.md) with a stable name (e.g. `so101_lift_cube.pt`). That directory is bind-mounted in Docker like `logs/`, so you can point `play.py` / dataset scripts at a fixed path without retraining.
+
 ## End-effector position and deltas
 
 - **In the wrapper**: After each `step()` and `reset()`, the wrapper reads the SO-101 articulation’s end-effector link pose from the Isaac Lab scene and computes position deltas from the previous step.
@@ -222,7 +224,7 @@ For **EnvHub**: put this repo on the Hub and load with `make_env("username/your-
 
 ## Collecting a LeRobot dataset (simulation, RSL-RL teacher)
 
-You can record a **LeRobot v3** dataset (Parquet + MP4) by rolling out a **trained RSL-RL MLP** policy in Isaac Sim: top + wrist RGB, proprioceptive joint state (degrees), and actions. This matches the workflow used for VLA / SmolVLA finetuning data.
+You can record a **LeRobot v3** dataset (Parquet + MP4) by rolling out a **trained RSL-RL MLP** policy in Isaac Sim: top + wrist + side RGB, proprioceptive joint state (degrees), and actions. This matches the workflow used for VLA / SmolVLA finetuning data.
 
 **Script:** `isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/collect_lerobot_dataset.py`
 
@@ -234,9 +236,13 @@ isaaclab -p isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/collect_lerobot_d
   --checkpoint /path/to/lift_fixed_layout/.../model_1499.pt \
   --num_episodes 50 \
   --output_dir output/datasets/my_so101_lift \
-  --repo_id local/my-so101-lift \
+  --repo_id HF_USER/my-so101-lift \
+  --success_only \
+  --push_to_hub \
   --headless
 ```
+
+For Hub upload, provide your token: `docker compose run --rm -e HF_TOKEN=hf_... isaac-bridge` (or `export HF_TOKEN=hf_...` inside the container before running).
 
 **Typical flags**
 
@@ -258,10 +264,10 @@ isaaclab -p isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/collect_lerobot_d
 
 **Hugging Face upload:** `--push_to_hub` does not run unless you are logged in. Options: `export HF_TOKEN=hf_...`, or `hf auth login` using the same env as Isaac (`export PATH="/isaac-sim/kit/python/bin:$PATH"` and prefer `/isaac-sim/python.sh -m huggingface_hub.cli.hf auth login` if bare `hf` fails to import deps).
 
-**SmolVLA / offline `lerobot-train`:** Base policy configs expect image keys `observation.images.camera1`, `camera2`, `camera3`. This collector writes `observation.images.top` and `observation.images.wrist`. Pass a **rename map** when training:
+**SmolVLA / offline `lerobot-train`:** Base policy configs expect image keys `observation.images.camera1`, `camera2`, `camera3`. This collector writes `observation.images.top`, `observation.images.wrist`, and `observation.images.side`. Pass a **rename map** when training:
 
 ```text
---rename_map='{"observation.images.top": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2"}'
+--rename_map='{"observation.images.top": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2", "observation.images.side": "observation.images.camera3"}'
 ```
 
 Run training with the **same Python** that has LeRobot installed (avoid a mismatched `lerobot-train` on `PATH`). Prefer the module form:
@@ -272,7 +278,7 @@ python3 -m lerobot.scripts.lerobot_train \
   --policy.repo_id=HF_USER/so101-fixed-layout-smolvla \
   --policy.push_to_hub=true \
   --dataset.repo_id=HF_USER/so101-fixed-layout-vla \
-  --rename_map='{"observation.images.top": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2"}' \
+  --rename_map='{"observation.images.top": "observation.images.camera1", "observation.images.wrist": "observation.images.camera2", "observation.images.side": "observation.images.camera3"}' \
   --steps=20000 \
   --batch_size=32 \
   --output_dir=outputs/train/so101_fixed_layout_smolvla \

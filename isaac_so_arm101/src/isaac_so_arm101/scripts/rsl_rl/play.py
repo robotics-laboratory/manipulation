@@ -12,6 +12,9 @@ Usage (from the manipulation/isaac_so_arm101 directory)::
 import argparse
 import sys
 
+import torch
+import torchvision  # noqa: F401
+
 from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip
@@ -79,7 +82,12 @@ import os
 import time
 
 import gymnasium as gym
-import torch
+
+import isaaclab as _isaaclab_ns
+
+if not getattr(_isaaclab_ns, "__file__", None):
+    _isaaclab_ns.__file__ = next(iter(_isaaclab_ns.__path__), __file__)
+
 from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg, multi_agent_to_single_agent
@@ -96,7 +104,7 @@ from isaac_so_arm101.tasks.lift.lift_env_cfg import apply_disable_task_cameras_i
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-from log_paths import rsl_rl_root
+from log_paths import resolve_checkpoint_cli_path, rsl_rl_root
 
 
 def _apply_so_arm101_overrides(env_cfg, args_cli) -> None:
@@ -133,7 +141,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
 
     if args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+        resume_path = retrieve_file_path(resolve_checkpoint_cli_path(args_cli.checkpoint))
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 

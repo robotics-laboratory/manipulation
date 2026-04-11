@@ -22,10 +22,11 @@ import argparse
 import os
 import sys
 
-# LeRobot (and torchvision it pulls in) must be imported BEFORE AppLauncher to
-# avoid a TypeError crash in inspect.getfile when torch.library.register_fake
-# walks the call stack and encounters the isaaclab namespace package.
+# Torch / torchvision must load before AppLauncher imports isaaclab as a namespace
+# package; LeRobot pulls torch but we import torchvision explicitly for register_fake.
 # See manipulation/docs/torch-fix-notes.md for the full explanation.
+import torch
+import torchvision  # noqa: F401
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 
 from isaaclab.app import AppLauncher
@@ -158,7 +159,7 @@ import isaac_so_arm101.tasks.lift  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-from log_paths import rsl_rl_root
+from log_paths import resolve_checkpoint_cli_path, rsl_rl_root
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +246,7 @@ def main(
         os.path.join(rsl_rl_root(), agent_cfg.experiment_name)
     )
     if args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+        resume_path = retrieve_file_path(resolve_checkpoint_cli_path(args_cli.checkpoint))
     else:
         resume_path = get_checkpoint_path(
             log_root, agent_cfg.load_run, agent_cfg.load_checkpoint
@@ -293,6 +294,11 @@ def main(
             "names": ["channels", "height", "width"],
         },
         "observation.images.wrist": {
+            "dtype": "video",
+            "shape": [3, cam_h, cam_w],
+            "names": ["channels", "height", "width"],
+        },
+        "observation.images.side": {
             "dtype": "video",
             "shape": [3, cam_h, cam_w],
             "names": ["channels", "height", "width"],
@@ -366,6 +372,7 @@ def main(
 
         top_img = _extract_image(unwrapped, "camera_top")
         wrist_img = _extract_image(unwrapped, "camera_wrist")
+        side_img = _extract_image(unwrapped, "camera_side")
         state = _extract_state(unwrapped)
 
         if _cube_is_lifted(unwrapped):
@@ -375,6 +382,7 @@ def main(
             {
                 "observation.images.top": top_img,
                 "observation.images.wrist": wrist_img,
+                "observation.images.side": side_img,
                 "observation.state": state,
                 "action": actions[0].cpu(),
                 "task": args_cli.task_description,

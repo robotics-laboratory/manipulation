@@ -18,6 +18,9 @@ Usage (from the manipulation/isaac_so_arm101 directory)::
 import argparse
 import sys
 
+import torch
+import torchvision  # noqa: F401
+
 from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip
@@ -51,7 +54,11 @@ import os
 
 import gymnasium as gym
 import numpy as np
-import torch
+
+import isaaclab as _isaaclab_ns
+
+if not getattr(_isaaclab_ns, "__file__", None):
+    _isaaclab_ns.__file__ = next(iter(_isaaclab_ns.__path__), __file__)
 
 from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg
 from isaaclab.utils.assets import retrieve_file_path
@@ -66,7 +73,7 @@ import isaac_so_arm101.tasks.reach  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-from log_paths import rsl_rl_root
+from log_paths import resolve_checkpoint_cli_path, rsl_rl_root
 
 
 def _cube_is_lifted(env_unwrapped, min_height: float = 0.025) -> bool:
@@ -89,7 +96,7 @@ def main(
     log_root = os.path.abspath(os.path.join(rsl_rl_root(), agent_cfg.experiment_name))
 
     if args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
+        resume_path = retrieve_file_path(resolve_checkpoint_cli_path(args_cli.checkpoint))
     else:
         resume_path = get_checkpoint_path(log_root, agent_cfg.load_run, agent_cfg.load_checkpoint)
     print(f"[INFO] Checkpoint: {resume_path}")

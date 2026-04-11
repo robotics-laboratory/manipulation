@@ -21,6 +21,8 @@ services:
     # GPU camera rendering needs more shared memory than Docker's 64MB default
     shm_size: '4g'
     environment:
+      # Used by isaac_so_arm101/scripts/rsl_rl/log_paths.resolve_checkpoint_cli_path for --checkpoint paths
+      - PROJECT_DIR=/workspace/isaac-bridge
       - ACCEPT_EULA=Y
       - PRIVACY_CONSENT=Y
       - OMNI_KIT_ALLOW_ROOT=1
@@ -36,6 +38,8 @@ services:
       - ../isaac_so_arm101/src:/workspace/isaac-bridge/isaac_so_arm101/src
       # RSL-RL checkpoints & TensorBoard: train/play use isaac_so_arm101/logs/rsl_rl/ (see isaac_so_arm101/scripts/rsl_rl/log_paths.py)
       - ../isaac_so_arm101/logs:/workspace/isaac-bridge/isaac_so_arm101/logs
+      # Curated final model_*.pt copies (stable paths for play / datasets; see isaac_so_arm101/checkpoints/README.md)
+      - ../isaac_so_arm101/checkpoints:/workspace/isaac-bridge/isaac_so_arm101/checkpoints
       # --- Persistent caches (avoid re-downloading between runs) ---
       - isaac-cache-kit:/isaac-sim/kit/cache
       - isaac-cache-pip:/root/.cache/pip
