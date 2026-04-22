@@ -55,8 +55,6 @@ services:
       # Requires repo layout: IsaacLab/manipulation/docker with ../../source/isaaclab present.
       # Uncomment if /workspace/isaaclab in the image is stale vs your host clone:
       # - ../../source/isaaclab:/workspace/isaaclab/source/isaaclab
-      # Use host-patched IsaacLab RSL-RL train/play scripts in-container.
-      - ../../scripts/reinforcement_learning/rsl_rl:/workspace/isaaclab/scripts/reinforcement_learning/rsl_rl
     deploy:
       resources:
         reservations:
