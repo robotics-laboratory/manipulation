@@ -30,7 +30,7 @@ class SoArm101SmolVLARLEnvCfg(SoArm101FixedLayoutGuidedLiftCubeSparseEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # Use a reasonable episode length for RL (5 s at 50 Hz = 250 steps).
+        # Use a reasonable episode length for RL (5 s at 30 Hz = 150 steps).
         self.episode_length_s = 5.0
         # Reduce num_envs default — SmolVLA needs GPU memory.
         self.scene.num_envs = 8

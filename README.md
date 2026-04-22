@@ -44,9 +44,14 @@ Scripts must be run via Isaac Lab’s Python so that `isaaclab` and the SO-101 e
 |------|-------------|
 | `Isaac-SO-ARM101-Lift-Cube-v0` | SO-101 pick cube and lift to target (default) |
 | `Isaac-SO-ARM101-Lift-Cube-Play-v0` | Same, smaller scene for play |
+| `Isaac-SO-ARM101-Lift-Orange-v0` | SO-101 lift task with orange object |
+| `Isaac-SO-ARM101-Lift-Orange-Play-v0` | Orange lift task, play variant |
 | `Isaac-SO-ARM101-Reach-v0` | SO-101 reach target pose |
 | `Isaac-SO-ARM101-Reach-Play-v0` | Same, play variant |
 | `Isaac-SO-ARM100-Lift-Cube-v0`, `Isaac-SO-ARM100-Reach-v0` | SO-100 (same tasks) |
+
+`Lift-Orange` uses the same Orange001 USD asset as LeIsaac pick-orange (`scenes/kitchen_with_orange/objects/Orange001/Orange001.usd`).  
+If your assets are not at `~/leisaac/assets`, set `LEISAAC_ASSETS_ROOT=/path/to/leisaac/assets` before launch.
 
 Options:
 
@@ -254,7 +259,12 @@ For Hub upload, provide your token: `docker compose run --rm -e HF_TOKEN=hf_... 
 | `--output_dir` | Local folder for the LeRobot dataset. |
 | `--repo_id` | Dataset id for metadata (e.g. `HF_USER/my-dataset`). |
 | `--task_description` | Language string stored per frame (default: pick-cube phrasing). |
-| `--success_only` | Drop episodes where the cube was never lifted. |
+| `--success_only` | Drop episodes where the cube was never lifted; in non-restore mode also drops “dirty success” episodes where cube falls back below `--clean-drop-threshold` after being lifted above `--clean-lift-threshold`. |
+| `--fps` | FPS in LeRobot metadata (default **30**; matches `sim.dt`×`decimation` in `LiftEnvCfg`). |
+| `--resume-dataset` | Append to an existing dataset folder; default is to **replace** `output_dir` if it exists. |
+| `--enable-fall-restore` | Respawn the cube when it falls instead of terminating; ratio filter is strict by default (`--max-fall-restore-fraction=0.10`) and force-commit episodes are discarded unless `--keep-force-commit-episodes` is set (see [`docs/DATASET_COLLECTION_FALL_RESTORE.md`](docs/DATASET_COLLECTION_FALL_RESTORE.md)). |
+| `--target-restore-episode-fraction`, `--restore-fraction-tolerance`, `--restore-quota-warmup-episodes` | Keep saved dataset near a target restore/clean mix (default target: 20% restore, 80% clean). |
+| `--manual-review` (+ `--manual-review-camera-key`, `--manual-review-dir`, `--manual-review-keep-mp4`, `--manual-review-gui`) | Render per-episode MP4 preview, show restore/clean/skip counters, then choose `r`/`c`/`s`/`q` before saving. With `--manual-review-gui`, play directly in an OpenCV window when display is available. |
 | `--push_to_hub` | Upload after `finalize()`; requires Hub auth (see below). |
 | `--headless` | Use in Docker / no display; the script also forces headless when `DISPLAY` is unset. |
 
@@ -293,6 +303,69 @@ python3 -m lerobot.scripts.lerobot_train \
 - Hub push requires login: `python3 -m huggingface_hub.cli.hf auth login` or `HF_TOKEN` on the same interpreter.
 
 If training still expects a third view, check LeRobot / SmolVLA docs for padding or duplicate-camera behavior. Offline training also needs **FFmpeg** libraries for video decoding (`torchcodec`); the project `docker/Dockerfile` installs `ffmpeg` for that.
+
+For holdout validation + teacher-action comparison during training, use [`docs/lerobot-holdout-wrapper.md`](docs/lerobot-holdout-wrapper.md).
+
+## Leader teleop recording (custom manipulation tasks)
+
+For SO101 leader-arm teleoperation on `manipulation` task IDs (starting with SO101 single-arm joint-position tasks such as
+`Isaac-SO-ARM101-Lift-Cube-Play-v0`), use:
+
+```bash
+isaaclab -p scripts/teleop_record_manipulation.py \
+  --task Isaac-SO-ARM101-Lift-Cube-Play-v0 \
+  --teleop_device so101leader \
+  --port /dev/ttyACM0 \
+  --num_envs 1 \
+  --device cuda \
+  --enable_cameras \
+  --record \
+  --dataset_file output/datasets/liftcubeplay_teleop.hdf5
+```
+
+By default, HDF5 mode overwrites an existing `--dataset_file` (unless `--resume` is set).  
+Use `--no-overwrite` to force a safety error when the file already exists.  
+Both `--resume` and `--resume-dataset` are accepted.
+
+LeRobot mode (save successful episodes only, `n` key):
+
+```bash
+isaaclab -p scripts/teleop_record_manipulation.py \
+  --task Isaac-SO-ARM101-Lift-Cube-Play-v0 \
+  --teleop_device so101leader \
+  --port /dev/ttyACM0 \
+  --num_envs 1 \
+  --device cuda \
+  --enable_cameras \
+  --record \
+  --use_lerobot_recorder \
+  --lerobot_dataset_repo_id HF_USER/so101-liftcubeplay-teleop \
+  --lerobot_dataset_fps 30
+```
+
+By default, the wrapper tries to auto-create/check the Hugging Face dataset repo (`--auto-create-hf-repo`).
+Disable with `--no-auto-create-hf-repo` if you want strictly local-only behavior.
+`--overwrite` now also replaces an existing local LeRobot cache dataset for the same `repo_id`.
+Use `--resume` to append instead.
+
+Controls mirror teleop flow:
+
+- `b`: start teleop/control
+- `r`: reset + mark failed
+- `n`: reset + mark success
+- `Ctrl+C`: quit
+
+Notes:
+
+- This wrapper currently supports SO101 leader with SO101 single-arm joint-position action layouts (6D arm+gripper).
+- Empty episodes are skipped safely (no crash on save).
+- In LeRobot mode, quitting finalizes local data only; upload manually:
+
+```bash
+hf upload HF_USER/so101-liftcubeplay-teleop \
+  ~/.cache/huggingface/lerobot/HF_USER/so101-liftcubeplay-teleop \
+  . --repo-type dataset
+```
 
 ## Project layout
 

@@ -68,8 +68,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     TORCH_DIR=$(/isaac-sim/python.sh -c "import torch, os; print(os.path.dirname(torch.__file__))") && \
     ln -s "$TORCH_DIR" /isaac-sim/exts/omni.isaac.ml_archive/pip_prebundle/torch && \
     /isaac-sim/python.sh -m pip install --no-deps \
-    "lerobot[smolvla] @ git+https://github.com/huggingface/lerobot.git@v0.4.3" && \
-    /isaac-sim/python.sh -m pip install --extra-index-url https://pypi.org/simple \
+    "lerobot[smolvla,async] @ git+https://github.com/huggingface/lerobot.git@v0.4.3" && \
+    /isaac-sim/python.sh -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
         "num2words>=0.5.14,<0.6.0" && \
     /isaac-sim/python.sh -m pip install \
         "typing_extensions>=4.12.0" \
@@ -90,9 +90,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "deepdiff>=7.0.1,<9.0.0" \
         "imageio[ffmpeg]>=2.34.0,<3.0.0" \
         "transformers>=4.57.1,<5.0.0" && \
+    # /isaac-sim/python.sh -m pip install "lerobot[async] @ git+https://github.com/huggingface/lerobot.git@v0.4.3" --no-deps && \
+    # /isaac-sim/python.sh -m pip install 'leisaac[isaaclab,lerobot-async] @ git+https://github.com/LightwheelAI/leisaac.git#subdirectory=source/leisaac' --extra-index-url https://pypi.nvidia.com && \
+    cd ${PROJECT_DIR}/scripts/leisaac/source/leisaac && \
+    /isaac-sim/python.sh -m pip install -e . && \
+    cd ${PROJECT_DIR} && \
     /isaac-sim/python.sh -c "import torch; print(f'torch {torch.__version__} OK')" && \
     /isaac-sim/python.sh -c "import numpy; print(f'numpy {numpy.__version__} OK')" && \
-    /isaac-sim/python.sh -c "from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy; print('SmolVLA OK')"
+    /isaac-sim/python.sh -c "from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy; print('SmolVLA OK')" && \
+    mkdir -p /isaac-sim/kit/python/lib/assets && \
+    cp -r ${PROJECT_DIR}/scripts/leisaac/assets/* /isaac-sim/kit/python/lib/assets/
 
 # ---- Install the isaac_so_arm101 extension ----
 # Registers Gym environments (Isaac-SO-ARM101-Lift-Cube-v0, etc.)

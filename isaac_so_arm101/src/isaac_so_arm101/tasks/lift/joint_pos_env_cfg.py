@@ -8,7 +8,11 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
+from pathlib import Path
+
 import isaaclab_tasks.manager_based.manipulation.lift.mdp as mdp
+import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
 
 # from isaaclab.managers NotImplementedError
@@ -24,6 +28,21 @@ from isaac_so_arm101.robots import SO_ARM100_CFG, SO_ARM101_CFG  # noqa: F401
 from isaac_so_arm101.tasks.lift.lift_env_cfg import LiftEnvCfg
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
+
+
+def _resolve_leisaac_orange_usd_path() -> str:
+    rel_path = Path("scenes") / "kitchen_with_orange" / "objects" / "Orange001" / "Orange001.usd"
+    candidates: list[Path] = []
+    env_root = os.environ.get("LEISAAC_ASSETS_ROOT")
+    if env_root:
+        candidates.append(Path(env_root) / rel_path)
+    candidates.append(Path.home() / "leisaac" / "assets" / rel_path)
+    candidates.append(Path("/home/robotics/leisaac/assets") / rel_path)
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    # Keep a deterministic fallback path for error messages / offline config dumps.
+    return str(candidates[0])
 
 
 @configclass
@@ -197,6 +216,45 @@ class SoArm101LiftCubeEnvCfg_PLAY(SoArm101LiftCubeEnvCfg):
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
         # disable randomization for play
+        self.observations.policy.enable_corruption = False
+
+
+@configclass
+class SoArm101LiftOrangeEnvCfg(SoArm101LiftCubeEnvCfg):
+    """SO-101 lift task variant with an orange sphere object."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        orange_usd_path = _resolve_leisaac_orange_usd_path()
+        if not Path(orange_usd_path).exists():
+            raise FileNotFoundError(
+                "LeIsaac orange asset not found. Set LEISAAC_ASSETS_ROOT to your leisaac assets directory "
+                f"(expected: {orange_usd_path})."
+            )
+        self.scene.object = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Object",
+            init_state=RigidObjectCfg.InitialStateCfg(pos=[0.2, 0.0, 0.025], rot=[1, 0, 0, 0]),
+            spawn=UsdFileCfg(
+                usd_path=orange_usd_path,
+                rigid_props=RigidBodyPropertiesCfg(
+                    solver_position_iteration_count=16,
+                    solver_velocity_iteration_count=1,
+                    max_angular_velocity=1000.0,
+                    max_linear_velocity=1000.0,
+                    max_depenetration_velocity=5.0,
+                    disable_gravity=False,
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+            ),
+        )
+
+
+@configclass
+class SoArm101LiftOrangeEnvCfg_PLAY(SoArm101LiftOrangeEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
 
 

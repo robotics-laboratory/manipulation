@@ -24,8 +24,8 @@ _DEFAULT_DISCRIMINATOR_FILE = os.environ.get(
     ),
 )
 
-# Match LiftEnvCfg: decimation * sim.dt (default 2 * 0.01 s).
-_DISCRIMINATOR_METRICS_INTERVAL_S = 0.02
+# Match LiftEnvCfg: decimation * sim.dt (2 * (1/60) s = 1/30 s at 30 Hz control).
+_DISCRIMINATOR_METRICS_INTERVAL_S = 1.0 / 30.0
 
 
 @configclass

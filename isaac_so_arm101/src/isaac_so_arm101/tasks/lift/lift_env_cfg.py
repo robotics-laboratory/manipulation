@@ -227,6 +227,10 @@ class EventCfg:
         },
     )
 
+    # Optional: enabled from ``collect_lerobot_dataset.py`` when using fall-restore (see docs).
+    fall_restore_reset: EventTerm | None = None
+    fall_restore_interval: EventTerm | None = None
+
 
 @configclass
 class RewardsCfg:
@@ -333,7 +337,8 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 2
         self.episode_length_s = 5.0
         self.viewer.eye = (2.5, 2.5, 1.5)
-        self.sim.dt = 0.01
+        # 60 Hz physics × decimation 2 → 30 Hz control (matches LeRobot ``--fps 30`` metadata).
+        self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
 
         self.sim.physx.bounce_threshold_velocity = 0.2
