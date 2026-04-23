@@ -1,0 +1,185 @@
+[3gH    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H   [INFO] Using python from: /workspace/isaaclab/_isaac_sim/python.sh
+[INFO][AppLauncher]: Using device: cuda:0
+[INFO][AppLauncher]: Loading experience file: /workspace/isaaclab/apps/isaaclab.python.headless.kit
+[INFO]: Parsing configuration from: leisaac.tasks.lift_cube.lift_cube_env_cfg:LiftCubeRewardDenseEnvCfg
+[INFO]: Parsing configuration from: leisaac.tasks.lift_cube.agents.rsl_rl_ppo_cfg:LiftCubeRewardDensePPORunnerCfg
+[INFO] Logging experiment in directory: /workspace/isaac-bridge/logs/rsl_rl/leisaac_lift_cube_reward_dense
+Exact experiment name requested from command line: 2026-04-23_17-23-36
+
+[36m======================================================================================[0m
+[36m[1m[INFO][IsaacLab]: Logging to file: /tmp/isaaclab/logs/isaaclab_2026-04-23_17-23-36.log[0m
+[36m======================================================================================[0m
+
+[33m17:23:36 [simulation_context.py] WARNING: The `enable_external_forces_every_iteration` parameter in the PhysxCfg is set to False. If you are experiencing noisy velocities, consider enabling this flag. You may need to slightly increase the number of velocity iterations (setting it to 1 or 2 rather than 0), together with this flag, to improve the accuracy of velocity updates.[0m
+[Info] [carb] Logging to file: /isaac-sim/kit/logs/Kit/Isaac-Sim/5.1/kit_20260423_172327.log
+2026-04-23T17:23:27Z [591ms] [Warning] [omni.platforminfo.plugin] failed to open the default display.  Can't verify X Server version.
+2026-04-23T17:23:27Z [609ms] [Warning] [omni.usd_config.extension] Enable omni.materialx.libs extension to use MaterialX
+2026-04-23T17:23:28Z [1,467ms] [Warning] [carb] Acquiring non optional plugin interface which is not listed as dependency: [omni::physx::IPhysxBenchmarks v1.0] (plugin: <default plugin>), by client: omni.physics.physx.plugin. Add it to CARB_PLUGIN_IMPL_DEPS() macro of a client.
+2026-04-23T17:23:28Z [1,858ms] [Warning] [omni.isaac.dynamic_control] omni.isaac.dynamic_control is deprecated as of Isaac Sim 4.5. No action is needed from end-users.
+
+|---------------------------------------------------------------------------------------------|
+| Driver Version: 580.126.09    | Graphics API: Vulkan
+|=============================================================================================|
+| GPU | Name                             | Active | LDA | GPU Memory | Vendor-ID | LUID       |
+|     |                                  |        |     |            | Device-ID | UUID       |
+|     |                                  |        |     |            | Bus-ID    |            |
+|---------------------------------------------------------------------------------------------|
+| 0   | NVIDIA GeForce RTX 4090          | Yes: 0 |     | 24564   MB | 10de      | 0          |
+|     |                                  |        |     |            | 2684      | 3540b987.. |
+|     |                                  |        |     |            | 1         |            |
+|=============================================================================================|
+| OS: 24.04.2 LTS (Noble Numbat) ubuntu, Version: 24.04.2, Kernel: 6.8.0-107-generic
+| Processor: 11th Gen Intel(R) Core(TM) i5-11400 @ 2.60GHz
+| Cores: 6 | Logical Cores: 12
+|---------------------------------------------------------------------------------------------|
+| Total Memory (MB): 15802 | Free Memory: 8783
+| Total Page/Swap (MB): 0 | Free Page/Swap: 0
+|---------------------------------------------------------------------------------------------|
+2026-04-23T17:23:33Z [5,901ms] [Warning] [gpu.foundation.plugin] CPU performance profile is set to powersave. This profile sets the CPU to the lowest frequency reducing performance.
+2026-04-23T17:23:33Z [5,930ms] [Warning] [omni.kvdb.plugin] Disabling key-value database because another kit process is locking it
+Traceback (most recent call last):
+  File "/workspace/isaaclab/source/isaaclab/isaaclab/managers/manager_base.py", line 401, in _process_term_cfg_at_play
+    value.resolve(self._env.scene)
+  File "/workspace/isaaclab/source/isaaclab/isaaclab/managers/scene_entity_cfg.py", line 138, in resolve
+    raise ValueError(f"The scene entity '{self.name}' does not exist. Available entities: {scene.keys()}.")
+ValueError: The scene entity 'front' does not exist. Available entities: ['terrain', 'robot', 'cube', 'ee_frame', 'scene', 'light'].
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/workspace/isaaclab/source/isaaclab/isaaclab/managers/manager_base.py", line 403, in _process_term_cfg_at_play
+    raise ValueError(f"Error while parsing '{term_name}:{key}'. {e}")
+ValueError: Error while parsing 'domain_randomize_1:asset_cfg'. The scene entity 'front' does not exist. Available entities: ['terrain', 'robot', 'cube', 'ee_frame', 'scene', 'light'].
+[INFO]: Base environment:
+	Environment device    : cuda:0
+	Environment seed      : 42
+	Physics step-size     : 0.01
+	Rendering step-size   : 0.02
+	Environment step-size : 0.02
+[INFO]: Time taken for scene creation : 0.285565 seconds
+[INFO]: Scene manager:  <class InteractiveScene>
+	Number of environments: 64
+	Environment spacing   : 8.0
+	Source prim name      : /World/envs/env_0
+	Global prim paths     : []
+	Replicate physics     : True
+[INFO]: Starting the simulation. This may take a few seconds. Please wait...
+[INFO]: Time taken for simulation start : 0.543972 seconds
+[INFO] Command Manager:  <CommandManager> contains 1 active terms.
++------------------------------------------+
+|           Active Command Terms           |
++-------+-------------+--------------------+
+| Index | Name        |        Type        |
++-------+-------------+--------------------+
+|   0   | object_pose | UniformPoseCommand |
++-------+-------------+--------------------+
+
+[INFO] Event Manager:  <EventManager> contains 1 active terms.
++-------------------------------------+
+| Active Event Terms in Mode: 'reset' |
++---------+---------------------------+
+|  Index  | Name                      |
++---------+---------------------------+
+|    0    | reset_all                 |
+|    1    | domain_randomize_0        |
+|    2    | domain_randomize_1        |
++---------+---------------------------+
+
+[INFO] Recorder Manager:  <RecorderManager> contains 0 active terms.
++---------------------+
+| Active Recorder Terms |
++-----------+---------+
+|   Index   | Name    |
++-----------+---------+
++-----------+---------+
+
+[INFO] Action Manager:  <ActionManager> contains 2 active terms.
++------------------------------------+
+|   Active Action Terms (shape: 6)   |
++-------+----------------+-----------+
+| Index | Name           | Dimension |
++-------+----------------+-----------+
+|   0   | arm_action     |         5 |
+|   1   | gripper_action |         1 |
++-------+----------------+-----------+
+
+[INFO] Observation Manager: <ObservationManager> contains 1 groups.
++-----------------------------------------------------------+
+| Active Observation Terms in Group: 'policy' (shape: (28,)) |
++-----------+-----------------------------------+-----------+
+|   Index   | Name                              |   Shape   |
++-----------+-----------------------------------+-----------+
+|     0     | joint_pos                         |    (6,)   |
+|     1     | joint_vel                         |    (6,)   |
+|     2     | cube_position                     |    (3,)   |
+|     3     | target_cube_position              |    (7,)   |
+|     4     | actions                           |    (6,)   |
++-----------+-----------------------------------+-----------+
+
+[INFO] Termination Manager:  <TerminationManager> contains 2 active terms.
++-----------------------------+
+|   Active Termination Terms  |
++-------+----------+----------+
+| Index | Name     | Time Out |
++-------+----------+----------+
+|   0   | time_out |   True   |
+|   1   | success  |  False   |
++-------+----------+----------+
+
+[INFO] Reward Manager:  <RewardManager> contains 9 active terms.
++---------------------------------------+
+|          Active Reward Terms          |
++-------+----------------------+--------+
+| Index | Name                 | Weight |
++-------+----------------------+--------+
+|   0   | reaching_object      |    2.5 |
+|   1   | grasp_closure        |    2.0 |
+|   2   | lift_progress        |    6.0 |
+|   3   | lifted_stillness     |    2.0 |
+|   4   | goal_tracking_coarse |    8.0 |
+|   5   | goal_tracking_fine   |    5.0 |
+|   6   | goal_success         |   25.0 |
+|   7   | action_rate          | -2e-05 |
+|   8   | joint_vel            | -2e-05 |
++-------+----------------------+--------+
+
+[INFO] Curriculum Manager:  <CurriculumManager> contains 2 active terms.
++--------------------------+
+| Active Curriculum Terms  |
++---------+----------------+
+|  Index  | Name           |
++---------+----------------+
+|    0    | action_rate    |
+|    1    | joint_vel      |
++---------+----------------+
+
+[INFO]: Completed setting up the environment...
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/workspace/isaaclab/source/isaaclab_tasks/isaaclab_tasks/utils/hydra.py", line 100, in hydra_main
+    func(env_cfg, agent_cfg, *args, **kwargs)
+  File "/workspace/isaaclab/scripts/reinforcement_learning/rsl_rl/train.py", line 195, in main
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/isaaclab/source/isaaclab_rl/isaaclab_rl/rsl_rl/vecenv_wrapper.py", line 66, in __init__
+    self.env.reset()
+  File "/workspace/isaaclab/_isaac_sim/kit/python/lib/python3.11/site-packages/gymnasium/wrappers/common.py", line 400, in reset
+    return super().reset(seed=seed, options=options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/isaaclab/_isaac_sim/kit/python/lib/python3.11/site-packages/gymnasium/core.py", line 333, in reset
+    return self.env.reset(seed=seed, options=options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/isaaclab/source/isaaclab/isaaclab/envs/manager_based_env.py", line 372, in reset
+    self._reset_idx(env_ids)
+  File "/workspace/isaaclab/source/isaaclab/isaaclab/envs/manager_based_rl_env.py", line 362, in _reset_idx
+    self.event_manager.apply(mode="reset", env_ids=env_ids, global_env_step_count=env_step_count)
+  File "/workspace/isaaclab/source/isaaclab/isaaclab/managers/event_manager.py", line 247, in apply
+    term_cfg.func(self._env, env_ids, **term_cfg.params)
+  File "/workspace/isaac-bridge/scripts/leisaac/source/leisaac/leisaac/enhance/envs/mdp/events.py", line 28, in randomize_camera_uniform
+    asset: Camera = env.scene[asset_cfg.name]
+                    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/workspace/isaaclab/source/isaaclab/isaaclab/scene/interactive_scene.py", line 707, in __getitem__
+    raise KeyError(f"Scene entity with key '{key}' not found. Available Entities: '{all_keys}'")
+KeyError: "Scene entity with key 'front' not found. Available Entities: '['terrain', 'robot', 'cube', 'ee_frame', 'scene', 'light']'"
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

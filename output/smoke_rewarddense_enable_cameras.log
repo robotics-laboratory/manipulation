@@ -1,0 +1,266 @@
+[3gH    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H    H   [INFO] Using python from: /workspace/isaaclab/_isaac_sim/python.sh
+[Info] [carb] Logging to file: /isaac-sim/kit/logs/Kit/Isaac-Sim/5.1/kit_20260423_171422.log
+2026-04-23T17:14:23Z [516ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-04-23T17:14:23Z [516ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-04-23T17:14:23Z [524ms] [Warning] [omni.platforminfo.plugin] failed to open the default display.  Can't verify X Server version.
+
+|---------------------------------------------------------------------------------------------|
+| Driver Version: 580.126.09    | Graphics API: Vulkan
+|=============================================================================================|
+| GPU | Name                             | Active | LDA | GPU Memory | Vendor-ID | LUID       |
+|     |                                  |        |     |            | Device-ID | UUID       |
+|     |                                  |        |     |            | Bus-ID    |            |
+|---------------------------------------------------------------------------------------------|
+| 0   | NVIDIA GeForce RTX 4090          | Yes: 0 |     | 24564   MB | 10de      | 0          |
+|     |                                  |        |     |            | 2684      | 3540b987.. |
+|     |                                  |        |     |            | 1         |            |
+|=============================================================================================|
+| OS: 24.04.2 LTS (Noble Numbat) ubuntu, Version: 24.04.2, Kernel: 6.8.0-107-generic
+| Processor: 11th Gen Intel(R) Core(TM) i5-11400 @ 2.60GHz
+| Cores: 6 | Logical Cores: 12
+|---------------------------------------------------------------------------------------------|
+| Total Memory (MB): 15802 | Free Memory: 9188
+| Total Page/Swap (MB): 0 | Free Page/Swap: 0
+|---------------------------------------------------------------------------------------------|
+2026-04-23T17:14:23Z [960ms] [Warning] [gpu.foundation.plugin] CPU performance profile is set to powersave. This profile sets the CPU to the lowest frequency reducing performance.
+2026-04-23T17:14:24Z [2,090ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-04-23T17:14:24Z [2,090ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-04-23T17:14:24Z [2,104ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-04-23T17:14:24Z [2,104ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-04-23T17:14:24Z [2,109ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-04-23T17:14:24Z [2,109ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-04-23T17:14:24Z [2,123ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-04-23T17:14:24Z [2,123ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-04-23T17:14:24Z [2,124ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-04-23T17:14:24Z [2,124ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+2026-04-23T17:14:24Z [2,125ms] [Warning] [carb.windowing-glfw.plugin] GLFW initialization failed.
+2026-04-23T17:14:24Z [2,125ms] [Warning] [carb] Failed to startup plugin carb.windowing-glfw.plugin (interfaces: [carb::windowing::IGLContext v1.0],[carb::windowing::IWindowing v1.5]) (impl: carb.windowing-glfw.plugin)
+[INFO][AppLauncher]: Using device: cuda:0
+[INFO][AppLauncher]: Loading experience file: /workspace/isaaclab/apps/isaaclab.python.headless.rendering.kit
+[INFO]: Parsing configuration from: leisaac.tasks.lift_cube.lift_cube_env_cfg:LiftCubeRewardDenseEnvCfg
+[INFO]: Parsing configuration from: leisaac.tasks.lift_cube.agents.rsl_rl_ppo_cfg:LiftCubeRewardDensePPORunnerCfg
+[INFO] Logging experiment in directory: /workspace/isaac-bridge/logs/rsl_rl/leisaac_lift_cube_reward_dense
+Exact experiment name requested from command line: 2026-04-23_17-15-22
+
+[36m======================================================================================[0m
+[36m[1m[INFO][IsaacLab]: Logging to file: /tmp/isaaclab/logs/isaaclab_2026-04-23_17-15-22.log[0m
+[36m======================================================================================[0m
+
+[33m17:15:22 [simulation_context.py] WARNING: The `enable_external_forces_every_iteration` parameter in the PhysxCfg is set to False. If you are experiencing noisy velocities, consider enabling this flag. You may need to slightly increase the number of velocity iterations (setting it to 1 or 2 rather than 0), together with this flag, to improve the accuracy of velocity updates.[0m
+/workspace/isaaclab/_isaac_sim/kit/python/lib/python3.11/site-packages/rsl_rl/utils/utils.py:245: UserWarning: The observation configuration dictionary 'obs_groups' must contain the 'policy' key. As an observation group with the name 'policy' was found, this is assumed to be the observation set. Consider adding the 'policy' key to the 'obs_groups' dictionary for clarity. This behavior will be removed in a future version.
+  warnings.warn(
+/workspace/isaaclab/_isaac_sim/kit/python/lib/python3.11/site-packages/rsl_rl/utils/utils.py:291: UserWarning: The observation configuration dictionary 'obs_groups' must contain the 'critic' key. As the configuration for 'critic' is missing, the observations from the 'policy' set are used. Consider adding the 'critic' key to the 'obs_groups' dictionary for clarity. This behavior will be removed in a future version.
+  warnings.warn(
+[INFO]: Base environment:
+	Environment device    : cuda:0
+	Environment seed      : 42
+	Physics step-size     : 0.01
+	Rendering step-size   : 0.02
+	Environment step-size : 0.02
+[INFO]: Time taken for scene creation : 0.359186 seconds
+[INFO]: Scene manager:  <class InteractiveScene>
+	Number of environments: 16
+	Environment spacing   : 8.0
+	Source prim name      : /World/envs/env_0
+	Global prim paths     : []
+	Replicate physics     : True
+[INFO]: Starting the simulation. This may take a few seconds. Please wait...
+[INFO]: Time taken for simulation start : 5.937638 seconds
+[INFO] Command Manager:  <CommandManager> contains 1 active terms.
++------------------------------------------+
+|           Active Command Terms           |
++-------+-------------+--------------------+
+| Index | Name        |        Type        |
++-------+-------------+--------------------+
+|   0   | object_pose | UniformPoseCommand |
++-------+-------------+--------------------+
+
+[INFO] Event Manager:  <EventManager> contains 1 active terms.
++-------------------------------------+
+| Active Event Terms in Mode: 'reset' |
++---------+---------------------------+
+|  Index  | Name                      |
++---------+---------------------------+
+|    0    | reset_all                 |
+|    1    | domain_randomize_0        |
+|    2    | domain_randomize_1        |
++---------+---------------------------+
+
+[INFO] Recorder Manager:  <RecorderManager> contains 5 active terms.
++--------------------------------------------------+
+|              Active Recorder Terms               |
++-------+------------------------------------------+
+| Index | Name                                     |
++-------+------------------------------------------+
+|   0   | record_initial_state                     |
+|   1   | record_post_step_states                  |
+|   2   | record_pre_step_actions                  |
+|   3   | record_pre_step_flat_policy_observations |
+|   4   | record_post_step_processed_actions       |
++-------+------------------------------------------+
+
+[INFO] Action Manager:  <ActionManager> contains 2 active terms.
++------------------------------------+
+|   Active Action Terms (shape: 6)   |
++-------+----------------+-----------+
+| Index | Name           | Dimension |
++-------+----------------+-----------+
+|   0   | arm_action     |         5 |
+|   1   | gripper_action |         1 |
++-------+----------------+-----------+
+
+[INFO] Observation Manager: <ObservationManager> contains 1 groups.
++-----------------------------------------------------------+
+| Active Observation Terms in Group: 'policy' (shape: (28,)) |
++-----------+-----------------------------------+-----------+
+|   Index   | Name                              |   Shape   |
++-----------+-----------------------------------+-----------+
+|     0     | joint_pos                         |    (6,)   |
+|     1     | joint_vel                         |    (6,)   |
+|     2     | cube_position                     |    (3,)   |
+|     3     | target_cube_position              |    (7,)   |
+|     4     | actions                           |    (6,)   |
++-----------+-----------------------------------+-----------+
+
+[INFO] Termination Manager:  <TerminationManager> contains 2 active terms.
++-----------------------------+
+|   Active Termination Terms  |
++-------+----------+----------+
+| Index | Name     | Time Out |
++-------+----------+----------+
+|   0   | time_out |   True   |
+|   1   | success  |  False   |
++-------+----------+----------+
+
+[INFO] Reward Manager:  <RewardManager> contains 9 active terms.
++---------------------------------------+
+|          Active Reward Terms          |
++-------+----------------------+--------+
+| Index | Name                 | Weight |
++-------+----------------------+--------+
+|   0   | reaching_object      |    2.5 |
+|   1   | grasp_closure        |    2.0 |
+|   2   | lift_progress        |    6.0 |
+|   3   | lifted_stillness     |    2.0 |
+|   4   | goal_tracking_coarse |    8.0 |
+|   5   | goal_tracking_fine   |    5.0 |
+|   6   | goal_success         |   25.0 |
+|   7   | action_rate          | -2e-05 |
+|   8   | joint_vel            | -2e-05 |
++-------+----------------------+--------+
+
+[INFO] Curriculum Manager:  <CurriculumManager> contains 2 active terms.
++--------------------------+
+| Active Curriculum Terms  |
++---------+----------------+
+|  Index  | Name           |
++---------+----------------+
+|    0    | action_rate    |
+|    1    | joint_vel      |
++---------+----------------+
+
+[INFO]: Completed setting up the environment...
+--------------------------------------------------------------------------------
+Resolved observation sets: 
+	 policy :  ['policy']
+	 critic :  ['policy']
+--------------------------------------------------------------------------------
+Actor MLP: MLP(
+  (0): Linear(in_features=28, out_features=256, bias=True)
+  (1): ELU(alpha=1.0)
+  (2): Linear(in_features=256, out_features=256, bias=True)
+  (3): ELU(alpha=1.0)
+  (4): Linear(in_features=256, out_features=128, bias=True)
+  (5): ELU(alpha=1.0)
+  (6): Linear(in_features=128, out_features=6, bias=True)
+)
+Critic MLP: MLP(
+  (0): Linear(in_features=28, out_features=256, bias=True)
+  (1): ELU(alpha=1.0)
+  (2): Linear(in_features=256, out_features=256, bias=True)
+  (3): ELU(alpha=1.0)
+  (4): Linear(in_features=256, out_features=128, bias=True)
+  (5): ELU(alpha=1.0)
+  (6): Linear(in_features=128, out_features=1, bias=True)
+)
+################################################################################
+                        [1m Learning iteration 0/2 [0m                        
+
+                       Computation: 210 steps/s (collection: 2.195s, learning 0.239s)
+             Mean action noise std: 0.80
+          Mean value_function loss: 0.0560
+               Mean surrogate loss: -0.0028
+                 Mean entropy loss: 7.1747
+                       Mean reward: 0.52
+               Mean episode length: 20.50
+    Episode_Reward/reaching_object: 0.0013
+      Episode_Reward/grasp_closure: 0.0000
+      Episode_Reward/lift_progress: 0.0651
+   Episode_Reward/lifted_stillness: 0.0000
+Episode_Reward/goal_tracking_coarse: 0.0000
+ Episode_Reward/goal_tracking_fine: 0.0000
+       Episode_Reward/goal_success: 0.0000
+        Episode_Reward/action_rate: -0.0000
+          Episode_Reward/joint_vel: -0.0003
+            Curriculum/action_rate: -0.0000
+              Curriculum/joint_vel: -0.0000
+Metrics/object_pose/position_error: 0.1118
+Metrics/object_pose/orientation_error: 1.3327
+      Episode_Termination/time_out: 0.0000
+       Episode_Termination/success: 0.0000
+--------------------------------------------------------------------------------
+                   Total timesteps: 512
+                    Iteration time: 2.43s
+                      Time elapsed: 00:00:02
+                               ETA: 00:00:04
+
+Could not find git repository in /workspace/isaaclab/_isaac_sim/kit/python/lib/python3.11/site-packages/rsl_rl/__init__.py. Skipping.
+Could not find git repository in /workspace/isaaclab/scripts/reinforcement_learning/rsl_rl/train.py. Skipping.
+################################################################################
+                        [1m Learning iteration 1/2 [0m                        
+
+                       Computation: 537 steps/s (collection: 0.879s, learning 0.074s)
+             Mean action noise std: 0.80
+          Mean value_function loss: 0.0433
+               Mean surrogate loss: -0.0175
+                 Mean entropy loss: 7.1746
+                       Mean reward: 0.82
+               Mean episode length: 31.67
+    Episode_Reward/reaching_object: 0.0053
+      Episode_Reward/grasp_closure: 0.0000
+      Episode_Reward/lift_progress: 0.2036
+   Episode_Reward/lifted_stillness: 0.0000
+Episode_Reward/goal_tracking_coarse: 0.0000
+ Episode_Reward/goal_tracking_fine: 0.0000
+       Episode_Reward/goal_success: 0.0000
+        Episode_Reward/action_rate: -0.0000
+          Episode_Reward/joint_vel: -0.0010
+            Curriculum/action_rate: -0.0000
+              Curriculum/joint_vel: -0.0000
+Metrics/object_pose/position_error: 0.1834
+Metrics/object_pose/orientation_error: 2.0281
+      Episode_Termination/time_out: 0.0000
+       Episode_Termination/success: 0.0000
+--------------------------------------------------------------------------------
+                   Total timesteps: 1024
+                    Iteration time: 0.95s
+                      Time elapsed: 00:00:03
+                               ETA: 00:00:01
+
+Training time: 5.13 seconds
+2026-04-23T17:14:25Z [2,466ms] [Warning] [omni.log] Source: omni.hydra was already registered.
+2026-04-23T17:14:26Z [3,494ms] [Warning] [carb] Acquiring non optional plugin interface which is not listed as dependency: [omni::physx::IPhysxBenchmarks v1.0] (plugin: <default plugin>), by client: omni.physics.physx.plugin. Add it to CARB_PLUGIN_IMPL_DEPS() macro of a client.
+2026-04-23T17:14:26Z [3,507ms] [Warning] [omni.isaac.dynamic_control] omni.isaac.dynamic_control is deprecated as of Isaac Sim 4.5. No action is needed from end-users.
+2026-04-23T17:14:28Z [6,304ms] [Warning] [pxr.Semantics] pxr.Semantics is deprecated - please use Semantics instead
+2026-04-23T17:14:29Z [6,498ms] [Warning] [omni.graph.core.plugin] Found duplicate of category 'Replicator' - was 'Annotators', adding 'Fabric Reader'
+2026-04-23T17:14:29Z [6,498ms] [Warning] [omni.graph.core.plugin] Category 'Replicator' not accepted on node type 'omni.replicator.core.FabricReader' in extension 'omni.replicator.core'
+2026-04-23T17:14:29Z [6,498ms] [Warning] [omni.replicator.core.scripts.extension] No material configuration file, adding configuration to material settings directly.
+2026-04-23T17:14:31Z [8,679ms] [Warning] [omni.kvdb.plugin] Disabling key-value database because another kit process is locking it
+2026-04-23T17:14:34Z [11,351ms] [Warning] [omni.fabric.plugin] Warning: attribute viewportHandle not found for bucket id 7
+
+2026-04-23T17:15:24Z [61,546ms] [Warning] [omni.fabric.plugin] getAttributeCount called on non-existent path /World/envs/env_9/Robot/wrist/visuals/wrist_roll_pitch_so101_v2
+2026-04-23T17:15:24Z [61,546ms] [Warning] [omni.fabric.plugin] getTypes called on non-existent path /World/envs/env_9/Robot/wrist/visuals/wrist_roll_pitch_so101_v2
+2026-04-23T17:15:31Z [68,901ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/Command/body_pose.
+2026-04-23T17:15:31Z [68,901ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/Command/goal_pose.
+2026-04-23T17:15:31Z [69,013ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/Command/body_pose.
+2026-04-23T17:15:31Z [69,013ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/Command/goal_pose.
