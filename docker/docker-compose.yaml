@@ -40,6 +40,8 @@ services:
       - ../isaac_so_arm101/logs:/workspace/isaac-bridge/isaac_so_arm101/logs
       # Curated final model_*.pt copies (stable paths for play / datasets; see isaac_so_arm101/checkpoints/README.md)
       - ../isaac_so_arm101/checkpoints:/workspace/isaac-bridge/isaac_so_arm101/checkpoints
+      # LeIsaac RSL-RL default logs/checkpoints path used by train.py (logs/rsl_rl/...).
+      - ../logs:/workspace/isaac-bridge/logs
       # --- Persistent caches (avoid re-downloading between runs) ---
       - isaac-cache-kit:/isaac-sim/kit/cache
       - isaac-cache-pip:/root/.cache/pip
