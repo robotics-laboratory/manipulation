@@ -1,0 +1,16 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""
+Python module serving as a project/extension template.
+"""
+
+# Register Gym environments.
+try:
+    from .tasks import *
+    from .utils import monkey_patch
+except ImportError as e:
+    print(f"[leisaac] ERROR: Failed to import: {e!r}")
+    print("[leisaac] If you are using remote teleoperation, you can ignore the above error.")
