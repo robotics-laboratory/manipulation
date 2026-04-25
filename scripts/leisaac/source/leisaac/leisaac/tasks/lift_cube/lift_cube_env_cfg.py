@@ -173,14 +173,19 @@ class LiftCubeRewardDenseRewardsCfg:
     lifting_object = RewTerm(
         func=mdp.object_is_lifted_delta,
         params={"minimal_height_delta": 0.015, "object_cfg": SceneEntityCfg("cube")},
-        weight=16.0,
+        weight=8.0,
+    )
+    lift_progress = RewTerm(
+        func=mdp.lift_progress_dense,
+        params={"target_height_delta": 0.18, "object_cfg": SceneEntityCfg("cube")},
+        weight=12.0,
     )
     object_goal_tracking = RewTerm(
         func=mdp.goal_tracking_dense,
         params={
             "std": 0.3,
             "command_name": "object_pose",
-            "lifted_height_delta": 0.015,
+            "lifted_height_delta": 0.05,
             "robot_cfg": SceneEntityCfg("robot"),
             "object_cfg": SceneEntityCfg("cube"),
         },
@@ -191,7 +196,7 @@ class LiftCubeRewardDenseRewardsCfg:
         params={
             "std": 0.05,
             "command_name": "object_pose",
-            "lifted_height_delta": 0.015,
+            "lifted_height_delta": 0.05,
             "robot_cfg": SceneEntityCfg("robot"),
             "object_cfg": SceneEntityCfg("cube"),
         },
