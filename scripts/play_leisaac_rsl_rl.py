@@ -25,6 +25,56 @@ def _resolve_play_script(manipulation_root: Path) -> Path:
     raise FileNotFoundError("Could not locate IsaacLab RSL-RL play.py. Tried: " + ", ".join(str(p) for p in candidates))
 
 
+def _install_lift_height_debug_print(module_globals: dict) -> None:
+    """Print the same lift height used by the success termination during play."""
+    # IsaacLab play.py strips sys.argv for Hydra during runpy, so read the parsed args it leaves behind.
+    task_name = getattr(module_globals["args_cli"], "task", "") or ""
+    if "LiftCube" not in task_name:
+        return
+
+    gym = module_globals["gym"]
+    original_make = gym.make
+
+    def make_with_lift_debug(*args, **kwargs):
+        env = original_make(*args, **kwargs)
+        unwrapped = env.unwrapped
+        if not hasattr(unwrapped, "scene"):
+            return env
+
+        original_step = env.step
+        step_count = 0
+
+        def step_with_lift_debug(actions):
+            nonlocal step_count
+            result = original_step(actions)
+            step_count += 1
+            if step_count % 30 != 0:
+                return result
+
+            try:
+                cube = unwrapped.scene["cube"]
+                robot = unwrapped.scene["robot"]
+                base_index = robot.data.body_names.index("base")
+                lift_height = cube.data.root_pos_w[:, 2] - robot.data.body_pos_w[:, base_index, 2]
+                threshold = unwrapped.cfg.terminations.success.params.get("height_threshold", 0.20)
+                print(
+                    "[lift-debug] "
+                    f"step={step_count} "
+                    f"cube_z-base_z={lift_height[0].item():.4f}m "
+                    f"success_threshold={threshold:.4f}m "
+                    f"success={bool(lift_height[0].item() > threshold)}"
+                )
+            except Exception as exc:
+                print(f"[lift-debug] failed to read lift height: {exc}")
+
+            return result
+
+        env.step = step_with_lift_debug
+        return env
+
+    gym.make = make_with_lift_debug
+
+
 def main() -> None:
     manipulation_root = Path(__file__).resolve().parents[1]
     leisaac_src = manipulation_root / "scripts" / "leisaac" / "source" / "leisaac"
@@ -44,6 +94,8 @@ def main() -> None:
     if str(leisaac_src) not in sys.path:
         sys.path.insert(0, str(leisaac_src))
     import leisaac  # noqa: F401
+
+    _install_lift_height_debug_print(module_globals)
 
     try:
         module_globals["main"]()
