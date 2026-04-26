@@ -48,6 +48,28 @@ def _install_lift_height_debug_print(module_globals: dict) -> None:
             nonlocal step_count
             result = original_step(actions)
             step_count += 1
+
+            try:
+                dones = result[2]
+                if bool(dones[0].item()):
+                    term = bool(unwrapped.reset_terminated[0].item())
+                    trunc = bool(unwrapped.reset_time_outs[0].item())
+                    ep_len = int(unwrapped.episode_length_buf[0].item())
+                    parts = [
+                        "[reset-debug]",
+                        f"step={step_count}",
+                        f"episode_len={ep_len}",
+                        f"terminated={term}",
+                        f"truncated={trunc}",
+                    ]
+                    if hasattr(unwrapped, "termination_manager"):
+                        for name in unwrapped.termination_manager.active_terms:
+                            term_val = bool(unwrapped.termination_manager.get_term(name)[0].item())
+                            parts.append(f"{name}={term_val}")
+                    print(" ".join(parts))
+            except Exception as exc:
+                print(f"[reset-debug] failed to read reset reason: {exc}")
+
             if step_count % 30 != 0:
                 return result
 

@@ -8,9 +8,16 @@ Usage:
 from __future__ import annotations
 
 import sys
+import traceback
 from importlib import import_module
 from pathlib import Path
 from typing import Iterable
+
+
+def _prepend_sys_path(path: Path) -> None:
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 
 def _resolve_train_module_dir(manipulation_root: Path) -> Path:
@@ -52,15 +59,16 @@ def main() -> None:
     task_name = _extract_flag_value(sys.argv, "--task")
 
     # Make IsaacLab RSL-RL trainer importable as `import train` and allow `import cli_args`.
-    if str(train_module_dir) not in sys.path:
-        sys.path.insert(0, str(train_module_dir))
+    _prepend_sys_path(train_module_dir)
 
-    # Import trainer module so AppLauncher / simulation app setup happens normally.
+    # Native train.py imports optional external tasks after AppLauncher starts but before Hydra config loading.
+    # The local LeIsaac source path must already be visible for that import to register LeIsaac task configs.
+    _prepend_sys_path(leisaac_src)
+
+    # Import trainer module so AppLauncher / simulation app setup happens normally. Avoid importing leisaac here:
+    # native train.py will do it after the simulation app is live, which keeps pxr-dependent modules safe.
     trainer = import_module("train")
 
-    # Register LeIsaac tasks after trainer import to avoid early pxr import failures.
-    if str(leisaac_src) not in sys.path:
-        sys.path.insert(0, str(leisaac_src))
     import leisaac
 
     if task_name:
@@ -82,8 +90,17 @@ def main() -> None:
         print("[WARN] No '--task' was provided. Trainer may exit immediately.")
 
     try:
+        print("[leisaac-train] entering IsaacLab RSL-RL trainer.main()", flush=True)
         trainer.main()
-        print("Training completed")
+        print("[leisaac-train] trainer.main() returned normally", flush=True)
+        print("Training completed", flush=True)
+    except SystemExit as exc:
+        print(f"[leisaac-train] trainer.main() raised SystemExit(code={exc.code!r})", flush=True)
+        raise
+    except BaseException:
+        print("[leisaac-train] trainer.main() raised an unexpected exception:", flush=True)
+        traceback.print_exc()
+        raise
     finally:
         if hasattr(trainer, "simulation_app"):
             trainer.simulation_app.close()
