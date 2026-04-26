@@ -20,6 +20,33 @@ def _start_height_world(
     return obj.data.default_root_state[:, 2] + env.scene.env_origins[:, 2]
 
 
+def _lift_height_above_robot_base(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
+    robot_base_name: str,
+) -> torch.Tensor:
+    obj: RigidObject = env.scene[object_cfg.name]
+    robot: Articulation = env.scene[robot_cfg.name]
+    base_index = robot.data.body_names.index(robot_base_name)
+    return obj.data.root_pos_w[:, 2] - robot.data.body_pos_w[:, base_index, 2]
+
+
+def _update_episode_max_lift_height_above_base(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
+    robot_base_name: str,
+) -> None:
+    lift_height = _lift_height_above_robot_base(
+        env=env, object_cfg=object_cfg, robot_cfg=robot_cfg, robot_base_name=robot_base_name
+    )
+    if not hasattr(env, "_lift_cube_episode_max_height_above_base"):
+        env._lift_cube_episode_max_height_above_base = lift_height.clone()
+    else:
+        env._lift_cube_episode_max_height_above_base = torch.maximum(env._lift_cube_episode_max_height_above_base, lift_height)
+
+
 def reach_object_dense(
     env: ManagerBasedRLEnv,
     std: float,
@@ -64,8 +91,14 @@ def lift_progress_dense(
     target_height_delta: float,
     start_height_tolerance: float = 0.005,
     object_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    robot_base_name: str = "base",
 ) -> torch.Tensor:
     """Reward proportional vertical progress from reset height to lift target."""
+    _update_episode_max_lift_height_above_base(
+        env=env, object_cfg=object_cfg, robot_cfg=robot_cfg, robot_base_name=robot_base_name
+    )
+
     obj: RigidObject = env.scene[object_cfg.name]
     start_height = _start_height_world(env, obj)
 
@@ -77,6 +110,23 @@ def lift_progress_dense(
     return torch.clamp(progress, min=0.0, max=1.0)
 
 
+def episode_max_lift_height_above_base(
+    env: ManagerBasedRLEnv,
+    env_ids,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    robot_base_name: str = "base",
+) -> dict[str, torch.Tensor]:
+    """Log average maximum cube lift height above robot base for episodes being reset."""
+    _update_episode_max_lift_height_above_base(
+        env=env, object_cfg=object_cfg, robot_cfg=robot_cfg, robot_base_name=robot_base_name
+    )
+    episode_max = env._lift_cube_episode_max_height_above_base
+    metric = torch.mean(episode_max[env_ids])
+    episode_max[env_ids] = -1.0e9
+    return {"avg": metric}
+
+
 def object_is_lifted_delta(
     env: ManagerBasedRLEnv,
     minimal_height_delta: float,
@@ -86,6 +136,22 @@ def object_is_lifted_delta(
     obj: RigidObject = env.scene[object_cfg.name]
     start_height = _start_height_world(env, obj)
     return (obj.data.root_pos_w[:, 2] > (start_height + minimal_height_delta)).float()
+
+
+def cube_height_above_base_bonus(
+    env: ManagerBasedRLEnv,
+    height_threshold: float,
+    ramp_width: float,
+    cube_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    robot_base_name: str = "base",
+) -> torch.Tensor:
+    """Dense success bonus that ramps up to the same height check as the success termination."""
+    cube: RigidObject = env.scene[cube_cfg.name]
+    robot: Articulation = env.scene[robot_cfg.name]
+    base_index = robot.data.body_names.index(robot_base_name)
+    lift_height = cube.data.root_pos_w[:, 2] - robot.data.body_pos_w[:, base_index, 2]
+    return torch.clamp((lift_height - (height_threshold - ramp_width)) / ramp_width, min=0.0, max=1.0)
 
 
 def lifted_stillness_dense(

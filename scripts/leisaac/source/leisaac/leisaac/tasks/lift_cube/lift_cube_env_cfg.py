@@ -177,9 +177,20 @@ class LiftCubeRewardDenseRewardsCfg:
     )
     lift_progress = RewTerm(
         func=mdp.lift_progress_dense,
-        params={"target_height_delta": 0.18, "object_cfg": SceneEntityCfg("cube")},
-        weight=12.0,
+        params={"target_height_delta": 0.23, "object_cfg": SceneEntityCfg("cube")},
+        weight=18.0,
     )
+    # success_bonus = RewTerm(
+    #     func=mdp.cube_height_above_base_bonus,
+    #     params={
+    #         "height_threshold": 0.20,
+    #         "ramp_width": 0.04,
+    #         "cube_cfg": SceneEntityCfg("cube"),
+    #         "robot_cfg": SceneEntityCfg("robot"),
+    #         "robot_base_name": "base",
+    #     },
+    #     weight=50.0,
+    # )
     object_goal_tracking = RewTerm(
         func=mdp.goal_tracking_dense,
         params={
@@ -189,7 +200,7 @@ class LiftCubeRewardDenseRewardsCfg:
             "robot_cfg": SceneEntityCfg("robot"),
             "object_cfg": SceneEntityCfg("cube"),
         },
-        weight=16.0,
+        weight=12.0,
     )
     object_goal_tracking_fine_grained = RewTerm(
         func=mdp.goal_tracking_dense,
@@ -210,13 +221,21 @@ class LiftCubeRewardDenseRewardsCfg:
 class LiftCubeRewardDenseCurriculumCfg:
     """Curriculum schedule for regularization penalties."""
 
+    max_lift_height_above_base = CurrTerm(
+        func=mdp.episode_max_lift_height_above_base,
+        params={
+            "object_cfg": SceneEntityCfg("cube"),
+            "robot_cfg": SceneEntityCfg("robot"),
+            "robot_base_name": "base",
+        },
+    )
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "action_rate", "weight": -1e-3, "num_steps": 20000},
+        params={"term_name": "action_rate", "weight": -1e-4, "num_steps": 20000},
     )
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "joint_vel", "weight": -1e-3, "num_steps": 20000},
+        params={"term_name": "joint_vel", "weight": -1e-4, "num_steps": 20000},
     )
 
 
@@ -333,3 +352,14 @@ class LiftCubeRewardDenseEnvCfg(LiftCubeEnvCfg):
         self.episode_length_s = 5.0
         self.sim.dt = 0.01
         self.sim.render_interval = self.decimation
+
+
+@configclass
+class LiftCubeRewardDenseTrainEnvCfg(LiftCubeRewardDenseEnvCfg):
+    """Training variant that keeps dense success reward but avoids terminal reward hacking."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # Do not reset at success during PPO training; otherwise the policy may hover below the threshold.
+        self.terminations.success = None

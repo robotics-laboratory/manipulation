@@ -3,6 +3,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import FrameTransformer
+from isaaclab.utils.math import subtract_frame_transforms
 
 
 def orange_grasped(
@@ -61,3 +62,17 @@ def put_orange_to_plate(
     placed = torch.logical_and(placed, gripper_open)
 
     return placed
+
+
+def object_position_in_robot_root_frame(
+    env: ManagerBasedRLEnv | DirectRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("Orange001"),
+) -> torch.Tensor:
+    """Object position represented in the robot base frame."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    obj: RigidObject = env.scene[object_cfg.name]
+
+    obj_pos_w = obj.data.root_pos_w[:, :3]
+    obj_pos_b, _ = subtract_frame_transforms(robot.data.root_state_w[:, :3], robot.data.root_state_w[:, 3:7], obj_pos_w)
+    return obj_pos_b
