@@ -48,3 +48,6 @@ Thumbs.db
 # huggingface/
 *.mp4
 output/datasets
+!good_checkpoints/
+!good_checkpoints/**/
+!good_checkpoints/**/*.pt
