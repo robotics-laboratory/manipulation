@@ -85,21 +85,31 @@ class PickOrangeMlpObservationsCfg:
     class PolicyCfg(ObsGroup):
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        orange001_position = ObsTerm(
-            func=mdp.object_position_in_robot_root_frame,
-            params={"robot_cfg": SceneEntityCfg("robot"), "object_cfg": SceneEntityCfg("Orange001")},
-        )
-        orange002_position = ObsTerm(
-            func=mdp.object_position_in_robot_root_frame,
-            params={"robot_cfg": SceneEntityCfg("robot"), "object_cfg": SceneEntityCfg("Orange002")},
-        )
-        orange003_position = ObsTerm(
-            func=mdp.object_position_in_robot_root_frame,
-            params={"robot_cfg": SceneEntityCfg("robot"), "object_cfg": SceneEntityCfg("Orange003")},
+        active_orange_position = ObsTerm(
+            func=mdp.active_unplaced_orange_position_in_robot_root_frame,
+            params={
+                "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+                "plate_cfg": SceneEntityCfg("Plate"),
+                "robot_cfg": SceneEntityCfg("robot"),
+            },
         )
         plate_position = ObsTerm(
             func=mdp.object_position_in_robot_root_frame,
             params={"robot_cfg": SceneEntityCfg("robot"), "object_cfg": SceneEntityCfg("Plate")},
+        )
+        placed_oranges = ObsTerm(
+            func=mdp.placed_oranges_flags,
+            params={
+                "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+                "plate_cfg": SceneEntityCfg("Plate"),
+            },
+        )
+        all_oranges_placed = ObsTerm(
+            func=mdp.all_oranges_placed,
+            params={
+                "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+                "plate_cfg": SceneEntityCfg("Plate"),
+            },
         )
         actions = ObsTerm(func=mdp.last_action)
 
@@ -114,7 +124,7 @@ class PickOrangeMlpObservationsCfg:
 class PickOrangeRewardDenseRewardsCfg:
     """Dense reward shaping for full three-orange pick-and-place."""
 
-    reaching_oranges = RewTerm(
+    reaching_active_orange = RewTerm(
         func=mdp.reach_unplaced_oranges_dense,
         params={
             "std": 0.08,
@@ -124,7 +134,7 @@ class PickOrangeRewardDenseRewardsCfg:
         },
         weight=1.0,
     )
-    grasp_oranges = RewTerm(
+    grasp_active_orange = RewTerm(
         func=mdp.grasp_unplaced_oranges_dense,
         params={
             "std": 0.08,
@@ -136,7 +146,7 @@ class PickOrangeRewardDenseRewardsCfg:
         },
         weight=4.0,
     )
-    lift_oranges = RewTerm(
+    lift_active_orange = RewTerm(
         func=mdp.lift_unplaced_oranges_dense,
         params={
             "target_height_delta": 0.10,
@@ -145,7 +155,7 @@ class PickOrangeRewardDenseRewardsCfg:
         },
         weight=6.0,
     )
-    move_oranges_to_plate = RewTerm(
+    move_active_orange_to_plate = RewTerm(
         func=mdp.move_unplaced_oranges_to_plate_dense,
         params={
             "std": 0.20,
@@ -179,6 +189,15 @@ class PickOrangeRewardDenseRewardsCfg:
         },
         weight=8.0,
     )
+    future_oranges_displacement = RewTerm(
+        func=mdp.non_active_orange_displacement_penalty,
+        params={
+            "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+            "plate_cfg": SceneEntityCfg("Plate"),
+            "displacement_tolerance": 0.025,
+        },
+        weight=-6.0,
+    )
     success_bonus = RewTerm(
         func=mdp.pick_orange_success_bonus,
         params={
@@ -187,8 +206,8 @@ class PickOrangeRewardDenseRewardsCfg:
         },
         weight=50.0,
     )
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-5)
-    joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1e-5, params={"asset_cfg": SceneEntityCfg("robot")})
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1e-4, params={"asset_cfg": SceneEntityCfg("robot")})
 
 
 @configclass
@@ -295,7 +314,7 @@ class PickOrangeRewardDenseEnvCfg(PickOrangeEnvCfg):
 
         # 50 Hz control loop.
         self.decimation = 2
-        self.episode_length_s = 6.0
+        self.episode_length_s = 25.0
         self.sim.dt = 0.01
         self.sim.render_interval = self.decimation
 

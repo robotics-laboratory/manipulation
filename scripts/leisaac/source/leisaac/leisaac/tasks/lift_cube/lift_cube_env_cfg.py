@@ -1,9 +1,17 @@
 import isaaclab.sim as sim_utils
 import torch
 from isaaclab.assets import AssetBaseCfg
+from isaaclab.envs.mdp.recorders.recorders_cfg import (
+    ActionStateRecorderManagerCfg,
+    InitialStateRecorderCfg,
+    PostStepProcessedActionsRecorderCfg,
+    PostStepStatesRecorderCfg,
+    PreStepActionsRecorderCfg,
+)
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers.recorder_manager import RecorderTerm, RecorderTermCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -19,6 +27,7 @@ from leisaac.utils.domain_randomization import (
     randomize_object_uniform,
 )
 from leisaac.utils.general_assets import parse_usd_and_create_subassets
+from leisaac.utils.robot_utils import convert_leisaac_action_to_lerobot
 
 from ..template import (
     SingleArmActionsCfg,
@@ -30,13 +39,8 @@ from ..template import (
 from . import mdp
 
 
-@configclass
-class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
-    """Scene configuration for the lift cube task."""
-
-    scene: AssetBaseCfg = TABLE_WITH_CUBE_CFG.replace(prim_path="{ENV_REGEX_NS}/Scene")
-
-    front: TiledCameraCfg = TiledCameraCfg(
+def _make_front_camera_cfg() -> TiledCameraCfg:
+    return TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base/front_camera",
         offset=TiledCameraCfg.OffsetCfg(
             pos=(-0.6, -0.75, 0.38), rot=(0.77337, 0.55078, -0.2374, -0.20537), convention="opengl"
@@ -54,15 +58,61 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
         update_period=1 / 30.0,  # 30FPS
     )
 
-    light = AssetBaseCfg(
+
+def _make_wrist_camera_cfg() -> TiledCameraCfg:
+    return TiledCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/gripper/wrist_camera",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(-0.001, 0.1, -0.04), rot=(-0.404379, -0.912179, -0.0451242, 0.0486914), convention="ros"
+        ),  # wxyz
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=36.5,
+            focus_distance=400.0,
+            horizontal_aperture=36.83,
+            clipping_range=(0.01, 50.0),
+            lock_camera=True,
+        ),
+        width=640,
+        height=480,
+        update_period=1 / 30.0,  # 30FPS
+    )
+
+
+def _make_light_cfg() -> AssetBaseCfg:
+    return AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Light",
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=1000.0),
     )
+
+
+@configclass
+class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
+    """Scene configuration for the lift cube task."""
+
+    scene: AssetBaseCfg = TABLE_WITH_CUBE_CFG.replace(prim_path="{ENV_REGEX_NS}/Scene")
+
+    front: TiledCameraCfg = _make_front_camera_cfg()
+
+    light = _make_light_cfg()
 
     def __post_init__(self):
         super().__post_init__()
         # Keep the dataclass field present for repr/serialization and disable sensor explicitly.
         self.wrist = None
+
+
+@configclass
+class LiftCubeCollectSceneCfg(SingleArmTaskSceneCfg):
+    """Camera-enabled scene configuration for LeRobot collection."""
+
+    scene: AssetBaseCfg = TABLE_WITH_CUBE_CFG.replace(prim_path="{ENV_REGEX_NS}/Scene")
+
+    front: TiledCameraCfg = _make_front_camera_cfg()
+
+    wrist: TiledCameraCfg = _make_wrist_camera_cfg()
+
+    light = _make_light_cfg()
 
 
 @configclass
@@ -128,6 +178,51 @@ class LiftCubeMlpObservationsCfg:
             self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class LiftCubeMlpCollectObservationsCfg(LiftCubeMlpObservationsCfg):
+    """MLP policy observations plus recorder-only terms for LeRobot export."""
+
+    @configclass
+    class RecordCfg(ObsGroup):
+        joint_pos_abs = ObsTerm(func=mdp.joint_pos)
+        front = ObsTerm(
+            func=mdp.image, params={"sensor_cfg": SceneEntityCfg("front"), "data_type": "rgb", "normalize": False}
+        )
+        wrist = ObsTerm(
+            func=mdp.image, params={"sensor_cfg": SceneEntityCfg("wrist"), "data_type": "rgb", "normalize": False}
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = False
+
+    record: RecordCfg = RecordCfg()
+
+
+class PreStepRecordObservationsRecorder(RecorderTerm):
+    """Recorder term that captures the collection-only observation group."""
+
+    def record_pre_step(self):
+        return "obs", self._env.observation_manager.compute_group("record")
+
+
+@configclass
+class PreStepRecordObservationsRecorderCfg(RecorderTermCfg):
+    class_type: type[RecorderTerm] = PreStepRecordObservationsRecorder
+
+
+@configclass
+class LeRobotRslRlRecorderManagerCfg(ActionStateRecorderManagerCfg):
+    """Recorder config that keeps RSL-RL policy observations separate from LeRobot observations."""
+
+    record_initial_state = InitialStateRecorderCfg()
+    record_post_step_states = PostStepStatesRecorderCfg()
+    record_pre_step_actions = PreStepActionsRecorderCfg()
+    record_pre_step_flat_policy_observations = None
+    record_pre_step_record_observations = PreStepRecordObservationsRecorderCfg()
+    record_post_step_processed_actions = PostStepProcessedActionsRecorderCfg()
 
 
 @configclass
@@ -305,8 +400,8 @@ class LiftCubeDigitalTwinEnvCfg(LiftCubeEnvCfg, ManagerBasedRLDigitalTwinEnvCfg)
 
 
 @configclass
-class LiftCubeRewardDenseEnvCfg(LiftCubeEnvCfg):
-    """Replacement dense reward configuration for MLP PPO training."""
+class LiftCubeRewardDenseBaseEnvCfg(LiftCubeEnvCfg):
+    """Shared dense reward configuration for MLP PPO evaluation and collection."""
 
     observations: LiftCubeMlpObservationsCfg = LiftCubeMlpObservationsCfg()
     commands: LiftCubeCommandsCfg = LiftCubeCommandsCfg()
@@ -329,6 +424,23 @@ class LiftCubeRewardDenseEnvCfg(LiftCubeEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
+        # Disable command marker visualization to reduce rendering overhead.
+        self.commands.object_pose.debug_vis = False
+
+        # 50 Hz control loop.
+        self.decimation = 2
+        self.episode_length_s = 5.0
+        self.sim.dt = 0.01
+        self.sim.render_interval = self.decimation
+
+
+@configclass
+class LiftCubeRewardDenseEnvCfg(LiftCubeRewardDenseBaseEnvCfg):
+    """Fast state-only dense reward configuration for MLP PPO training/evaluation."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
         # Disable vision sensors for MLP PPO training: observations are state-only.
         self.scene.wrist = None
         self.scene.front = None
@@ -341,17 +453,8 @@ class LiftCubeRewardDenseEnvCfg(LiftCubeEnvCfg):
             if asset_cfg is not None and getattr(asset_cfg, "name", None) in {"front", "wrist"}:
                 setattr(self.events, event_name, None)
 
-        # Disable command marker visualization to reduce rendering overhead.
-        self.commands.object_pose.debug_vis = False
-
         # Disable recorder manager for PPO training to avoid unnecessary overhead.
         self.recorders = None
-
-        # 50 Hz control loop.
-        self.decimation = 2
-        self.episode_length_s = 5.0
-        self.sim.dt = 0.01
-        self.sim.render_interval = self.decimation
 
 
 @configclass
@@ -363,3 +466,35 @@ class LiftCubeRewardDenseTrainEnvCfg(LiftCubeRewardDenseEnvCfg):
 
         # Do not reset at success during PPO training; otherwise the policy may hover below the threshold.
         self.terminations.success = None
+
+
+@configclass
+class LiftCubeRewardDenseCollectEnvCfg(LiftCubeRewardDenseBaseEnvCfg):
+    """Collection variant for recording RSL-RL rollouts as LeRobot episodes."""
+
+    scene: LiftCubeCollectSceneCfg = LiftCubeCollectSceneCfg(num_envs=1, env_spacing=8.0)
+    observations: LiftCubeMlpCollectObservationsCfg = LiftCubeMlpCollectObservationsCfg()
+    recorders: LeRobotRslRlRecorderManagerCfg = LeRobotRslRlRecorderManagerCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.recorders = LeRobotRslRlRecorderManagerCfg()
+
+    def build_lerobot_frame(self, episode_data, dataset_cfg) -> dict:
+        obs_data = episode_data._data["obs"]
+        action = episode_data._data["processed_actions"][-1]
+        frame = {
+            "action": convert_leisaac_action_to_lerobot(action.unsqueeze(0)).squeeze(0),
+            "observation.state": convert_leisaac_action_to_lerobot(
+                obs_data["joint_pos_abs"][-1].unsqueeze(0)
+            ).squeeze(0),
+            "task": self.task_description,
+        }
+        for frame_key in dataset_cfg.features.keys():
+            if not frame_key.startswith("observation.images"):
+                continue
+            camera_key = frame_key.split(".")[-1]
+            frame[frame_key] = obs_data[camera_key][-1].cpu().numpy()
+
+        return frame
