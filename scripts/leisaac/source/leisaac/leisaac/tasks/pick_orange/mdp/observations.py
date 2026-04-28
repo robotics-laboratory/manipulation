@@ -133,6 +133,24 @@ def object_position_in_robot_root_frame(
     return obj_pos_b
 
 
+def objects_positions_in_robot_root_frame(
+    env: ManagerBasedRLEnv | DirectRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    objects_cfg: list[SceneEntityCfg] | None = None,
+) -> torch.Tensor:
+    """Object positions represented in the robot base frame, concatenated in task order."""
+    if objects_cfg is None:
+        objects_cfg = [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")]
+
+    robot: Articulation = env.scene[robot_cfg.name]
+    positions = []
+    for object_cfg in objects_cfg:
+        obj: RigidObject = env.scene[object_cfg.name]
+        obj_pos_b, _ = subtract_frame_transforms(robot.data.root_state_w[:, :3], robot.data.root_state_w[:, 3:7], obj.data.root_pos_w[:, :3])
+        positions.append(obj_pos_b)
+    return torch.cat(positions, dim=1)
+
+
 def active_unplaced_orange_position_in_robot_root_frame(
     env: ManagerBasedRLEnv | DirectRLEnv,
     oranges_cfg: list[SceneEntityCfg],

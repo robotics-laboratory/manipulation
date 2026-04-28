@@ -1,5 +1,7 @@
+import copy
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 from isaaclab.envs import ManagerBasedEnv
 from isaaclab.managers import DatasetExportMode, RecorderManager
@@ -8,6 +10,25 @@ from leisaac.utils.robot_utils import build_feature_from_env
 
 from ..datasets.lerobot_dataset_handler import LeRobotDatasetCfg, LeRobotDatasetHandler
 from .recorder_manager import EnhanceDatasetExportMode
+
+
+def _freeze_lerobot_value(value):
+    """Copy frame values before staging so delayed export cannot observe reused simulator buffers."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, dict):
+        return {key: _freeze_lerobot_value(sub_value) for key, sub_value in value.items()}
+    if isinstance(value, list):
+        return [_freeze_lerobot_value(sub_value) for sub_value in value]
+    if isinstance(value, tuple):
+        return tuple(_freeze_lerobot_value(sub_value) for sub_value in value)
+    return copy.deepcopy(value)
+
+
+def _freeze_lerobot_frame(frame: dict) -> dict:
+    return {key: _freeze_lerobot_value(value) for key, value in frame.items()}
 
 
 class LeRobotRecorderManager(RecorderManager):
@@ -34,8 +55,9 @@ class LeRobotRecorderManager(RecorderManager):
         self._dataset_file_handler = cfg.dataset_file_handler_class_type(dataset_cfg)
         self._dataset_file_handler.create(None, resume=resume)
 
-        self._skip_frames = 5
+        self._skip_frames = 0
         self._env_steps_record = torch.zeros(self._env.num_envs)
+        self._pending_frames = {env_id: [] for env_id in range(self._env.num_envs)}
 
     def __str__(self) -> str:
         msg = "[Enhanced] LeRobotRecorderManager. \n"
@@ -48,7 +70,11 @@ class LeRobotRecorderManager(RecorderManager):
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, torch.Tensor]:
         if env_ids is None:
             env_ids = list(range(self._env.num_envs))
+        if isinstance(env_ids, torch.Tensor):
+            env_ids = env_ids.tolist()
         self._env_steps_record[env_ids] = 0
+        for env_id in env_ids:
+            self._pending_frames[env_id] = []
         return super().reset(env_ids)
 
     def record_post_step(self) -> None:
@@ -59,8 +85,8 @@ class LeRobotRecorderManager(RecorderManager):
         self._env_steps_record[env_idx] += 1
         if self._env_steps_record[env_idx] <= self._skip_frames:
             return
-        frame = self._env.cfg.build_lerobot_frame(self._episodes[env_idx], self._dataset_cfg)
-        self._dataset_file_handler.add_frame(frame)
+        frame = _freeze_lerobot_frame(self._env.cfg.build_lerobot_frame(self._episodes[env_idx], self._dataset_cfg))
+        self._pending_frames[env_idx].append(frame)
         self._episodes[env_idx]._data.clear()
 
     def export_episodes(self, env_ids: Sequence[int] | None = None) -> None:
@@ -79,15 +105,32 @@ class LeRobotRecorderManager(RecorderManager):
                 episode_succeeded = self._episodes[env_id].success
                 target_dataset_file_handler = self._dataset_file_handler
                 if episode_succeeded:
+                    pending_frames = self._pending_frames.get(env_id, [])
+                    if len(pending_frames) == 0:
+                        print("[WARN] Skipping successful episode export because it has no staged LeRobot frames.")
+                        target_dataset_file_handler.clear()
+                        self._exported_failed_episode_count[env_id] = (
+                            self._exported_failed_episode_count.get(env_id, -1) + 1
+                        )
+                        self._pending_frames[env_id] = []
+                        self._episodes[env_id] = EpisodeData()
+                        continue
+                    target_dataset_file_handler.clear()
+                    for frame in pending_frames:
+                        target_dataset_file_handler.add_frame(frame)
                     target_dataset_file_handler.flush()
                     self._exported_successful_episode_count[env_id] = (
                         self._exported_successful_episode_count.get(env_id, 0) + 1
                     )
                 else:
+                    discarded_frames = len(self._pending_frames.get(env_id, []))
                     target_dataset_file_handler.clear()
                     self._exported_failed_episode_count[env_id] = (
                         self._exported_failed_episode_count.get(env_id, -1) + 1
                     )  # default to -1 to handle the first reset
+                    if discarded_frames > 0:
+                        print(f"[INFO] Discarded failed LeRobot episode buffer with {discarded_frames} staged frames.")
+                self._pending_frames[env_id] = []
             # Reset the episode buffer for the given environment after export
             self._episodes[env_id] = EpisodeData()
 
@@ -122,3 +165,4 @@ class LeRobotRecorderManager(RecorderManager):
 
         if force_export_or_skip or (force_export_or_skip is None and self.cfg.export_in_record_pre_reset):
             self.export_episodes(env_ids)
+            self._env_steps_record[env_ids] = 0

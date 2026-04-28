@@ -18,7 +18,7 @@ import isaac_so_arm101.scripts.rsl_rl.cli_args as cli_args  # isort: skip
 
 parser = argparse.ArgumentParser(description="Collect a LeRobot dataset with an RSL-RL policy.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate. Must be 1.")
-parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--task", type=str, default=None, help="Name of the collection task.")
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
@@ -37,6 +37,15 @@ parser.add_argument(
 )
 parser.add_argument("--fps", type=int, default=30, help="LeRobot dataset frames per second.")
 parser.add_argument(
+    "--step_hz",
+    type=float,
+    default=30.0,
+    help=(
+        "Wall-clock environment stepping rate during collection. This gives RTX cameras time to produce fresh frames. "
+        "Keep this aligned with --fps for honest LeRobot timing."
+    ),
+)
+parser.add_argument(
     "--success_only",
     action="store_true",
     default=False,
@@ -48,8 +57,50 @@ parser.add_argument(
     default=False,
     help="Fail if the local LeRobot dataset already exists instead of overwriting it.",
 )
+parser.add_argument(
+    "--resume_dataset",
+    action="store_true",
+    default=False,
+    help="Append successful episodes to an existing local LeRobot dataset instead of recreating it.",
+)
 parser.add_argument("--push_to_hub", action="store_true", default=False, help="Push the dataset to Hugging Face Hub.")
 parser.add_argument("--max_steps", type=int, default=0, help="Optional global rollout step limit. Set 0 for unlimited.")
+parser.add_argument(
+    "--post_success_steps",
+    type=int,
+    default=25,
+    help="Number of additional control steps to record after first detecting task success.",
+)
+parser.add_argument(
+    "--max_action_delta",
+    type=float,
+    default=0.0,
+    help=(
+        "Optional per-step delta limit for policy actions before env.step(). "
+        "Set >0 to slow/smooth teacher arm motion; 0 disables limiting."
+    ),
+)
+parser.add_argument(
+    "--limit_gripper_delta",
+    action="store_true",
+    default=False,
+    help="Also apply --max_action_delta to the final gripper action dimension. By default only arm dims are limited.",
+)
+parser.add_argument(
+    "--manual_decision",
+    action="store_true",
+    default=False,
+    help="Disable automatic success/reset. Press N to mark success+reset, R to reset/skip the current episode.",
+)
+parser.add_argument(
+    "--post_reset_warmup_steps",
+    type=int,
+    default=20,
+    help=(
+        "In manual decision mode, render this many post-reset frames before stepping the teacher again. "
+        "This avoids recording stale RTX/reset frames in very short episodes."
+    ),
+)
 
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -61,6 +112,7 @@ if not args_cli.success_only:
     print("[INFO] LeRobot recorder exports successful episodes only; proceeding in success-only mode.")
 args_cli.enable_cameras = True
 
+# clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
 app_launcher = AppLauncher(args_cli)
@@ -68,49 +120,77 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import gymnasium as gym
 import os
 import shutil
-import torch
+import time
 from pathlib import Path
 
-from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg, multi_agent_to_single_agent
-from isaaclab.managers import DatasetExportMode
+import carb
+import gymnasium as gym
+import omni
+import torch
+from isaaclab.envs import (
+    DirectMARLEnv,
+    DirectMARLEnvCfg,
+    DirectRLEnvCfg,
+    ManagerBasedRLEnvCfg,
+    multi_agent_to_single_agent,
+)
+from isaaclab.managers import DatasetExportMode, SceneEntityCfg, TerminationTermCfg
 from isaaclab.utils.assets import retrieve_file_path
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from leisaac.enhance.datasets.lerobot_dataset_handler import LeRobotDatasetCfg
+from leisaac.enhance.managers import EnhanceDatasetExportMode
+from leisaac.enhance.managers.lerobot_recorder_manager import LeRobotRecorderManager
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 try:
     from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 except ModuleNotFoundError:
     get_published_pretrained_checkpoint = None
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
-from leisaac.enhance.datasets.lerobot_dataset_handler import LeRobotDatasetCfg
-from leisaac.enhance.managers.lerobot_recorder_manager import LeRobotRecorderManager
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
-
 import isaaclab_tasks  # noqa: F401
 import isaac_so_arm101.tasks  # noqa: F401
 import leisaac.tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
+from leisaac.tasks.lift_cube import mdp as lift_cube_mdp
 
 
-def _local_lerobot_dataset_path(repo_id: str) -> Path:
-    if not repo_id:
-        raise ValueError("--repo_id is required for LeRobot dataset collection.")
-    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    return hf_home / "lerobot" / repo_id
+class RateLimiter:
+    """Match teleop collection pacing and keep RTX sensors rendering between control steps."""
+
+    def __init__(self, hz: float):
+        if hz <= 0.0:
+            raise ValueError("--step_hz must be positive.")
+        self.hz = hz
+        self.last_time = time.time()
+        self.sleep_duration = 1.0 / hz
+        self.render_period = min(0.0166, self.sleep_duration)
+
+    def sleep(self, env) -> None:
+        next_wakeup_time = self.last_time + self.sleep_duration
+        while time.time() < next_wakeup_time:
+            time.sleep(self.render_period)
+            env.sim.render()
+
+        self.last_time = self.last_time + self.sleep_duration
+        if self.last_time < time.time():
+            while self.last_time < time.time():
+                self.last_time += self.sleep_duration
+
+
+def _lerobot_cache_path(repo_id: str) -> Path:
+    root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    return root / "lerobot" / repo_id
 
 
 def _prepare_lerobot_dataset_path(repo_id: str) -> None:
-    dataset_path = _local_lerobot_dataset_path(repo_id)
+    dataset_path = _lerobot_cache_path(repo_id)
     if not dataset_path.exists():
         return
     if args_cli.no_overwrite:
-        raise FileExistsError(
-            f"Local LeRobot dataset already exists: {dataset_path}. "
-            "Remove --no_overwrite or choose a different --repo_id."
-        )
+        raise FileExistsError(f"Local LeRobot dataset already exists: {dataset_path}")
     shutil.rmtree(dataset_path)
     print(f"[INFO] Overwriting existing local LeRobot dataset: {dataset_path}")
 
@@ -120,13 +200,30 @@ def _replace_lerobot_recorder(env, env_cfg: ManagerBasedRLEnvCfg) -> None:
     if env_cfg.recorders is None:
         raise ValueError("The collection environment must define recorder terms.")
 
-    env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
-    _prepare_lerobot_dataset_path(args_cli.repo_id)
+    if args_cli.resume_dataset:
+        dataset_path = _lerobot_cache_path(args_cli.repo_id)
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"Cannot resume missing local LeRobot dataset: {dataset_path}")
+        env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_SUCCEEDED_ONLY_RESUME
+        print(f"[INFO] Resuming existing local LeRobot dataset: {dataset_path}")
+    else:
+        env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+        _prepare_lerobot_dataset_path(args_cli.repo_id)
     if hasattr(env.unwrapped, "recorder_manager"):
         del env.unwrapped.recorder_manager
 
     dataset_cfg = LeRobotDatasetCfg(repo_id=args_cli.repo_id, fps=args_cli.fps)
     env.unwrapped.recorder_manager = LeRobotRecorderManager(env_cfg.recorders, dataset_cfg, env.unwrapped)
+
+
+def _get_lerobot_episode_count(env) -> int:
+    dataset = env.unwrapped.recorder_manager._dataset_file_handler._lerobot_dataset
+    meta = getattr(dataset, "meta", None)
+    if meta is not None and hasattr(meta, "total_episodes"):
+        return int(meta.total_episodes)
+    if hasattr(dataset, "num_episodes"):
+        return int(dataset.num_episodes)
+    return 0
 
 
 def _push_dataset_to_hub(env) -> None:
@@ -135,6 +232,88 @@ def _push_dataset_to_hub(env) -> None:
         dataset.push_to_hub()
     else:
         print("[WARN] The active LeRobot dataset object does not expose push_to_hub(); skipping upload.")
+
+
+def _detect_lift_cube_success(env) -> torch.Tensor:
+    return lift_cube_mdp.cube_height_above_base(
+        env=env.unwrapped,
+        cube_cfg=SceneEntityCfg("cube"),
+        robot_cfg=SceneEntityCfg("robot"),
+        robot_base_name="base",
+        height_threshold=0.20,
+    )
+
+
+def _set_manual_success(env, success: bool) -> None:
+    env = env.unwrapped
+    if not hasattr(env, "termination_manager"):
+        raise RuntimeError("Manual success marking currently requires a manager-based environment.")
+    env.termination_manager.set_term_cfg(
+        "success",
+        TerminationTermCfg(
+            func=lambda env: torch.full((env.num_envs,), success, dtype=torch.bool, device=env.device),
+        ),
+    )
+    env.termination_manager.compute()
+
+
+def _limit_action_delta(
+    actions: torch.Tensor,
+    previous_actions: torch.Tensor | None,
+    max_delta: float,
+    limit_gripper: bool,
+) -> torch.Tensor:
+    """Clamp per-step policy action changes to make teacher trajectories easier to imitate."""
+    if max_delta <= 0.0 or previous_actions is None:
+        return actions
+
+    limited_actions = actions.clone()
+    delta = torch.clamp(actions - previous_actions, min=-max_delta, max=max_delta)
+    if limit_gripper:
+        limited_actions = previous_actions + delta
+    else:
+        # SO-101 action layout is 5 arm joints + gripper. Keep gripper responsive by default.
+        limited_actions[..., :-1] = previous_actions[..., :-1] + delta[..., :-1]
+    return limited_actions
+
+
+def _warmup_after_reset(env, num_steps: int) -> None:
+    """Let sensors/rendering settle after reset without advancing policy-controlled episode frames."""
+    for _ in range(max(num_steps, 0)):
+        env.unwrapped.sim.render()
+
+
+class ManualDecisionController:
+    """Keyboard callbacks for manual dataset decisions during automated teacher rollout."""
+
+    def __init__(self):
+        self._appwindow = omni.appwindow.get_default_app_window()
+        self._input = carb.input.acquire_input_interface()
+        self._keyboard = self._appwindow.get_keyboard()
+        self._keyboard_sub = self._input.subscribe_to_keyboard_events(self._keyboard, self._on_keyboard_event)
+        self.start_recording = False
+        self.mark_success = False
+        self.reset_failed = False
+
+    def __del__(self):
+        if hasattr(self, "_input") and hasattr(self, "_keyboard") and hasattr(self, "_keyboard_sub"):
+            self._input.unsubscribe_from_keyboard_events(self._keyboard, self._keyboard_sub)
+            self._keyboard_sub = None
+
+    def reset_flags(self):
+        self.start_recording = False
+        self.mark_success = False
+        self.reset_failed = False
+
+    def _on_keyboard_event(self, event, *args, **kwargs):
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            if event.input.name == "B":
+                self.start_recording = True
+            elif event.input.name == "N":
+                self.mark_success = True
+            elif event.input.name == "R":
+                self.reset_failed = True
+        return True
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -186,31 +365,157 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     obs = env.get_observations()
     total_steps = 0
+    initial_episode_count = _get_lerobot_episode_count(env) if args_cli.resume_dataset else 0
+    target_episode_count = initial_episode_count + args_cli.num_episodes
     last_success_count = env.unwrapped.recorder_manager.exported_successful_episode_count
+    success_detected = False
+    post_success_steps = 0
+    collection_complete = False
+    previous_actions = None
+    rate_limiter = RateLimiter(args_cli.step_hz)
+    manual_controller = ManualDecisionController() if args_cli.manual_decision else None
+    pending_manual_warmup_steps = args_cli.post_reset_warmup_steps if manual_controller is not None else 0
+    manual_recording_active = manual_controller is None
+
+    if abs(args_cli.step_hz - args_cli.fps) > 1e-6:
+        print(
+            f"[WARN] --step_hz ({args_cli.step_hz:g}) differs from --fps ({args_cli.fps}). "
+            "Videos and dataset timestamps will not reflect wall-clock collection speed."
+        )
+    print(f"[INFO] Collection pacing: {args_cli.step_hz:g} Hz; LeRobot metadata FPS: {args_cli.fps}.")
+    if args_cli.resume_dataset:
+        print(
+            f"[INFO] Resume mode: dataset starts with {initial_episode_count} episodes; "
+            f"recording {args_cli.num_episodes} more to reach {target_episode_count}."
+        )
+    if args_cli.max_action_delta > 0.0:
+        target_dims = "all action dims" if args_cli.limit_gripper_delta else "arm action dims only"
+        print(f"[INFO] Limiting teacher action delta to {args_cli.max_action_delta:g} per step ({target_dims}).")
+    if manual_controller is not None:
+        print("[INFO] Manual decision mode enabled. Press B to start, N to save success+reset, R to reset/skip.")
+        print(f"[INFO] Post-reset render warmup: {args_cli.post_reset_warmup_steps} frames.")
 
     try:
         while simulation_app.is_running():
-            with torch.inference_mode():
+            if manual_controller is not None:
+                if manual_controller.mark_success:
+                    print("Task Success!!!")
+                    print("[INFO] Manual success marked; exporting episode and resetting.")
+                    expected_success_count = last_success_count + 1
+                    _set_manual_success(env, True)
+                    obs, _ = env.reset()
+                    _set_manual_success(env, False)
+                    previous_actions = None
+                    success_detected = False
+                    post_success_steps = 0
+                    if manual_recording_active:
+                        print("Stop Recording!!!")
+                    manual_recording_active = False
+                    manual_controller.reset_flags()
+
+                    success_count = env.unwrapped.recorder_manager.exported_successful_episode_count
+                    if success_count > last_success_count:
+                        last_success_count = success_count
+                        total_success_count = initial_episode_count + success_count
+                        print(
+                            f"[INFO] Recorded successful episode {total_success_count}/{target_episode_count} "
+                            f"(session {success_count}/{args_cli.num_episodes})."
+                        )
+                    if success_count < expected_success_count:
+                        print(
+                            "[WARN] Manual success reset completed, but exported success count did not increase yet "
+                            f"({success_count}/{expected_success_count}). Continuing after warmup."
+                        )
+                    if initial_episode_count + success_count >= target_episode_count:
+                        collection_complete = True
+                        break
+                    pending_manual_warmup_steps = args_cli.post_reset_warmup_steps
+                    continue
+
+                if manual_controller.reset_failed:
+                    print("[INFO] Manual reset requested; skipping current episode.")
+                    _set_manual_success(env, False)
+                    obs, _ = env.reset()
+                    previous_actions = None
+                    success_detected = False
+                    post_success_steps = 0
+                    if manual_recording_active:
+                        print("Stop Recording!!!")
+                    manual_recording_active = False
+                    manual_controller.reset_flags()
+                    pending_manual_warmup_steps = args_cli.post_reset_warmup_steps
+                    continue
+
+                if pending_manual_warmup_steps > 0:
+                    env.unwrapped.sim.render()
+                    pending_manual_warmup_steps -= 1
+                    continue
+
+                if manual_controller.start_recording:
+                    print("Start Recording!!!")
+                    manual_recording_active = True
+                    manual_controller.start_recording = False
+
+                if not manual_recording_active:
+                    env.unwrapped.sim.render()
+                    continue
+
+            with torch.no_grad():
                 actions = policy(obs)
-                obs, _, _, _ = env.step(actions)
+            actions = _limit_action_delta(
+                actions=actions,
+                previous_actions=previous_actions,
+                max_delta=args_cli.max_action_delta,
+                limit_gripper=args_cli.limit_gripper_delta,
+            )
+            obs, _, _, _ = env.step(actions)
+            rate_limiter.sleep(env.unwrapped)
+            previous_actions = actions.detach().clone()
 
             total_steps += 1
-            success_count = env.unwrapped.recorder_manager.exported_successful_episode_count
-            if success_count > last_success_count:
-                last_success_count = success_count
-                print(f"[INFO] Recorded {success_count}/{args_cli.num_episodes} successful episodes.")
 
-            if success_count >= args_cli.num_episodes:
-                print(f"[INFO] Finished recording {args_cli.num_episodes} successful episodes.")
-                break
+            if manual_controller is None:
+                is_success = bool(_detect_lift_cube_success(env)[0].item())
+                if is_success and not success_detected:
+                    success_detected = True
+                    post_success_steps = 0
+                    print(
+                        "[INFO] Success detected; recording "
+                        f"{args_cli.post_success_steps} additional post-success steps."
+                    )
+                if success_detected:
+                    post_success_steps += 1
+
+            if manual_controller is None and success_detected and post_success_steps >= args_cli.post_success_steps:
+                _set_manual_success(env, True)
+                obs, _ = env.reset()
+                _set_manual_success(env, False)
+                previous_actions = None
+                success_detected = False
+                post_success_steps = 0
+
+                success_count = env.unwrapped.recorder_manager.exported_successful_episode_count
+                if success_count > last_success_count:
+                    last_success_count = success_count
+                    total_success_count = initial_episode_count + success_count
+                    print(
+                        f"[INFO] Recorded successful episode {total_success_count}/{target_episode_count} "
+                        f"(session {success_count}/{args_cli.num_episodes})."
+                    )
+                if initial_episode_count + success_count >= target_episode_count:
+                    collection_complete = True
+                    break
+
             if args_cli.max_steps > 0 and total_steps >= args_cli.max_steps:
-                print(f"[WARN] Reached --max_steps={args_cli.max_steps} before collecting all requested episodes.")
+                print(f"[WARN] Reached --max_steps={args_cli.max_steps} before collection completed.")
                 break
     finally:
         if hasattr(env.unwrapped.recorder_manager, "finalize"):
             env.unwrapped.recorder_manager.finalize()
-        if args_cli.push_to_hub:
+        if args_cli.push_to_hub and collection_complete:
             _push_dataset_to_hub(env)
+        elif args_cli.push_to_hub:
+            print("[WARN] Collection did not reach requested episode count; skipping push_to_hub.")
         env.close()
 
 

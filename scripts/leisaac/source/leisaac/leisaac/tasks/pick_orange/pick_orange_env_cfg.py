@@ -93,6 +93,13 @@ class PickOrangeMlpObservationsCfg:
                 "robot_cfg": SceneEntityCfg("robot"),
             },
         )
+        orange_positions = ObsTerm(
+            func=mdp.objects_positions_in_robot_root_frame,
+            params={
+                "robot_cfg": SceneEntityCfg("robot"),
+                "objects_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+            },
+        )
         plate_position = ObsTerm(
             func=mdp.object_position_in_robot_root_frame,
             params={"robot_cfg": SceneEntityCfg("robot"), "object_cfg": SceneEntityCfg("Plate")},
@@ -152,6 +159,10 @@ class PickOrangeRewardDenseRewardsCfg:
             "target_height_delta": 0.10,
             "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
             "plate_cfg": SceneEntityCfg("Plate"),
+            "robot_cfg": SceneEntityCfg("robot"),
+            "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+            "grasp_distance": 0.06,
+            "close_joint_threshold": 0.7,
         },
         weight=6.0,
     )
@@ -197,6 +208,16 @@ class PickOrangeRewardDenseRewardsCfg:
             "displacement_tolerance": 0.025,
         },
         weight=-6.0,
+    )
+    active_orange_pre_lift_displacement = RewTerm(
+        func=mdp.active_orange_pre_lift_displacement_penalty,
+        params={
+            "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+            "plate_cfg": SceneEntityCfg("Plate"),
+            "displacement_tolerance": 0.015,
+            "lifted_height_delta": 0.04,
+        },
+        weight=-12.0,
     )
     success_bonus = RewTerm(
         func=mdp.pick_orange_success_bonus,

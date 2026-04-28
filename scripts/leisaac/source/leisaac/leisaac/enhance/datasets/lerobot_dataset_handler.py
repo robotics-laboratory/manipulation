@@ -79,7 +79,8 @@ class LeRobotDatasetHandler(DatasetFileHandlerBase):
         self._lerobot_dataset.save_episode(parallel_encoding=False)
 
     def clear(self):
-        self._lerobot_dataset.clear_episode_buffer()
+        if getattr(self._lerobot_dataset, "episode_buffer", None) is not None:
+            self._lerobot_dataset.clear_episode_buffer()
 
     def finalize(self):
         self._lerobot_dataset.finalize()
