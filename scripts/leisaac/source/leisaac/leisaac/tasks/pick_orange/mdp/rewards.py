@@ -90,6 +90,35 @@ def _gripper_near_closed_mask(
     return torch.stack(masks, dim=1)
 
 
+def _currently_held_per_orange(
+    env: ManagerBasedRLEnv,
+    oranges_cfg: list[SceneEntityCfg],
+    lifted_height_delta: float,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    ee_frame_index: int = 1,
+    grasp_distance: float = 0.06,
+    close_joint_threshold: float = 0.7,
+) -> torch.Tensor:
+    """Per-step mask: orange is grasped now AND currently lifted above threshold."""
+    grasped_now = _gripper_near_closed_mask(
+        env,
+        oranges_cfg=oranges_cfg,
+        robot_cfg=robot_cfg,
+        ee_frame_cfg=ee_frame_cfg,
+        ee_frame_index=ee_frame_index,
+        grasp_distance=grasp_distance,
+        close_joint_threshold=close_joint_threshold,
+    )
+    lifted_now = []
+    for orange_cfg in oranges_cfg:
+        orange: RigidObject = env.scene[orange_cfg.name]
+        start_height = _orange_start_height_world(env, orange)
+        lifted_now.append(orange.data.root_pos_w[:, 2] > (start_height + lifted_height_delta))
+    lifted_now = torch.stack(lifted_now, dim=1)
+    return torch.logical_and(grasped_now, lifted_now)
+
+
 def _lifted_history_per_orange(
     env: ManagerBasedRLEnv,
     oranges_cfg: list[SceneEntityCfg],
@@ -101,22 +130,17 @@ def _lifted_history_per_orange(
     close_joint_threshold: float = 0.7,
 ) -> torch.Tensor:
     _reset_episode_progress_if_needed(env, len(oranges_cfg))
-    lifted_now = []
-    for orange_cfg in oranges_cfg:
-        orange: RigidObject = env.scene[orange_cfg.name]
-        start_height = _orange_start_height_world(env, orange)
-        lifted_now.append(orange.data.root_pos_w[:, 2] > (start_height + lifted_height_delta))
-    lifted_now = torch.stack(lifted_now, dim=1)
-    grasped_now = _gripper_near_closed_mask(
+    held_now = _currently_held_per_orange(
         env,
         oranges_cfg=oranges_cfg,
+        lifted_height_delta=lifted_height_delta,
         robot_cfg=robot_cfg,
         ee_frame_cfg=ee_frame_cfg,
         ee_frame_index=ee_frame_index,
         grasp_distance=grasp_distance,
         close_joint_threshold=close_joint_threshold,
     )
-    env._pick_orange_lifted_history |= torch.logical_and(lifted_now, grasped_now)
+    env._pick_orange_lifted_history |= held_now
     return env._pick_orange_lifted_history
 
 
@@ -199,8 +223,17 @@ def grasp_unplaced_oranges_dense(
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
     ee_frame_index: int = 1,
+    lift_progress_height: float = 0.05,
+    lift_progress_floor: float = 0.25,
 ) -> torch.Tensor:
-    """Reward closing gripper while near the first unplaced orange."""
+    """Reward closing gripper while near the first unplaced orange.
+
+    Multiplied by a lift-progress factor with a small floor: grasping pays only a
+    fraction (``lift_progress_floor``) when the orange is on the table and ramps to
+    the full value once the orange is lifted to ``lift_progress_height`` above its
+    starting height. This prevents the policy from camping on a closed-gripper pose
+    over the orange without actually picking it up.
+    """
     robot: Articulation = env.scene[robot_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
     ee_pos = ee_frame.data.target_pos_w[:, ee_frame_index, :3]
@@ -209,11 +242,21 @@ def grasp_unplaced_oranges_dense(
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
     active_mask, all_placed = _active_target_mask(placed_mask)
     near_scores = []
+    lift_factors = []
+    effective_height = max(lift_progress_height, 1.0e-6)
     for orange_cfg in oranges_cfg:
         orange: RigidObject = env.scene[orange_cfg.name]
         distance = torch.linalg.vector_norm(orange.data.root_pos_w[:, :3] - ee_pos, dim=1)
         near_scores.append(1.0 - torch.tanh(distance / std))
+
+        start_height = _orange_start_height_world(env, orange)
+        lift_progress = torch.clamp(
+            (orange.data.root_pos_w[:, 2] - start_height) / effective_height, min=0.0, max=1.0
+        )
+        lift_factors.append(lift_progress_floor + (1.0 - lift_progress_floor) * lift_progress)
     near_scores = torch.stack(near_scores, dim=1)
+    lift_factors = torch.stack(lift_factors, dim=1)
+    near_scores = near_scores * lift_factors
     active_near = torch.sum(torch.where(active_mask, near_scores, torch.zeros_like(near_scores)), dim=1)
     return torch.where(all_placed, torch.zeros_like(active_near), active_near * gripper_closed)
 
@@ -262,20 +305,24 @@ def move_unplaced_oranges_to_plate_dense(
     oranges_cfg: list[SceneEntityCfg],
     plate_cfg: SceneEntityCfg = SceneEntityCfg("Plate"),
 ) -> torch.Tensor:
-    """Reward reducing XY distance from lifted first unplaced orange to plate center."""
+    """Reward reducing XY distance from currently-held first unplaced orange to plate center.
+
+    Gated by currently-held (grasped AND lifted) rather than sticky lift-history so that
+    dropping the orange to sweep it across the table immediately stops earning credit.
+    """
     plate: RigidObject = env.scene[plate_cfg.name]
     plate_xy = plate.data.root_pos_w[:, :2]
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg, lifted_height_delta=lifted_height_delta)
     active_mask, all_placed = _active_target_mask(placed_mask)
 
     scores = []
-    lifted_history = _lifted_history_per_orange(env, oranges_cfg=oranges_cfg, lifted_height_delta=lifted_height_delta)
+    held_now = _currently_held_per_orange(env, oranges_cfg=oranges_cfg, lifted_height_delta=lifted_height_delta)
     for orange_cfg in oranges_cfg:
         orange: RigidObject = env.scene[orange_cfg.name]
         distance_xy = torch.linalg.vector_norm(orange.data.root_pos_w[:, :2] - plate_xy, dim=1)
         scores.append(1.0 - torch.tanh(distance_xy / std))
     scores = torch.stack(scores, dim=1)
-    scores = scores * lifted_history.float()
+    scores = scores * held_now.float()
     active_score = torch.sum(torch.where(active_mask, scores, torch.zeros_like(scores)), dim=1)
     return torch.where(all_placed, torch.zeros_like(active_score), active_score)
 
@@ -287,13 +334,20 @@ def oranges_on_plate_fraction(
     x_range: tuple[float, float] = (-0.10, 0.10),
     y_range: tuple[float, float] = (-0.10, 0.10),
     height_range: tuple[float, float] = (-0.07, 0.07),
+    lifted_height_delta: float = 0.08,
 ) -> torch.Tensor:
-    """Reward proportional to fraction of oranges successfully placed on plate."""
+    """Reward proportional to fraction of oranges successfully placed on plate.
+
+    Gated by ``lifted_history``: only oranges that were grasped AND lifted at least
+    ``lifted_height_delta`` above their starting height at some point during the
+    episode count as placed. The threshold is intentionally above what stochastic
+    arm motion can produce by luck so that "sweep onto plate" never triggers credit.
+    """
     placed_mask = _progress_mask_per_orange(
         env,
         oranges_cfg=oranges_cfg,
         plate_cfg=plate_cfg,
-        lifted_height_delta=0.04,
+        lifted_height_delta=lifted_height_delta,
         x_range=x_range,
         y_range=y_range,
         height_range=height_range,
@@ -384,17 +438,27 @@ def active_orange_pre_lift_displacement_penalty(
     displacement_tolerance: float = 0.015,
     lifted_height_delta: float = 0.04,
 ) -> torch.Tensor:
-    """Penalty for pushing the active orange horizontally before a valid gripper-held lift."""
+    """Penalty for pushing the active orange horizontally while it is on (or near) the table.
+
+    Triggered per-step whenever the active orange's height stays at or below the lift
+    threshold, regardless of whether it was briefly lifted earlier in the episode. This
+    closes the lift-then-drop-and-sweep loophole left open by the prior history-based gate.
+    """
     progress_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg, lifted_height_delta=lifted_height_delta)
     active_mask, _ = _active_target_mask(progress_mask)
-    lifted_history = _lifted_history_per_orange(env, oranges_cfg=oranges_cfg, lifted_height_delta=lifted_height_delta)
-    penalized_mask = torch.logical_and(active_mask, torch.logical_not(lifted_history))
 
+    below_lift_list = []
     displacements = []
     for orange_cfg in oranges_cfg:
         orange: RigidObject = env.scene[orange_cfg.name]
+        start_height = _orange_start_height_world(env, orange)
+        below_lift_list.append(orange.data.root_pos_w[:, 2] <= (start_height + lifted_height_delta))
+
         default_pos_w = orange.data.default_root_state[:, :3] + env.scene.env_origins
         xy_displacement = torch.linalg.vector_norm(orange.data.root_pos_w[:, :2] - default_pos_w[:, :2], dim=1)
         displacements.append(torch.clamp(xy_displacement - displacement_tolerance, min=0.0))
+    below_lift = torch.stack(below_lift_list, dim=1)
     displacement = torch.stack(displacements, dim=1)
+
+    penalized_mask = torch.logical_and(active_mask, below_lift)
     return torch.sum(torch.where(penalized_mask, displacement, torch.zeros_like(displacement)), dim=1)

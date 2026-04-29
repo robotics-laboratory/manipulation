@@ -150,21 +150,23 @@ class PickOrangeRewardDenseRewardsCfg:
             "plate_cfg": SceneEntityCfg("Plate"),
             "robot_cfg": SceneEntityCfg("robot"),
             "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+            "lift_progress_height": 0.05,
+            "lift_progress_floor": 0.25,
         },
-        weight=4.0,
+        weight=2.0,
     )
     lift_active_orange = RewTerm(
         func=mdp.lift_unplaced_oranges_dense,
         params={
-            "target_height_delta": 0.10,
+            "target_height_delta": 0.05,
             "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
             "plate_cfg": SceneEntityCfg("Plate"),
             "robot_cfg": SceneEntityCfg("robot"),
             "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-            "grasp_distance": 0.06,
+            "grasp_distance": 0.04,
             "close_joint_threshold": 0.7,
         },
-        weight=6.0,
+        weight=8.0,
     )
     move_active_orange_to_plate = RewTerm(
         func=mdp.move_unplaced_oranges_to_plate_dense,
@@ -181,16 +183,9 @@ class PickOrangeRewardDenseRewardsCfg:
         params={
             "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
             "plate_cfg": SceneEntityCfg("Plate"),
+            "lifted_height_delta": 0.08,
         },
-        weight=24.0,
-    )
-    all_oranges_progress = RewTerm(
-        func=mdp.oranges_on_plate_fraction,
-        params={
-            "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
-            "plate_cfg": SceneEntityCfg("Plate"),
-        },
-        weight=12.0,
+        weight=6.0,
     )
     rest_pose_after_placing = RewTerm(
         func=mdp.rest_pose_after_all_placed,
@@ -205,7 +200,7 @@ class PickOrangeRewardDenseRewardsCfg:
         params={
             "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
             "plate_cfg": SceneEntityCfg("Plate"),
-            "displacement_tolerance": 0.025,
+            "displacement_tolerance": 0.05,
         },
         weight=-6.0,
     )
@@ -214,10 +209,10 @@ class PickOrangeRewardDenseRewardsCfg:
         params={
             "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
             "plate_cfg": SceneEntityCfg("Plate"),
-            "displacement_tolerance": 0.015,
+            "displacement_tolerance": 0.025,
             "lifted_height_delta": 0.04,
         },
-        weight=-12.0,
+        weight=-3.0,
     )
     success_bonus = RewTerm(
         func=mdp.pick_orange_success_bonus,

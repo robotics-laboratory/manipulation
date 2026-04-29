@@ -48,8 +48,8 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
     front: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base/front_camera",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.0, -0.60114, 0.66027),
-            rot=(0.94246, 0.33432, 0.00055, 0.00156),
+            pos=(-0.0, -0.71935, 0.69892),
+            rot=(0.92788, 0.37234, -0.00185, -0.00461),
             convention="opengl",
         ),
         data_types=["rgb"],
@@ -134,7 +134,6 @@ class LiftCubeMlpObservationsCfg:
             func=mdp.object_position_in_robot_root_frame,
             params={"robot_cfg": SceneEntityCfg("robot"), "object_cfg": SceneEntityCfg("cube")},
         )
-        target_cube_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
         actions = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
@@ -244,6 +243,48 @@ class LiftCubeRewardDenseRewardsCfg:
         },
         weight=8.0,
     )
+    goal_tracking = RewTerm(
+        func=mdp.goal_tracking_dense,
+        params={
+            "std": 0.30,
+            "command_name": "object_pose",
+            "lifted_height_delta": 0.025,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+        weight=0.0,
+    )
+    goal_tracking_fine = RewTerm(
+        func=mdp.goal_tracking_dense,
+        params={
+            "std": 0.05,
+            "command_name": "object_pose",
+            "lifted_height_delta": 0.025,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+        weight=0.0,
+    )
+    goal_success_bonus = RewTerm(
+        func=mdp.goal_success_bonus,
+        params={
+            "command_name": "object_pose",
+            "position_tolerance": 0.05,
+            "lifted_height_delta": 0.025,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+        weight=0.0,
+    )
+    lifted_stillness = RewTerm(
+        func=mdp.lifted_stillness_dense,
+        params={
+            "lifted_height_delta": 0.15,
+            "velocity_std": 0.08,
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+        weight=4.0,
+    )
     success_bonus = RewTerm(
         func=mdp.cube_height_above_base_bonus,
         params={
@@ -253,9 +294,9 @@ class LiftCubeRewardDenseRewardsCfg:
             "height_threshold": 0.20,
             "ramp_width": 0.05,
         },
-        weight=20.0,
+        weight=10.0,
     )
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    # action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1e-4, params={"asset_cfg": SceneEntityCfg("robot")})
 
 
@@ -263,10 +304,10 @@ class LiftCubeRewardDenseRewardsCfg:
 class LiftCubeRewardDenseCurriculumCfg:
     """Curriculum schedule for regularization terms."""
 
-    action_rate = CurrTerm(
-        func=mdp.modify_reward_weight,
-        params={"term_name": "action_rate", "weight": -1e-4, "num_steps": 30000},
-    )
+    # action_rate = CurrTerm(
+    #     func=mdp.modify_reward_weight,
+    #     params={"term_name": "action_rate", "weight": -1e-4, "num_steps": 30000},
+    # )
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "joint_vel", "weight": -1e-4, "num_steps": 30000},
@@ -329,10 +370,11 @@ class LiftCubeRewardDenseEnvCfg(LiftCubeEnvCfg):
     rewards: LiftCubeRewardDenseRewardsCfg = LiftCubeRewardDenseRewardsCfg()
     curriculum: LiftCubeRewardDenseCurriculumCfg = LiftCubeRewardDenseCurriculumCfg()
     actions: SingleArmActionsCfg = SingleArmActionsCfg(
-        arm_action=mdp.JointPositionActionCfg(
+        arm_action=mdp.RateLimitedJointPositionActionCfg(
             asset_name="robot",
             joint_names=["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"],
-            scale=0.35,
+            scale=0.25,
+            max_delta=0.025,
         ),
         gripper_action=mdp.BinaryJointPositionActionCfg(
             asset_name="robot",
@@ -381,10 +423,11 @@ class LiftCubeRewardDenseCollectEnvCfg(LiftCubeEnvCfg):
     commands: LiftCubeCommandsCfg = LiftCubeCommandsCfg()
     recorders: LeRobotRslRlRecorderManagerCfg = LeRobotRslRlRecorderManagerCfg()
     actions: SingleArmActionsCfg = SingleArmActionsCfg(
-        arm_action=mdp.JointPositionActionCfg(
+        arm_action=mdp.RateLimitedJointPositionActionCfg(
             asset_name="robot",
             joint_names=["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"],
-            scale=0.35,
+            scale=0.25,
+            max_delta=0.025,
         ),
         gripper_action=mdp.BinaryJointPositionActionCfg(
             asset_name="robot",

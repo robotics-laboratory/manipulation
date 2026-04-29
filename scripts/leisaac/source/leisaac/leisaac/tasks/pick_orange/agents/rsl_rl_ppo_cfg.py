@@ -16,7 +16,7 @@ class PickOrangeRewardDensePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "leisaac_pick_orange_reward_dense"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.2,
+        init_noise_std=0.4,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
@@ -25,7 +25,7 @@ class PickOrangeRewardDensePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.006,
+        entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-4,

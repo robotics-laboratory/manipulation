@@ -249,8 +249,20 @@ class LeRobotServicePolicyClient(Policy):
 
         self.latest_action_step = 0
         self.skip_send_observation = False
+        self.must_go_next_observation = True
+        self.empty_action_count = 0
+        self.max_empty_action_count = 3
 
         self._init_service()
+
+    def reset(self):
+        """Reset per-episode client state so the policy server starts a fresh action chunk."""
+        self.latest_action_step = 0
+        self.skip_send_observation = False
+        self.must_go_next_observation = True
+        self.empty_action_count = 0
+        if self.task_type == "so101leader":
+            self.last_action = np.zeros((1, 6))
 
     def _init_service(self):
         try:
@@ -298,7 +310,9 @@ class LeRobotServicePolicyClient(Policy):
             timestamp=time.time(),
             observation=raw_observation,
             timestep=self.latest_action_step,
+            must_go=self.must_go_next_observation,
         )
+        self.must_go_next_observation = False
 
         # send observation to policy server
         observation_bytes = pickle.dumps(observation)
@@ -322,7 +336,16 @@ class LeRobotServicePolicyClient(Policy):
             self._send_observation(observation_dict)
         action_chunk = self._receive_action()
         if action_chunk is None:
-            # self.skip_send_observation = True
+            self.empty_action_count += 1
+            self.must_go_next_observation = True
+            print(
+                "[WARN] Policy server returned empty action chunk; "
+                f"forcing next observation (empty {self.empty_action_count}/{self.max_empty_action_count})."
+            )
+            if self.empty_action_count >= self.max_empty_action_count:
+                print("[WARN] Re-sending policy instructions to recover policy server action stream.")
+                self._init_service()
+                self.empty_action_count = 0
             return torch.from_numpy(self.last_action).repeat(self.actions_per_chunk, 1)[:, None, :]
 
         action_list = [action.get_action()[None, :] for action in action_chunk]
@@ -331,6 +354,7 @@ class LeRobotServicePolicyClient(Policy):
 
         self.last_action = concat_action[-1, :]
         self.skip_send_observation = False
+        self.empty_action_count = 0
 
         return torch.from_numpy(concat_action[:, None, :])
 

@@ -14,7 +14,12 @@ parser = argparse.ArgumentParser(description="leisaac inference for leisaac in t
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--step_hz", type=int, default=60, help="Environment stepping rate in Hz.")
 parser.add_argument("--seed", type=int, default=None, help="Seed of the environment.")
-parser.add_argument("--episode_length_s", type=float, default=60.0, help="Episode length in seconds.")
+parser.add_argument(
+    "--episode_length_s",
+    type=float,
+    default=60.0,
+    help="Episode timeout in seconds. Set <=0 to disable timeout resets.",
+)
 parser.add_argument(
     "--eval_rounds",
     type=int,
@@ -36,6 +41,38 @@ parser.add_argument("--policy_timeout_ms", type=int, default=15000, help="Timeou
 parser.add_argument("--policy_action_horizon", type=int, default=16, help="Action horizon of the policy.")
 parser.add_argument("--policy_language_instruction", type=str, default=None, help="Language instruction of the policy.")
 parser.add_argument("--policy_checkpoint_path", type=str, default=None, help="Checkpoint path of the policy.")
+parser.add_argument("--record_video", action="store_true", default=False, help="Record evaluation video.")
+parser.add_argument("--video", action="store_true", default=False, help="Alias for --record_video.")
+parser.add_argument("--video_record", action="store_true", default=False, help="Alias for --record_video.")
+parser.add_argument(
+    "--video_folder",
+    type=str,
+    default="videos/policy_inference",
+    help="Directory where evaluation videos will be saved.",
+)
+parser.add_argument("--video_fps", type=int, default=30, help="FPS used for encoded evaluation videos.")
+parser.add_argument(
+    "--video_length",
+    type=int,
+    default=2000,
+    help=(
+        "Recorded video length in env steps. With --video_single_file, this is the full rollout length. "
+        "Without --video_single_file, 0 records separate episode videos."
+    ),
+)
+parser.add_argument(
+    "--video_single_file",
+    action="store_true",
+    default=True,
+    help="Record one continuous rollout video across episode resets instead of one video per episode.",
+)
+parser.add_argument(
+    "--video_max_episodes",
+    type=int,
+    default=0,
+    help="Maximum number of episodes to record. 0 records all episodes.",
+)
+parser.add_argument("--video_name_prefix", type=str, default="policy-inference", help="Recorded video filename prefix.")
 
 
 # append AppLauncher cli args
@@ -140,14 +177,47 @@ def main():
     env_cfg.episode_length_s = args_cli.episode_length_s
 
     # modify configuration
-    if args_cli.eval_rounds <= 0:
+    if args_cli.episode_length_s <= 0:
         if hasattr(env_cfg.terminations, "time_out"):
             env_cfg.terminations.time_out = None
     max_episode_count = args_cli.eval_rounds
     env_cfg.recorders = None
 
     # create environment
-    env: ManagerBasedRLEnv = gym.make(args_cli.task, cfg=env_cfg).unwrapped
+    do_record_video = args_cli.record_video or args_cli.video or args_cli.video_record
+    render_mode = "rgb_array" if do_record_video else None
+    sim_env = gym.make(args_cli.task, cfg=env_cfg, render_mode=render_mode)
+    if do_record_video:
+        video_max_episodes = args_cli.video_max_episodes
+        if args_cli.video_single_file:
+            video_length = args_cli.video_length
+            if video_length <= 0:
+                if args_cli.eval_rounds > 0 and args_cli.episode_length_s > 0:
+                    video_length = int(args_cli.eval_rounds * args_cli.episode_length_s * args_cli.step_hz)
+                else:
+                    video_length = 2000
+            sim_env = gym.wrappers.RecordVideo(
+                sim_env,
+                video_folder=args_cli.video_folder,
+                step_trigger=lambda step_id: step_id == 0,
+                video_length=video_length,
+                fps=args_cli.video_fps,
+                name_prefix=args_cli.video_name_prefix,
+                disable_logger=True,
+            )
+            print(f"[Video] Recording one continuous rollout video for {video_length} env steps.")
+        else:
+            sim_env = gym.wrappers.RecordVideo(
+                sim_env,
+                video_folder=args_cli.video_folder,
+                episode_trigger=lambda episode_id: video_max_episodes <= 0 or episode_id < video_max_episodes,
+                video_length=args_cli.video_length,
+                fps=args_cli.video_fps,
+                name_prefix=args_cli.video_name_prefix,
+                disable_logger=True,
+            )
+        print(f"[Video] Recording evaluation videos to: {args_cli.video_folder} at {args_cli.video_fps} FPS.")
+    env: ManagerBasedRLEnv = sim_env.unwrapped
 
     # create policy
     model_type = args_cli.policy_type
@@ -219,8 +289,14 @@ def main():
     controller = Controller()
 
     # reset environment
-    obs_dict, _ = env.reset()
+    obs_dict, _ = sim_env.reset()
     controller.reset()
+
+    def reset_policy_client():
+        if hasattr(policy, "reset"):
+            policy.reset()
+
+    reset_policy_client()
 
     # record the results
     success_count, episode_count = 0, 1
@@ -230,11 +306,13 @@ def main():
         print(f"[Evaluation] Evaluating episode {episode_count}...")
         success, time_out = False, False
         while simulation_app.is_running():
-            # run everything in inference mode
-            with torch.inference_mode():
+            # Disable gradients for policy calls without turning Isaac Lab buffers into inference tensors.
+            with torch.no_grad():
                 if controller.reset_state:
+                    print(f"[Evaluation] Episode {episode_count} manually marked failed/reset with R.")
                     controller.reset()
-                    obs_dict, _ = env.reset()
+                    obs_dict, _ = sim_env.reset()
+                    reset_policy_client()
                     episode_count += 1
                     break
 
@@ -244,7 +322,7 @@ def main():
                     action = actions[i, :, :]
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
-                    obs_dict, _, reset_terminated, reset_time_outs, _ = env.step(action)
+                    obs_dict, _, reset_terminated, reset_time_outs, _ = sim_env.step(action)
                     if reset_terminated[0]:
                         success = True
                         break
@@ -257,22 +335,27 @@ def main():
                 print(f"[Evaluation] Episode {episode_count} is successful!")
                 episode_count += 1
                 success_count += 1
+                obs_dict, _ = sim_env.reset()
+                reset_policy_client()
                 break
             if time_out:
                 print(f"[Evaluation] Episode {episode_count} timed out!")
                 episode_count += 1
+                obs_dict, _ = sim_env.reset()
+                reset_policy_client()
                 break
         print(
             f"[Evaluation] now success rate: {success_count / (episode_count - 1)} "
             f" [{success_count}/{episode_count - 1}]"
         )
-    print(
-        f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} "
-        f" [{success_count}/{max_episode_count}]"
-    )
+    if max_episode_count > 0:
+        print(
+            f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} "
+            f" [{success_count}/{max_episode_count}]"
+        )
 
     # close the simulator
-    env.close()
+    sim_env.close()
     simulation_app.close()
 
 
