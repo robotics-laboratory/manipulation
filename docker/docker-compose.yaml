@@ -42,6 +42,7 @@ services:
       - ../isaac_so_arm101/checkpoints:/workspace/isaac-bridge/isaac_so_arm101/checkpoints
       # Curated LeIsaac checkpoints used for dataset collection.
       - ../good_checkpoints:/workspace/isaac-bridge/good_checkpoints:ro
+      - ../vla_checkpoints:/workspace/isaac-bridge/vla_checkpoints:ro
       # LeIsaac RSL-RL default logs/checkpoints path used by train.py (logs/rsl_rl/...).
       - ../logs:/workspace/isaac-bridge/logs
       # --- Persistent caches (avoid re-downloading between runs) ---
@@ -55,6 +56,8 @@ services:
       - huggingface-cache:/root/.cache/huggingface
       # --- Output directory for saved data/logs ---
       - ../output:/workspace/isaac-bridge/output
+      # --- Videos recorded to the default policy_inference.py video folder ---
+      - ../videos:/workspace/isaac-bridge/videos
       # --- Optional: host Isaac Lab package (use local patches, e.g. utils __init__ without eager mesh/pxr).
       # Requires repo layout: IsaacLab/manipulation/docker with ../../source/isaaclab present.
       # Uncomment if /workspace/isaaclab in the image is stale vs your host clone:
