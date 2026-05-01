@@ -122,3 +122,144 @@ def disable_rigid_body_gravity(
                 prim_path,
                 sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
             )
+
+
+def disable_scene_clutter_colliders(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    scene_attr_name: str = "Scene/Scene",
+    keep_name_patterns: list[str] | None = None,
+    extra_disable_name_patterns: list[str] | None = None,
+    deep_disable_path_patterns: list[str] | None = None,
+    log: bool = True,
+):
+    """Disable PhysX collisions on prims under the per-env Scene root that are pure
+    visual clutter, dramatically reducing collision pair counts on heavy USD scenes.
+
+    Two passes:
+
+    1. **Top-level pass** — enumerates immediate children of
+       ``/World/envs/env_0/<scene_attr_name>``. For each child whose name does NOT match
+       any pattern in ``keep_name_patterns`` (or matches ``extra_disable_name_patterns``),
+       collisions are disabled recursively across all envs.
+    2. **Deep pass** — for each pattern in ``deep_disable_path_patterns`` (regex relative
+       to the scene root, e.g. ``"stack_.*_main_group_.*/drawer_.*"``), all matching prims
+       across all envs are disabled. This is where most of the savings come from on
+       Robocasa-style kitchens: door / drawer / handle internals can be culled while
+       keeping the cabinet *corpus* (which holds the countertop) collidable.
+
+    Collision modification cascades via ``modify_collision_properties``'s ``@apply_nested``
+    decorator. Use as a ``"startup"`` mode event so it runs once after scene cloning but
+    before the first physics step.
+
+    Args:
+        env: The environment instance.
+        env_ids: Required by event manager; unused (operation is global, not per-env).
+        scene_attr_name: Path (relative to ``/World/envs/env_0``) of the prim whose
+            top-level children are inspected. Defaults to ``"Scene/Scene"`` because most
+            UsdFileCfg-loaded kitchens introduce one extra wrapper prim (the file's
+            defaultPrim, also named ``Scene``) under the env's scene attribute.
+        keep_name_patterns: Regex list. Top-level children whose name matches any pattern
+            keep their collisions. Defaults to a permissive list covering oranges, plate,
+            cabinet/fixture stacks (``stack_*``), tables, counters, floor, walls, and the
+            robot itself. Always pass an explicit list if your scene uses non-standard
+            naming.
+        extra_disable_name_patterns: Optional regex list. Top-level children matching any
+            of these are *also* disabled even if they would have been kept by
+            ``keep_name_patterns``. Defaults to ``[]``.
+        deep_disable_path_patterns: Optional list of regex *paths* (slash-separated) under
+            ``scene_attr_name`` to recursively disable. Each pattern is appended to
+            ``/World/envs/env_.*/<scene_attr_name>/`` and resolved via
+            ``find_matching_prim_paths``. Use this to nuke specific named clutter that
+            lives inside a kept group (e.g. drawer/door internals).
+        log: If True, print the lists of kept vs disabled top-level prim names and the
+            deep-disable counts.
+    """
+    import re
+
+    if keep_name_patterns is None:
+        keep_name_patterns = [
+            r"^Orange.*$",
+            r"^Plate.*$",
+            r"^stack_.*$",
+            r"(?i).*table.*",
+            r"(?i).*counter.*",
+            r"(?i).*floor.*",
+            r"(?i).*ground.*",
+            r"(?i).*wall.*",
+            r"(?i).*robot.*",
+        ]
+    if extra_disable_name_patterns is None:
+        extra_disable_name_patterns = []
+    if deep_disable_path_patterns is None:
+        deep_disable_path_patterns = []
+
+    keep_re = [re.compile(p) for p in keep_name_patterns]
+    force_disable_re = [re.compile(p) for p in extra_disable_name_patterns]
+
+    ref_scene_path = f"/World/envs/env_0/{scene_attr_name}"
+    ref_scenes = sim_utils.find_matching_prims(ref_scene_path)
+    if not ref_scenes:
+        if log:
+            print(f"[disable_scene_clutter_colliders] No prim at {ref_scene_path}; nothing to do.")
+        return
+    ref_scene = ref_scenes[0]
+
+    keep_names: list[str] = []
+    disable_names: list[str] = []
+    for child in ref_scene.GetAllChildren():
+        name = child.GetName()
+        is_force_disabled = any(r.match(name) for r in force_disable_re)
+        is_kept = any(r.match(name) for r in keep_re) and not is_force_disabled
+        (keep_names if is_kept else disable_names).append(name)
+
+    if log:
+        print(
+            f"[disable_scene_clutter_colliders] Keeping colliders on top-level "
+            f"{ref_scene_path} children: {sorted(keep_names)}"
+        )
+        print(
+            f"[disable_scene_clutter_colliders] Disabling colliders on top-level "
+            f"{ref_scene_path} children: {sorted(disable_names)}"
+        )
+
+    disabled_prim_count = 0
+    for name in disable_names:
+        prim_paths = sim_utils.find_matching_prim_paths(
+            f"/World/envs/env_.*/{scene_attr_name}/{name}"
+        )
+        for prim_path in prim_paths:
+            sim_utils.modify_collision_properties(
+                prim_path,
+                sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            )
+            disabled_prim_count += 1
+
+    n_envs = len(sim_utils.find_matching_prim_paths(f"/World/envs/env_.*/{scene_attr_name}"))
+    if log:
+        print(
+            f"[disable_scene_clutter_colliders] Disabled colliders on {disabled_prim_count} "
+            f"top-level prim(s) across {n_envs} env(s). Sub-prims cascaded via apply_nested."
+        )
+
+    deep_disabled_total = 0
+    for pattern in deep_disable_path_patterns:
+        full_pattern = f"/World/envs/env_.*/{scene_attr_name}/{pattern}"
+        matched_paths = sim_utils.find_matching_prim_paths(full_pattern)
+        for prim_path in matched_paths:
+            sim_utils.modify_collision_properties(
+                prim_path,
+                sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            )
+        if log:
+            print(
+                f"[disable_scene_clutter_colliders] Deep-disabled {len(matched_paths)} "
+                f"prim(s) matching '{pattern}' (across {n_envs} env(s))."
+            )
+        deep_disabled_total += len(matched_paths)
+
+    if log and deep_disable_path_patterns:
+        print(
+            f"[disable_scene_clutter_colliders] Deep-disable total: {deep_disabled_total} "
+            f"prim(s) across {len(deep_disable_path_patterns)} pattern(s)."
+        )

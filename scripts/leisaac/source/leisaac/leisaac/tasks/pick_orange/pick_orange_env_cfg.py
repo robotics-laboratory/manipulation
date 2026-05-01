@@ -134,7 +134,7 @@ class PickOrangeRewardDenseRewardsCfg:
     reaching_active_orange = RewTerm(
         func=mdp.reach_unplaced_oranges_dense,
         params={
-            "std": 0.08,
+            "std": 0.04,
             "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
             "plate_cfg": SceneEntityCfg("Plate"),
             "ee_frame_cfg": SceneEntityCfg("ee_frame"),
@@ -151,7 +151,7 @@ class PickOrangeRewardDenseRewardsCfg:
             "robot_cfg": SceneEntityCfg("robot"),
             "ee_frame_cfg": SceneEntityCfg("ee_frame"),
             "lift_progress_height": 0.05,
-            "lift_progress_floor": 0.25,
+            "lift_progress_floor": 1.0,
         },
         weight=2.0,
     )
@@ -163,29 +163,51 @@ class PickOrangeRewardDenseRewardsCfg:
             "plate_cfg": SceneEntityCfg("Plate"),
             "robot_cfg": SceneEntityCfg("robot"),
             "ee_frame_cfg": SceneEntityCfg("ee_frame"),
-            "grasp_distance": 0.04,
+            "grasp_distance": 0.08,
             "close_joint_threshold": 0.7,
         },
         weight=8.0,
     )
+    excessive_lift_height = RewTerm(
+        func=mdp.active_orange_over_lift_penalty,
+        params={
+            "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+            "plate_cfg": SceneEntityCfg("Plate"),
+            "max_height_delta": 0.12,
+        },
+        weight=-20.0,
+    )
     move_active_orange_to_plate = RewTerm(
         func=mdp.move_unplaced_oranges_to_plate_dense,
         params={
-            "std": 0.20,
+            "std": 0.40,
             "lifted_height_delta": 0.04,
+            "preplace_height_above_plate": 0.10,
             "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
             "plate_cfg": SceneEntityCfg("Plate"),
         },
         weight=8.0,
+    )
+    lower_active_orange_to_plate = RewTerm(
+        func=mdp.lower_unplaced_oranges_to_plate_dense,
+        params={
+            "std": 0.04,
+            "lifted_height_delta": 0.04,
+            "target_height_above_plate": 0.05,
+            "near_plate_xy": 0.12,
+            "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+            "plate_cfg": SceneEntityCfg("Plate"),
+        },
+        weight=6.0,
     )
     place_oranges_on_plate = RewTerm(
         func=mdp.oranges_on_plate_fraction,
         params={
             "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
             "plate_cfg": SceneEntityCfg("Plate"),
-            "lifted_height_delta": 0.08,
+            "lifted_height_delta": 0.05,
         },
-        weight=6.0,
+        weight=24.0,
     )
     rest_pose_after_placing = RewTerm(
         func=mdp.rest_pose_after_all_placed,
@@ -202,27 +224,26 @@ class PickOrangeRewardDenseRewardsCfg:
             "plate_cfg": SceneEntityCfg("Plate"),
             "displacement_tolerance": 0.05,
         },
-        weight=-6.0,
+        weight=-12.0,
     )
-    active_orange_pre_lift_displacement = RewTerm(
-        func=mdp.active_orange_pre_lift_displacement_penalty,
-        params={
-            "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
-            "plate_cfg": SceneEntityCfg("Plate"),
-            "displacement_tolerance": 0.025,
-            "lifted_height_delta": 0.04,
-        },
-        weight=-3.0,
-    )
-    success_bonus = RewTerm(
-        func=mdp.pick_orange_success_bonus,
-        params={
-            "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
-            "plate_cfg": SceneEntityCfg("Plate"),
-        },
-        weight=50.0,
-    )
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    # active_orange_pre_lift_displacement = RewTerm(
+    #     func=mdp.active_orange_pre_lift_displacement_penalty,
+    #     params={
+    #         "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+    #         "plate_cfg": SceneEntityCfg("Plate"),
+    #         "displacement_tolerance": 0.05,
+    #         "lifted_height_delta": 0.04,
+    #     },
+    #     weight=-3.0,
+    # )
+    # success_bonus = RewTerm(
+    #     func=mdp.pick_orange_success_bonus,
+    #     params={
+    #         "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+    #         "plate_cfg": SceneEntityCfg("Plate"),
+    #     },
+    #     weight=50.0,
+    # )
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1e-4, params={"asset_cfg": SceneEntityCfg("robot")})
 
 
@@ -230,10 +251,6 @@ class PickOrangeRewardDenseRewardsCfg:
 class PickOrangeRewardDenseCurriculumCfg:
     """Curriculum schedule for regularization terms."""
 
-    action_rate = CurrTerm(
-        func=mdp.modify_reward_weight,
-        params={"term_name": "action_rate", "weight": -1e-4, "num_steps": 30000},
-    )
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "joint_vel", "weight": -1e-4, "num_steps": 30000},
@@ -297,10 +314,11 @@ class PickOrangeRewardDenseEnvCfg(PickOrangeEnvCfg):
     rewards: PickOrangeRewardDenseRewardsCfg = PickOrangeRewardDenseRewardsCfg()
     curriculum: PickOrangeRewardDenseCurriculumCfg = PickOrangeRewardDenseCurriculumCfg()
     actions: SingleArmActionsCfg = SingleArmActionsCfg(
-        arm_action=mdp.JointPositionActionCfg(
+        arm_action=mdp.RateLimitedJointPositionActionCfg(
             asset_name="robot",
             joint_names=["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"],
-            scale=0.35,
+            scale=0.25,
+            max_delta=0.025,
         ),
         gripper_action=mdp.BinaryJointPositionActionCfg(
             asset_name="robot",
@@ -333,6 +351,43 @@ class PickOrangeRewardDenseEnvCfg(PickOrangeEnvCfg):
         self.episode_length_s = 25.0
         self.sim.dt = 0.01
         self.sim.render_interval = self.decimation
+
+        # Strip PhysX collisions from kitchen clutter (door/drawer/handle internals on
+        # cabinets, fridges, dishwashers, stoves, etc.) that the arm cannot reach. This
+        # dramatically reduces broad-phase pair counts and lets us scale ``num_envs`` up.
+        #
+        # The kitchen USD's defaultPrim is itself named ``Scene``, so when loaded under
+        # ``{ENV_REGEX_NS}/Scene`` the live hierarchy is ``/World/envs/env_X/Scene/Scene/...``.
+        # We descend through the wrapper with ``scene_attr_name="Scene/Scene"`` so the
+        # top-level pass sees the actual fixture groups (``stack_*_main_group_*``) rather
+        # than just one opaque ``Scene`` child. All ``stack_*`` groups are kept (they hold
+        # the countertop the oranges sit on); we only deep-disable specific named internals
+        # under each cabinet that the arm cannot physically interact with.
+        from isaaclab.managers import EventTermCfg as _EventTerm
+        self.events.disable_kitchen_clutter_collisions = _EventTerm(
+            func=mdp.disable_scene_clutter_colliders,
+            mode="startup",
+            params={
+                "scene_attr_name": "Scene/Scene",
+                "keep_name_patterns": [
+                    r"^Orange.*$",
+                    r"^Plate.*$",
+                    r"^stack_.*$",
+                    r"(?i).*table.*",
+                    r"(?i).*counter.*",
+                    r"(?i).*floor.*",
+                    r"(?i).*ground.*",
+                    r"(?i).*wall.*",
+                    r"(?i).*robot.*",
+                ],
+                "deep_disable_path_patterns": [
+                    r"stack_.*_main_group_.*/drawer_.*",
+                    r"stack_.*_main_group_.*/door_.*",
+                    r"stack_.*_main_group_.*/handle_.*",
+                    r"stack_.*_main_group_.*/.*_handle",
+                ],
+            },
+        )
 
 
 @configclass

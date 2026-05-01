@@ -47,6 +47,22 @@ def _update_episode_max_lift_height_above_base(
         env._lift_cube_episode_max_height_above_base = torch.maximum(env._lift_cube_episode_max_height_above_base, lift_height)
 
 
+def _initial_object_xy_w(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Snapshot the object's reset-time XY position, including per-episode randomization."""
+    obj: RigidObject = env.scene[object_cfg.name]
+    if not hasattr(env, "_lift_cube_initial_object_xy_w"):
+        env._lift_cube_initial_object_xy_w = obj.data.root_pos_w[:, :2].clone()
+
+    reset_env_ids = (env.episode_length_buf <= 1).nonzero(as_tuple=True)[0]
+    if reset_env_ids.numel() > 0:
+        env._lift_cube_initial_object_xy_w[reset_env_ids] = obj.data.root_pos_w[reset_env_ids, :2]
+
+    return env._lift_cube_initial_object_xy_w
+
+
 def reach_object_dense(
     env: ManagerBasedRLEnv,
     std: float,
@@ -154,6 +170,23 @@ def cube_height_above_base_bonus(
     return torch.clamp((lift_height - (height_threshold - ramp_width)) / ramp_width, min=0.0, max=1.0)
 
 
+def excessive_lift_penalty(
+    env: ManagerBasedRLEnv,
+    max_height: float,
+    std: float,
+    cube_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    robot_base_name: str = "base",
+) -> torch.Tensor:
+    """Penalize lifting higher than the useful success margin."""
+    cube: RigidObject = env.scene[cube_cfg.name]
+    robot: Articulation = env.scene[robot_cfg.name]
+    base_index = robot.data.body_names.index(robot_base_name)
+    lift_height = cube.data.root_pos_w[:, 2] - robot.data.body_pos_w[:, base_index, 2]
+    excess = torch.clamp(lift_height - max_height, min=0.0)
+    return torch.tanh(excess / std)
+
+
 def lifted_stillness_dense(
     env: ManagerBasedRLEnv,
     lifted_height_delta: float,
@@ -168,6 +201,57 @@ def lifted_stillness_dense(
     stable = 1.0 - torch.tanh(speed / velocity_std)
     lifted = (obj.data.root_pos_w[:, 2] > lifted_height).float()
     return lifted * stable
+
+
+def lifted_angular_stillness_dense(
+    env: ManagerBasedRLEnv,
+    lifted_height_delta: float,
+    angular_velocity_std: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+) -> torch.Tensor:
+    """Reward keeping the object from tumbling once lifting starts."""
+    obj: RigidObject = env.scene[object_cfg.name]
+    start_height = _start_height_world(env, obj)
+    lifted_height = start_height + lifted_height_delta
+    angular_speed = torch.linalg.vector_norm(obj.data.root_ang_vel_w[:, :3], dim=1)
+    stable = 1.0 - torch.tanh(angular_speed / angular_velocity_std)
+    lifted = (obj.data.root_pos_w[:, 2] > lifted_height).float()
+    return lifted * stable
+
+
+def wrist_flip_penalty(
+    env: ManagerBasedRLEnv,
+    max_abs_wrist_flex: float,
+    std: float,
+    lifted_height_delta: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    wrist_joint_name: str = "wrist_flex",
+) -> torch.Tensor:
+    """Penalize excessive wrist flexion during lift to avoid over-the-top lifts."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    obj: RigidObject = env.scene[object_cfg.name]
+    wrist_index = robot.data.joint_names.index(wrist_joint_name)
+    wrist_excess = torch.clamp(torch.abs(robot.data.joint_pos[:, wrist_index]) - max_abs_wrist_flex, min=0.0)
+
+    start_height = _start_height_world(env, obj)
+    lifted = (obj.data.root_pos_w[:, 2] > start_height + lifted_height_delta).float()
+    return lifted * torch.tanh(wrist_excess / std)
+
+
+def xy_position_stability_dense(
+    env: ManagerBasedRLEnv,
+    std: float,
+    lifted_height_delta: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+) -> torch.Tensor:
+    """Reward keeping the object close to its reset-time XY position once lifting starts."""
+    obj: RigidObject = env.scene[object_cfg.name]
+    initial_xy = _initial_object_xy_w(env, object_cfg)
+    start_height = _start_height_world(env, obj)
+    distance_xy = torch.linalg.vector_norm(obj.data.root_pos_w[:, :2] - initial_xy, dim=1)
+    lifted = (obj.data.root_pos_w[:, 2] > start_height + lifted_height_delta).float()
+    return lifted * (1.0 - torch.tanh(distance_xy / std))
 
 
 def _commanded_goal_position_w(

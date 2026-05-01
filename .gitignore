@@ -51,3 +51,6 @@ output/datasets
 !good_checkpoints/
 !good_checkpoints/**/
 !good_checkpoints/**/*.pt
+!vla_checkpoints/
+!vla_checkpoints/**/
+!vla_checkpoints/**/*.pt

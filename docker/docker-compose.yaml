@@ -85,6 +85,8 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ${HOME}/.Xauthority:/root/.Xauthority:ro
+    # devices:
+    #   - /dev/ttyACM0:/dev/ttyACM0
 
 volumes:
   isaac-cache-kit:

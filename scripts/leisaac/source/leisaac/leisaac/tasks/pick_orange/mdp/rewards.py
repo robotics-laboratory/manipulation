@@ -298,20 +298,41 @@ def lift_unplaced_oranges_dense(
     return torch.where(all_placed, torch.zeros_like(active_progress), active_progress)
 
 
+def active_orange_over_lift_penalty(
+    env: ManagerBasedRLEnv,
+    oranges_cfg: list[SceneEntityCfg],
+    plate_cfg: SceneEntityCfg = SceneEntityCfg("Plate"),
+    max_height_delta: float = 0.12,
+) -> torch.Tensor:
+    """Penalty for lifting the active orange far above the useful carry height."""
+    placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
+    active_mask, all_placed = _active_target_mask(placed_mask)
+
+    penalties = []
+    for orange_cfg in oranges_cfg:
+        orange: RigidObject = env.scene[orange_cfg.name]
+        start_height = _orange_start_height_world(env, orange)
+        height_delta = orange.data.root_pos_w[:, 2] - start_height
+        penalties.append(torch.clamp(height_delta - max_height_delta, min=0.0))
+    penalties = torch.stack(penalties, dim=1)
+    active_penalty = torch.sum(torch.where(active_mask, penalties, torch.zeros_like(penalties)), dim=1)
+    return torch.where(all_placed, torch.zeros_like(active_penalty), active_penalty)
+
+
 def move_unplaced_oranges_to_plate_dense(
     env: ManagerBasedRLEnv,
     std: float,
     lifted_height_delta: float,
     oranges_cfg: list[SceneEntityCfg],
     plate_cfg: SceneEntityCfg = SceneEntityCfg("Plate"),
+    preplace_height_above_plate: float | None = None,
 ) -> torch.Tensor:
-    """Reward reducing XY distance from currently-held first unplaced orange to plate center.
+    """Reward moving the currently-held active orange toward the plate or pre-place pose.
 
     Gated by currently-held (grasped AND lifted) rather than sticky lift-history so that
     dropping the orange to sweep it across the table immediately stops earning credit.
     """
     plate: RigidObject = env.scene[plate_cfg.name]
-    plate_xy = plate.data.root_pos_w[:, :2]
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg, lifted_height_delta=lifted_height_delta)
     active_mask, all_placed = _active_target_mask(placed_mask)
 
@@ -319,8 +340,44 @@ def move_unplaced_oranges_to_plate_dense(
     held_now = _currently_held_per_orange(env, oranges_cfg=oranges_cfg, lifted_height_delta=lifted_height_delta)
     for orange_cfg in oranges_cfg:
         orange: RigidObject = env.scene[orange_cfg.name]
-        distance_xy = torch.linalg.vector_norm(orange.data.root_pos_w[:, :2] - plate_xy, dim=1)
-        scores.append(1.0 - torch.tanh(distance_xy / std))
+        if preplace_height_above_plate is None:
+            distance = torch.linalg.vector_norm(orange.data.root_pos_w[:, :2] - plate.data.root_pos_w[:, :2], dim=1)
+        else:
+            preplace_target = plate.data.root_pos_w[:, :3].clone()
+            preplace_target[:, 2] += preplace_height_above_plate
+            distance = torch.linalg.vector_norm(orange.data.root_pos_w[:, :3] - preplace_target, dim=1)
+        scores.append(1.0 - torch.tanh(distance / std))
+    scores = torch.stack(scores, dim=1)
+    scores = scores * held_now.float()
+    active_score = torch.sum(torch.where(active_mask, scores, torch.zeros_like(scores)), dim=1)
+    return torch.where(all_placed, torch.zeros_like(active_score), active_score)
+
+
+def lower_unplaced_oranges_to_plate_dense(
+    env: ManagerBasedRLEnv,
+    std: float,
+    lifted_height_delta: float,
+    target_height_above_plate: float,
+    near_plate_xy: float,
+    oranges_cfg: list[SceneEntityCfg],
+    plate_cfg: SceneEntityCfg = SceneEntityCfg("Plate"),
+) -> torch.Tensor:
+    """Reward lowering the held active orange toward plate height once it is near the plate."""
+    plate: RigidObject = env.scene[plate_cfg.name]
+    plate_pos = plate.data.root_pos_w[:, :3]
+    placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg, lifted_height_delta=lifted_height_delta)
+    active_mask, all_placed = _active_target_mask(placed_mask)
+    held_now = _currently_held_per_orange(env, oranges_cfg=oranges_cfg, lifted_height_delta=lifted_height_delta)
+
+    scores = []
+    for orange_cfg in oranges_cfg:
+        orange: RigidObject = env.scene[orange_cfg.name]
+        orange_pos = orange.data.root_pos_w[:, :3]
+        distance_xy = torch.linalg.vector_norm(orange_pos[:, :2] - plate_pos[:, :2], dim=1)
+        near_plate = 1.0 - torch.tanh(distance_xy / near_plate_xy)
+        target_z = plate_pos[:, 2] + target_height_above_plate
+        height_score = 1.0 - torch.tanh(torch.abs(orange_pos[:, 2] - target_z) / std)
+        scores.append(near_plate * height_score)
     scores = torch.stack(scores, dim=1)
     scores = scores * held_now.float()
     active_score = torch.sum(torch.where(active_mask, scores, torch.zeros_like(scores)), dim=1)

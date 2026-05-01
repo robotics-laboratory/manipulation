@@ -48,3 +48,13 @@ gym.register(
         "env_cfg_entry_point": f"{__name__}.direct.pick_orange_env:PickOrangeEnvCfg",
     },
 )
+
+gym.register(
+    id="LeIsaac-SO101-PickOrange-Eureka-Direct-v0",
+    entry_point=f"{__name__}.direct.pick_orange_env:PickOrangeEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.direct.pick_orange_env:PickOrangeEurekaEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PickOrangeEurekaDirectPPORunnerCfg",
+    },
+)

@@ -63,6 +63,91 @@ Notes: uses teacher **`act_inference`** (mean actions) as BC targets; only **`Ac
 
 *(Newest first.)*
 
+### 2026-05-01 — Lift-cube anti-flip stability rewards
+
+- **Goal / hypothesis:** Stop the learned lift policy from flipping the wrist/cube upward while preserving successful stable lifts.
+- **Setup:**
+  - **Env / task:** `LeIsaac-SO101-LiftCube-RewardDense-Train-v0` and matching reward-dense play/collect variants.
+  - **Code / config:** `manipulation/scripts/leisaac/source/leisaac/leisaac/tasks/lift_cube/mdp/rewards.py`; `lift_cube_env_cfg.py`.
+  - **Seeds / CLI:** Retrain fresh PPO; compare videos against the over-the-top wrist-lift behavior.
+- **What changed vs previous:** Added `lifted_angular_stillness_dense` to reward low cube angular velocity after lift starts, and `wrist_flip_penalty` to penalize `abs(wrist_flex) > 1.05` rad once the cube is lifted. Enabled them as `lifted_angular_stillness` weight `4.0` and `wrist_flip` weight `-4.0`.
+- **Metrics / artifacts:** Pending new run under `logs/rsl_rl/leisaac_lift_cube_reward_dense/...`; inspect `Episode_Reward/lifted_angular_stillness`, `Episode_Reward/wrist_flip`, lift success, and rollout videos.
+- **Outcome:** Code ready; training/evaluation pending.
+- **Insights:** The posture penalty is lift-gated so it discourages the exploit during lifting without constraining reach/grasp exploration too early.
+
+### 2026-04-30 — PickOrange Direct Eureka entry point
+
+- **Goal / hypothesis:** Make the existing direct PickOrange task usable with IsaacLabEureka for automated reward proposal and short PPO feedback loops.
+- **Setup:**
+  - **Env / task:** `LeIsaac-SO101-PickOrange-Eureka-Direct-v0`.
+  - **Code / config:** `manipulation/scripts/leisaac/source/leisaac/leisaac/tasks/pick_orange/direct/pick_orange_env.py`; `pick_orange/__init__.py`; `pick_orange/agents/rsl_rl_ppo_cfg.py`; `pick_orange/eureka_task_cfg.py`; launcher `manipulation/scripts/leisaac/scripts/eureka/train_pick_orange.py`.
+  - **Env vars:** requires `OPENAI_API_KEY` or Azure OpenAI env vars for IsaacLabEureka.
+  - **Seeds / CLI:** `python manipulation/scripts/leisaac/scripts/eureka/train_pick_orange.py --max_eureka_iterations 1 --max_training_iterations 10`.
+- **What changed vs previous:** Added a state-only direct config, RSL-RL runner config, oracle dense reward for Eureka reward-correlation logging, and `self._eureka_success_metric(env_ids)` task score.
+- **Metrics / artifacts:** Expected under `logs/eureka/LeIsaac-SO101-PickOrange-Eureka-Direct-v0/...` and `logs/rl_runs/rsl_rl_eureka/leisaac_pick_orange_eureka_direct/...`.
+- **Outcome:** Code ready; full Eureka run pending IsaacLabEureka installation/API key and simulator smoke test.
+- **Insights:** The wrapper patches IsaacLabEureka's worker environment creation to import `leisaac`, avoiding edits to the external `isaaclab_eureka` package.
+
+### 2026-04-30 — Lift-cube XY spawn stability reward
+
+- **Goal / hypothesis:** Encourage human-like lift behavior where the cube is lifted near its spawn XY instead of dragged laterally before lifting.
+- **Setup:**
+  - **Env / task:** `LeIsaac-SO101-LiftCube-RewardDense-Train-v0` and matching reward-dense play/collect variants.
+  - **Code / config:** `manipulation/scripts/leisaac/source/leisaac/leisaac/tasks/lift_cube/mdp/rewards.py`; `lift_cube_env_cfg.py`.
+  - **Seeds / CLI:** Retrain fresh PPO with rate-limited action, lift-only objective, and post-lift stillness.
+- **What changed vs previous:** Added `xy_position_stability_dense`, which snapshots cube reset-time XY per env and rewards `1 - tanh(distance_xy / 0.08)`; enabled as `xy_position_stability` with weight `3.0`.
+- **Metrics / artifacts:** Pending new run under `logs/rsl_rl/leisaac_lift_cube_reward_dense/...`.
+- **Outcome:** Code ready; training/evaluation pending.
+- **Insights:** The reset-time snapshot follows object randomization, unlike static USD/default coordinates.
+
+### 2026-04-29 — Lift-only observation/objective cleanup
+
+- **Goal / hypothesis:** For stable lift-only dataset collection, remove target-conditioned signals that encourage lateral motion after lifting.
+- **Setup:**
+  - **Env / task:** `LeIsaac-SO101-LiftCube-RewardDense-Train-v0` and matching reward-dense play/collect variants.
+  - **Code / config:** `manipulation/scripts/leisaac/source/leisaac/leisaac/tasks/lift_cube/lift_cube_env_cfg.py`.
+  - **Seeds / CLI:** Retrain fresh PPO with rate-limited action and post-lift stillness.
+- **What changed vs previous:** Removed `target_cube_position` from `LiftCubeMlpObservationsCfg.PolicyCfg`; set `goal_tracking`, `goal_tracking_fine`, and `goal_success_bonus` default weights to `0.0` so goal conditioning is opt-in via CLI.
+- **Metrics / artifacts:** Pending new run under `logs/rsl_rl/leisaac_lift_cube_reward_dense/...`.
+- **Outcome:** Code ready; training/evaluation pending.
+- **Insights:** If the objective is lift + settle, random `object_pose` commands are nuisance variables unless goal rewards are intentionally enabled.
+
+### 2026-04-29 — Lift-cube post-lift stabilization reward
+
+- **Goal / hypothesis:** Encourage the policy to settle and hold the cube after lifting instead of ending episodes with continuing motion.
+- **Setup:**
+  - **Env / task:** `LeIsaac-SO101-LiftCube-RewardDense-Train-v0` and matching reward-dense play/collect variants.
+  - **Code / config:** `manipulation/scripts/leisaac/source/leisaac/leisaac/tasks/lift_cube/lift_cube_env_cfg.py`; `mdp.lifted_stillness_dense`.
+  - **Seeds / CLI:** Retrain fresh PPO after rate-limited action + goal-tracking changes.
+- **What changed vs previous:** Added `lifted_stillness` reward (`lifted_height_delta=0.15`, `velocity_std=0.08`, weight `4.0`) and reduced height-only `success_bonus` from `20.0` to `10.0`.
+- **Metrics / artifacts:** Pending new run under `logs/rsl_rl/leisaac_lift_cube_reward_dense/...`.
+- **Outcome:** Code ready; training/evaluation pending.
+- **Insights:** Stability is rewarded only after a meaningful lift, avoiding extra pressure during reach/grasp exploration.
+
+### 2026-04-29 — Restore lift-cube goal tracking reward
+
+- **Goal / hypothesis:** Make the smoothed lift-cube policy optimize commanded cube placement again instead of only lifting quickly.
+- **Setup:**
+  - **Env / task:** `LeIsaac-SO101-LiftCube-RewardDense-Train-v0` and matching reward-dense play/collect variants.
+  - **Code / config:** `manipulation/scripts/leisaac/source/leisaac/leisaac/tasks/lift_cube/lift_cube_env_cfg.py`; existing reward funcs in `mdp/rewards.py`.
+  - **Seeds / CLI:** Retrain fresh PPO after the rate-limited action experiment.
+- **What changed vs previous:** Added `goal_tracking` (`std=0.30`, weight `8.0`), `goal_tracking_fine` (`std=0.05`, weight `3.0`), and `goal_success_bonus` (`position_tolerance=0.05`, weight `10.0`) using the `object_pose` command; terms are gated once cube lift exceeds `0.025` m from reset height.
+- **Metrics / artifacts:** Pending new run under `logs/rsl_rl/leisaac_lift_cube_reward_dense/...`.
+- **Outcome:** Code ready; training/evaluation pending.
+- **Insights:** The policy observation already contained `target_cube_position`; without these terms the target was not part of the objective.
+
+### 2026-04-29 — Lift-cube action target rate limiter
+
+- **Goal / hypothesis:** Make the SO-101 lift-cube policy less reactive without changing simulated robot actuator physics.
+- **Setup:**
+  - **Env / task:** `LeIsaac-SO101-LiftCube-RewardDense-Train-v0` for training; matching reward-dense play/collect variants for evaluation/export.
+  - **Code / config:** `manipulation/scripts/leisaac/source/leisaac/leisaac/tasks/lift_cube/mdp/actions.py`; `lift_cube_env_cfg.py`.
+  - **Seeds / CLI:** Retrain fresh PPO; optional overrides: `env.actions.arm_action.max_delta=...`, `env.actions.arm_action.scale=...`.
+- **What changed vs previous:** Arm action now uses `RateLimitedJointPositionActionCfg` with `scale=0.25` and `max_delta=0.025` rad/control-step; command target changes are clamped before applying joint-position targets.
+- **Metrics / artifacts:** Pending new run under `logs/rsl_rl/leisaac_lift_cube_reward_dense/...`.
+- **Outcome:** Code ready; training/evaluation pending.
+- **Insights:** Prefer command-interface smoothing over actuator gain/velocity edits when the target is real-robot transfer.
+
 ### 2026-03-19 — Discriminator metrics “constant” while raw varies
 
 - **Observed:** `log_d_raw` / `logit` vary (e.g. std ~10) but `log_d_shaped_std: 0` and `log_d_shaped_mean: -3`.

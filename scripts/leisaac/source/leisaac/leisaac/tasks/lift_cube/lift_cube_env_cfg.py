@@ -243,39 +243,39 @@ class LiftCubeRewardDenseRewardsCfg:
         },
         weight=8.0,
     )
-    goal_tracking = RewTerm(
-        func=mdp.goal_tracking_dense,
-        params={
-            "std": 0.30,
-            "command_name": "object_pose",
-            "lifted_height_delta": 0.025,
-            "robot_cfg": SceneEntityCfg("robot"),
-            "object_cfg": SceneEntityCfg("cube"),
-        },
-        weight=0.0,
-    )
-    goal_tracking_fine = RewTerm(
-        func=mdp.goal_tracking_dense,
-        params={
-            "std": 0.05,
-            "command_name": "object_pose",
-            "lifted_height_delta": 0.025,
-            "robot_cfg": SceneEntityCfg("robot"),
-            "object_cfg": SceneEntityCfg("cube"),
-        },
-        weight=0.0,
-    )
-    goal_success_bonus = RewTerm(
-        func=mdp.goal_success_bonus,
-        params={
-            "command_name": "object_pose",
-            "position_tolerance": 0.05,
-            "lifted_height_delta": 0.025,
-            "robot_cfg": SceneEntityCfg("robot"),
-            "object_cfg": SceneEntityCfg("cube"),
-        },
-        weight=0.0,
-    )
+    # goal_tracking = RewTerm(
+    #     func=mdp.goal_tracking_dense,
+    #     params={
+    #         "std": 0.30,
+    #         "command_name": "object_pose",
+    #         "lifted_height_delta": 0.025,
+    #         "robot_cfg": SceneEntityCfg("robot"),
+    #         "object_cfg": SceneEntityCfg("cube"),
+    #     },
+    #     weight=0.0,
+    # )
+    # goal_tracking_fine = RewTerm(
+    #     func=mdp.goal_tracking_dense,
+    #     params={
+    #         "std": 0.05,
+    #         "command_name": "object_pose",
+    #         "lifted_height_delta": 0.025,
+    #         "robot_cfg": SceneEntityCfg("robot"),
+    #         "object_cfg": SceneEntityCfg("cube"),
+    #     },
+    #     weight=0.0,
+    # )
+    # goal_success_bonus = RewTerm(
+    #     func=mdp.goal_success_bonus,
+    #     params={
+    #         "command_name": "object_pose",
+    #         "position_tolerance": 0.05,
+    #         "lifted_height_delta": 0.025,
+    #         "robot_cfg": SceneEntityCfg("robot"),
+    #         "object_cfg": SceneEntityCfg("cube"),
+    #     },
+    #     weight=0.0,
+    # )
     lifted_stillness = RewTerm(
         func=mdp.lifted_stillness_dense,
         params={
@@ -284,6 +284,36 @@ class LiftCubeRewardDenseRewardsCfg:
             "object_cfg": SceneEntityCfg("cube"),
         },
         weight=4.0,
+    )
+    lifted_angular_stillness = RewTerm(
+        func=mdp.lifted_angular_stillness_dense,
+        params={
+            "lifted_height_delta": 0.025,
+            "angular_velocity_std": 1.0,
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+        weight=4.0,
+    )
+    wrist_flip = RewTerm(
+        func=mdp.wrist_flip_penalty,
+        params={
+            "max_abs_wrist_flex": 1.05,
+            "std": 0.25,
+            "lifted_height_delta": 0.025,
+            "object_cfg": SceneEntityCfg("cube"),
+            "robot_cfg": SceneEntityCfg("robot"),
+            "wrist_joint_name": "wrist_flex",
+        },
+        weight=-4.0,
+    )
+    xy_position_stability = RewTerm(
+        func=mdp.xy_position_stability_dense,
+        params={
+            "std": 0.08,
+            "lifted_height_delta": 0.025,
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+        weight=1.5,
     )
     success_bonus = RewTerm(
         func=mdp.cube_height_above_base_bonus,
@@ -296,7 +326,18 @@ class LiftCubeRewardDenseRewardsCfg:
         },
         weight=10.0,
     )
-    # action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    excessive_lift = RewTerm(
+        func=mdp.excessive_lift_penalty,
+        params={
+            "max_height": 0.25,
+            "std": 0.05,
+            "cube_cfg": SceneEntityCfg("cube"),
+            "robot_cfg": SceneEntityCfg("robot"),
+            "robot_base_name": "base",
+        },
+        weight=-2.0,
+    )
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-1e-4, params={"asset_cfg": SceneEntityCfg("robot")})
 
 
@@ -304,10 +345,10 @@ class LiftCubeRewardDenseRewardsCfg:
 class LiftCubeRewardDenseCurriculumCfg:
     """Curriculum schedule for regularization terms."""
 
-    # action_rate = CurrTerm(
-    #     func=mdp.modify_reward_weight,
-    #     params={"term_name": "action_rate", "weight": -1e-4, "num_steps": 30000},
-    # )
+    action_rate = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "action_rate", "weight": -1e-4, "num_steps": 30000},
+    )
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "joint_vel", "weight": -1e-4, "num_steps": 30000},
@@ -440,6 +481,7 @@ class LiftCubeRewardDenseCollectEnvCfg(LiftCubeEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.recorders = LeRobotRslRlRecorderManagerCfg()
+        self.terminations.time_out = None
         self.terminations.success = DoneTerm(func=false_success_termination)
 
         # Match the dense MLP control loop used by the teacher policy.
