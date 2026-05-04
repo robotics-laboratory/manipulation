@@ -1,0 +1,13 @@
+name: so101_stereo_teleop
+communication:
+  zenoh:
+    prefix: /so101
+
+nodes:
+  - id: robot_core
+    custom:
+      source: src/main_node.py
+      inputs:
+        tick: dora/timer/millis/33
+      env:
+        LEROBOT_CONFIG_PATH: "cameras_config.yaml"

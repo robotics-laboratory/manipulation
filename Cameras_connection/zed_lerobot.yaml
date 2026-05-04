@@ -1,0 +1,48 @@
+robot_type: so-101
+fps: 30
+
+cameras:
+  # Левый объектив ZED
+  laparoscope_left:
+    type: python
+    module: src.cameras.zed_lerobot_factory
+    class: create_zed_camera
+    config:
+      zed_type: left
+      width: 1280
+      height: 720
+
+  # Правый объектив ZED
+  laparoscope_right:
+    type: python
+    module: src.cameras.zed_lerobot_factory
+    class: create_zed_camera
+    config:
+      zed_type: right
+      width: 1280
+      height: 720
+
+  # Опционально: Карта глубины (если понадобится в будущем)
+  # laparoscope_depth:
+  #   type: python
+  #   module: src.cameras.zed_lerobot_factory
+  #   class: create_zed_camera
+  #   config:
+  #     zed_type: depth
+  #     width: 1280
+  #     height: 720
+
+  # Стандартные USB-камеры на запястьях (OpenCV)
+  left_wrist:
+    type: opencv
+    index_or_path: 0
+    width: 1280
+    height: 720
+    fps: 30
+
+# Секция приводов (манипуляторов)
+actuators:
+  main_arms:
+    type: feetech
+    port: /dev/ttyUSB0 
+    baudrate: 1000000

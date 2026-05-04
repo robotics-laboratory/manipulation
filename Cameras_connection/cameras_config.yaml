@@ -1,0 +1,60 @@
+robot_type: so-101
+fps: 30
+
+cameras:
+  # ========================================
+  # ZED 2 (Общий план)
+  # ========================================
+  laparoscope_left:
+    type: python
+    module: zed_lerobot_factory
+    class: create_zed_camera
+    config:
+      zed_type: left
+      width: 1280
+      height: 720
+
+  laparoscope_right:
+    type: python
+    module: zed_lerobot_factory
+    class: create_zed_camera
+    config:
+      zed_type: right
+      width: 1280
+      height: 720
+
+  laparoscope_depth:
+    type: python
+    module: zed_lerobot_factory
+    class: create_zed_camera
+    config:
+      zed_type: depth
+      width: 1280
+      height: 720
+
+  # ========================================
+  # REALSENSE D435 (Камера на кисти)
+  # ========================================
+  wrist_color:
+    type: python
+    module: ealsense_lerobot_factory
+    class: create_realsense_camera
+    config:
+      rs_mode: color
+      width: 640
+      height: 480
+
+  wrist_depth:
+    type: python
+    module: realsense_lerobot_factory
+    class: create_realsense_camera
+    config:
+      rs_mode: depth
+      width: 640
+      height: 480
+
+actuators:
+  main_arms:
+    type: feetech
+    port: /dev/ttyUSB0
+    baudrate: 1000000
