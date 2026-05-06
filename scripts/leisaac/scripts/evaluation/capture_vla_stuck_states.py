@@ -1,34 +1,20 @@
-"""Script to run a leisaac inference with leisaac in the simulation."""
+"""Run VLA inference and capture stuck LiftCube states for offline MLP recovery collection."""
 
-"""Launch Isaac Sim Simulator first."""
 import multiprocessing
 
 if multiprocessing.get_start_method() != "spawn":
     multiprocessing.set_start_method("spawn", force=True)
+
 import argparse
 
 from isaaclab.app import AppLauncher
 
-# add argparse arguments
-parser = argparse.ArgumentParser(description="leisaac inference for leisaac in the simulation.")
+parser = argparse.ArgumentParser(description="Capture LiftCube stuck states during VLA inference.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--step_hz", type=int, default=60, help="Environment stepping rate in Hz.")
 parser.add_argument("--seed", type=int, default=None, help="Seed of the environment.")
-parser.add_argument(
-    "--episode_length_s",
-    type=float,
-    default=60.0,
-    help="Episode timeout in seconds. Set <=0 to disable timeout resets.",
-)
-parser.add_argument(
-    "--eval_rounds",
-    type=int,
-    default=0,
-    help=(
-        "Number of evaluation rounds. 0 means don't add time out termination, policy will run until success or manual"
-        " reset."
-    ),
-)
+parser.add_argument("--episode_length_s", type=float, default=60.0, help="Episode timeout in seconds.")
+parser.add_argument("--eval_rounds", type=int, default=0, help="Number of evaluation rounds. 0 runs forever.")
 parser.add_argument(
     "--policy_type",
     type=str,
@@ -47,52 +33,35 @@ parser.add_argument(
     default=False,
     help="Force LeRobot policy server inference for every observation.",
 )
+parser.add_argument("--capture_dir", type=str, default="output/recovery_states/lift_cube_vla_stuck")
+parser.add_argument("--capture_run_name", type=str, default=None, help="Optional subdirectory name for this capture run.")
+parser.add_argument("--capture_prefix", type=str, default="state", help="Prefix for saved recovery state files.")
+parser.add_argument(
+    "--no_capture_mlp_obs",
+    action="store_false",
+    dest="capture_mlp_obs",
+    default=True,
+    help="Do not store diagnostic MLP policy observation terms in recovery state files.",
+)
 parser.add_argument("--record_video", action="store_true", default=False, help="Record evaluation video.")
 parser.add_argument("--video", action="store_true", default=False, help="Alias for --record_video.")
 parser.add_argument("--video_record", action="store_true", default=False, help="Alias for --record_video.")
-parser.add_argument(
-    "--video_folder",
-    type=str,
-    default="videos/policy_inference",
-    help="Directory where evaluation videos will be saved.",
-)
+parser.add_argument("--video_folder", type=str, default="videos/policy_inference")
 parser.add_argument("--video_fps", type=int, default=30, help="FPS used for encoded evaluation videos.")
-parser.add_argument(
-    "--video_length",
-    type=int,
-    default=2000,
-    help=(
-        "Recorded video length in env steps. With --video_single_file, this is the full rollout length. "
-        "Without --video_single_file, 0 records separate episode videos."
-    ),
-)
-parser.add_argument(
-    "--video_single_file",
-    action="store_true",
-    default=True,
-    help="Record one continuous rollout video across episode resets instead of one video per episode.",
-)
-parser.add_argument(
-    "--video_max_episodes",
-    type=int,
-    default=0,
-    help="Maximum number of episodes to record. 0 records all episodes.",
-)
-parser.add_argument("--video_name_prefix", type=str, default="policy-inference", help="Recorded video filename prefix.")
+parser.add_argument("--video_length", type=int, default=2000, help="Recorded video length in env steps.")
+parser.add_argument("--video_single_file", action="store_true", default=True)
+parser.add_argument("--video_max_episodes", type=int, default=0)
+parser.add_argument("--video_name_prefix", type=str, default="vla-stuck-capture")
 
-
-# append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
-# parse the arguments
 args_cli = parser.parse_args()
 
-app_launcher_args = vars(args_cli)
-
-# launch omniverse app
-app_launcher = AppLauncher(app_launcher_args)
+app_launcher = AppLauncher(vars(args_cli))
 simulation_app = app_launcher.app
 
+import sys
 import time
+from pathlib import Path
 
 import carb
 import gymnasium as gym
@@ -100,84 +69,82 @@ import omni
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab_tasks.utils import parse_env_cfg
-from leisaac.utils.env_utils import (
-    dynamic_reset_gripper_effort_limit_sim,
-    get_task_type,
-)
+from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim, get_task_type
 
 import leisaac  # noqa: F401
+
+_MANIPULATION_ROOT = Path(__file__).resolve().parents[4]
+_MANIPULATION_SRC = _MANIPULATION_ROOT / "src"
+if str(_MANIPULATION_SRC) not in sys.path:
+    sys.path.append(str(_MANIPULATION_SRC))
+
+from isaac_so_arm101.scripts.rsl_rl.recovery_state_utils import (  # noqa: E402
+    capture_lift_cube_state,
+    save_lift_cube_state,
+)
 
 
 class RateLimiter:
     """Convenience class for enforcing rates in loops."""
 
-    def __init__(self, hz):
-        """
-        Args:
-            hz (int): frequency to enforce
-        """
-        self.hz = hz
+    def __init__(self, hz: int):
+        if hz <= 0:
+            raise ValueError("--step_hz must be positive.")
         self.last_time = time.time()
         self.sleep_duration = 1.0 / hz
         self.render_period = min(0.0166, self.sleep_duration)
 
     def sleep(self, env):
-        """Attempt to sleep at the specified rate in hz."""
         next_wakeup_time = self.last_time + self.sleep_duration
         while time.time() < next_wakeup_time:
             time.sleep(self.render_period)
             env.sim.render()
-
-        self.last_time = self.last_time + self.sleep_duration
-
-        # detect time jumping forwards (e.g. loop is too slow)
+        self.last_time += self.sleep_duration
         if self.last_time < time.time():
             while self.last_time < time.time():
                 self.last_time += self.sleep_duration
 
 
 class Controller:
+    """Keyboard controller for manual reset and stuck-state capture."""
+
     def __init__(self):
         self._appwindow = omni.appwindow.get_default_app_window()
         self._input = carb.input.acquire_input_interface()
         self._keyboard = self._appwindow.get_keyboard()
-        self._keyboard_sub = self._input.subscribe_to_keyboard_events(
-            self._keyboard,
-            self._on_keyboard_event,
-        )
+        self._keyboard_sub = self._input.subscribe_to_keyboard_events(self._keyboard, self._on_keyboard_event)
         self.reset_state = False
+        self.capture_state = False
 
     def __del__(self):
-        """Release the keyboard interface."""
         if hasattr(self, "_input") and hasattr(self, "_keyboard") and hasattr(self, "_keyboard_sub"):
             self._input.unsubscribe_from_keyboard_events(self._keyboard, self._keyboard_sub)
             self._keyboard_sub = None
 
     def reset(self):
         self.reset_state = False
+        self.capture_state = False
 
     def _on_keyboard_event(self, event, *args, **kwargs):
-        """Handle keyboard events using carb."""
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             if event.input.name == "R":
                 self.reset_state = True
+            elif event.input.name == "C":
+                self.capture_state = True
         return True
 
 
 def preprocess_obs_dict(obs_dict: dict, model_type: str, language_instruction: str):
-    """Preprocess the observation dictionary to the format expected by the policy."""
     if model_type in ["gr00tn1.5", "gr00tn1.6", "lerobot", "openpi"]:
         obs_dict["task_description"] = language_instruction
         return obs_dict
-    else:
-        raise ValueError(f"Model type {model_type} not supported")
+    raise ValueError(f"Model type {model_type} not supported")
 
 
 def configure_lerobot_absolute_joint_actions(env_cfg, task_type: str) -> None:
     """Apply LeRobot actions as absolute joint targets after motor-to-joint conversion."""
     if task_type != "so101leader":
         return
-
     for action_name in ("arm_action", "gripper_action"):
         action_cfg = getattr(env_cfg.actions, action_name, None)
         if action_cfg is not None and hasattr(action_cfg, "use_default_offset"):
@@ -186,9 +153,13 @@ def configure_lerobot_absolute_joint_actions(env_cfg, task_type: str) -> None:
     print("[INFO] LeRobot policy actions use absolute joint targets (scale=1.0, no default offset).")
 
 
-def main():
-    """Running lerobot teleoperation with leisaac manipulation environment."""
+def _capture_output_dir() -> Path:
+    capture_dir = Path(args_cli.capture_dir)
+    run_name = args_cli.capture_run_name or time.strftime("%Y-%m-%d_%H-%M-%S")
+    return capture_dir / run_name
 
+
+def main():
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
     task_type = get_task_type(args_cli.task)
     env_cfg.use_teleop_device(task_type)
@@ -196,91 +167,69 @@ def main():
         configure_lerobot_absolute_joint_actions(env_cfg, task_type)
     env_cfg.seed = args_cli.seed if args_cli.seed is not None else int(time.time())
     env_cfg.episode_length_s = args_cli.episode_length_s
-
-    # modify configuration
-    if args_cli.episode_length_s <= 0:
-        if hasattr(env_cfg.terminations, "time_out"):
-            env_cfg.terminations.time_out = None
-    max_episode_count = args_cli.eval_rounds
+    if args_cli.episode_length_s <= 0 and hasattr(env_cfg.terminations, "time_out"):
+        env_cfg.terminations.time_out = None
     env_cfg.recorders = None
 
-    # create environment
     do_record_video = args_cli.record_video or args_cli.video or args_cli.video_record
     render_mode = "rgb_array" if do_record_video else None
     sim_env = gym.make(args_cli.task, cfg=env_cfg, render_mode=render_mode)
     if do_record_video:
-        video_max_episodes = args_cli.video_max_episodes
         if args_cli.video_single_file:
-            video_length = args_cli.video_length
-            if video_length <= 0:
-                if args_cli.eval_rounds > 0 and args_cli.episode_length_s > 0:
-                    video_length = int(args_cli.eval_rounds * args_cli.episode_length_s * args_cli.step_hz)
-                else:
-                    video_length = 2000
             sim_env = gym.wrappers.RecordVideo(
                 sim_env,
                 video_folder=args_cli.video_folder,
                 step_trigger=lambda step_id: step_id == 0,
-                video_length=video_length,
-                fps=args_cli.video_fps,
-                name_prefix=args_cli.video_name_prefix,
-                disable_logger=True,
-            )
-            print(f"[Video] Recording one continuous rollout video for {video_length} env steps.")
-        else:
-            sim_env = gym.wrappers.RecordVideo(
-                sim_env,
-                video_folder=args_cli.video_folder,
-                episode_trigger=lambda episode_id: video_max_episodes <= 0 or episode_id < video_max_episodes,
                 video_length=args_cli.video_length,
                 fps=args_cli.video_fps,
                 name_prefix=args_cli.video_name_prefix,
                 disable_logger=True,
             )
-        print(f"[Video] Recording evaluation videos to: {args_cli.video_folder} at {args_cli.video_fps} FPS.")
+        else:
+            sim_env = gym.wrappers.RecordVideo(
+                sim_env,
+                video_folder=args_cli.video_folder,
+                episode_trigger=lambda episode_id: args_cli.video_max_episodes <= 0
+                or episode_id < args_cli.video_max_episodes,
+                video_length=args_cli.video_length,
+                fps=args_cli.video_fps,
+                name_prefix=args_cli.video_name_prefix,
+                disable_logger=True,
+            )
     env: ManagerBasedRLEnv = sim_env.unwrapped
 
-    # create policy
     model_type = args_cli.policy_type
     if args_cli.policy_type == "gr00tn1.5":
         from isaaclab.sensors import Camera
         from leisaac.policy import Gr00tServicePolicyClient
 
-        if task_type == "so101leader":
-            modality_keys = ["single_arm", "gripper"]
-        else:
+        if task_type != "so101leader":
             raise ValueError(f"Task type {task_type} not supported when using GR00T N1.5 policy yet.")
-
         policy = Gr00tServicePolicyClient(
             host=args_cli.policy_host,
             port=args_cli.policy_port,
             timeout_ms=args_cli.policy_timeout_ms,
             camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
-            modality_keys=modality_keys,
+            modality_keys=["single_arm", "gripper"],
         )
     elif args_cli.policy_type == "gr00tn1.6":
         from isaaclab.sensors import Camera
         from leisaac.policy import Gr00t16ServicePolicyClient
 
-        if task_type == "so101leader":
-            modality_keys = ["single_arm", "gripper"]
-        else:
-            raise ValueError(f"Task type {task_type} not supported when using GR00T N1.5 policy yet.")
-
+        if task_type != "so101leader":
+            raise ValueError(f"Task type {task_type} not supported when using GR00T N1.6 policy yet.")
         policy = Gr00t16ServicePolicyClient(
             host=args_cli.policy_host,
             port=args_cli.policy_port,
             timeout_ms=args_cli.policy_timeout_ms,
             camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
-            modality_keys=modality_keys,
+            modality_keys=["single_arm", "gripper"],
         )
-
     elif "lerobot" in args_cli.policy_type:
         from isaaclab.sensors import Camera
         from leisaac.policy import LeRobotServicePolicyClient
 
         model_type = "lerobot"
-
         policy_type = args_cli.policy_type.split("-")[1]
         policy = LeRobotServicePolicyClient(
             host=args_cli.policy_host,
@@ -306,11 +255,14 @@ def main():
             camera_keys=[key for key, sensor in env.scene.sensors.items() if isinstance(sensor, Camera)],
             task_type=task_type,
         )
+    else:
+        raise ValueError(f"Unsupported policy type: {args_cli.policy_type}")
 
+    output_dir = _capture_output_dir()
+    print("[INFO] Press C to capture the current stuck state; press R to reset the episode.")
+    print(f"[INFO] Capturing recovery states to: {output_dir}")
     rate_limiter = RateLimiter(args_cli.step_hz)
     controller = Controller()
-
-    # reset environment
     obs_dict, _ = sim_env.reset()
     controller.reset()
 
@@ -318,17 +270,33 @@ def main():
         if hasattr(policy, "reset"):
             policy.reset()
 
+    def maybe_capture(episode_idx: int, episode_step: int, last_action: torch.Tensor | None, capture_idx: int) -> int:
+        if not controller.capture_state:
+            return capture_idx
+        state = capture_lift_cube_state(
+            env,
+            task=args_cli.task,
+            instruction=args_cli.policy_language_instruction,
+            episode_index=episode_idx,
+            episode_step=episode_step,
+            last_action=last_action,
+            include_mlp_obs=args_cli.capture_mlp_obs,
+        )
+        path = save_lift_cube_state(state, output_dir, args_cli.capture_prefix, capture_idx)
+        print(f"[Capture] Saved stuck state #{capture_idx}: {path}")
+        controller.capture_state = False
+        return capture_idx + 1
+
     reset_policy_client()
+    max_episode_count = args_cli.eval_rounds
+    success_count, episode_count, capture_count = 0, 1, 1
 
-    # record the results
-    success_count, episode_count = 0, 1
-
-    # simulate environment
     while max_episode_count <= 0 or episode_count <= max_episode_count:
         print(f"[Evaluation] Evaluating episode {episode_count}...")
         success, time_out = False, False
+        episode_step = 0
+        last_action = None
         while simulation_app.is_running():
-            # Disable gradients for policy calls without turning Isaac Lab buffers into inference tensors.
             with torch.no_grad():
                 if controller.reset_state:
                     print(f"[Evaluation] Episode {episode_count} manually marked failed/reset with R.")
@@ -338,21 +306,26 @@ def main():
                     episode_count += 1
                     break
 
-                obs_dict = preprocess_obs_dict(obs_dict["policy"], model_type, args_cli.policy_language_instruction)
-                actions = policy.get_action(obs_dict).to(env.device)
+                capture_count = maybe_capture(episode_count, episode_step, last_action, capture_count)
+                policy_obs = preprocess_obs_dict(
+                    obs_dict["policy"], model_type, args_cli.policy_language_instruction
+                )
+                actions = policy.get_action(policy_obs).to(env.device)
                 for i in range(min(args_cli.policy_action_horizon, actions.shape[0])):
                     action = actions[i, :, :]
                     if env.cfg.dynamic_reset_gripper_effort_limit:
                         dynamic_reset_gripper_effort_limit_sim(env, task_type)
                     obs_dict, _, reset_terminated, reset_time_outs, _ = sim_env.step(action)
+                    episode_step += 1
+                    last_action = action.detach().cpu().clone()
+                    capture_count = maybe_capture(episode_count, episode_step, last_action, capture_count)
                     if reset_terminated[0]:
                         success = True
                         break
                     if reset_time_outs[0]:
                         time_out = True
                         break
-                    if rate_limiter:
-                        rate_limiter.sleep(env)
+                    rate_limiter.sleep(env)
             if success:
                 print(f"[Evaluation] Episode {episode_count} is successful!")
                 episode_count += 1
@@ -366,21 +339,15 @@ def main():
                 obs_dict, _ = sim_env.reset()
                 reset_policy_client()
                 break
-        print(
-            f"[Evaluation] now success rate: {success_count / (episode_count - 1)} "
-            f" [{success_count}/{episode_count - 1}]"
-        )
-    if max_episode_count > 0:
-        print(
-            f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} "
-            f" [{success_count}/{max_episode_count}]"
-        )
+        if episode_count > 1:
+            print(f"[Evaluation] now success rate: {success_count / (episode_count - 1)} [{success_count}/{episode_count - 1}]")
 
-    # close the simulator
+    if max_episode_count > 0:
+        print(f"[Evaluation] Final success rate: {success_count / max_episode_count:.3f} [{success_count}/{max_episode_count}]")
     sim_env.close()
     simulation_app.close()
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
+

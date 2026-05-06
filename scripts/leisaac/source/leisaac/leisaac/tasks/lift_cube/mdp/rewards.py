@@ -7,6 +7,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import FrameTransformer
 from isaaclab.utils.math import combine_frame_transforms
+from leisaac.assets.robots.lerobot import SO101_FOLLOWER_MOTOR_LIMITS, SO101_FOLLOWER_USD_JOINT_LIMLITS
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -100,6 +101,12 @@ def grasp_closure_dense(
     near_cube = 1.0 - torch.tanh(distance / std)
     gripper_closed = (robot.data.joint_pos[:, -1] < close_joint_threshold).float()
     return near_cube * gripper_closed
+
+
+def gripper_action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Penalize toggling the gripper action without damping useful arm corrections."""
+    action_delta = env.action_manager.action[:, -1] - env.action_manager.prev_action[:, -1]
+    return torch.square(action_delta)
 
 
 def lift_progress_dense(
@@ -237,6 +244,36 @@ def wrist_flip_penalty(
     start_height = _start_height_world(env, obj)
     lifted = (obj.data.root_pos_w[:, 2] > start_height + lifted_height_delta).float()
     return lifted * torch.tanh(wrist_excess / std)
+
+
+def human_lift_posture_dense(
+    env: ManagerBasedRLEnv,
+    target_motor_positions: dict[str, float],
+    std: float,
+    lifted_height_delta: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward human-like elbow/wrist posture once the object starts lifting."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    obj: RigidObject = env.scene[object_cfg.name]
+
+    target_joint_positions = []
+    joint_indices = []
+    for joint_name, motor_position in target_motor_positions.items():
+        motor_min, motor_max = SO101_FOLLOWER_MOTOR_LIMITS[joint_name]
+        joint_min, joint_max = SO101_FOLLOWER_USD_JOINT_LIMLITS[joint_name]
+        joint_degree = (motor_position - motor_min) / (motor_max - motor_min) * (joint_max - joint_min) + joint_min
+        target_joint_positions.append(joint_degree / 180.0 * torch.pi)
+        joint_indices.append(robot.data.joint_names.index(joint_name))
+
+    target = torch.tensor(target_joint_positions, device=env.device, dtype=robot.data.joint_pos.dtype)
+    current = robot.data.joint_pos[:, joint_indices]
+    posture_error = torch.linalg.vector_norm(current - target.unsqueeze(0), dim=1)
+
+    start_height = _start_height_world(env, obj)
+    lifted = (obj.data.root_pos_w[:, 2] > start_height + lifted_height_delta).float()
+    return lifted * (1.0 - torch.tanh(posture_error / std))
 
 
 def xy_position_stability_dense(

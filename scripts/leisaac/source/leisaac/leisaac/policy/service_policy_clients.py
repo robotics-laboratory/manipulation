@@ -198,6 +198,7 @@ class LeRobotServicePolicyClient(Policy):
         policy_type: str = "smolvla",
         pretrained_name_or_path: str = "checkpoints/last/pretrained_model",
         actions_per_chunk: int = 50,
+        force_must_go: bool = False,
         device: str = "cuda",
     ):
         """
@@ -210,6 +211,7 @@ class LeRobotServicePolicyClient(Policy):
             policy_type: Type of policy.
             pretrained_name_or_path: Path to the pretrained model in the remote policy server.
             actions_per_chunk: Number of actions per chunk.
+            force_must_go: Whether to force the policy server to run inference for every observation.
             device: Device to use.
         """
         super().__init__("service")
@@ -217,6 +219,7 @@ class LeRobotServicePolicyClient(Policy):
         self.timeout_ms = timeout_ms
         self.task_type = task_type
         self.actions_per_chunk = actions_per_chunk
+        self.force_must_go = force_must_go
 
         lerobot_features = {}
         self.last_action = None
@@ -249,9 +252,11 @@ class LeRobotServicePolicyClient(Policy):
 
         self.latest_action_step = 0
         self.skip_send_observation = False
-        self.must_go_next_observation = True
+        self.must_go_next_observation = False
         self.empty_action_count = 0
-        self.max_empty_action_count = 3
+        self.max_empty_action_count = 20
+        self.action_poll_timeout_s = timeout_ms / 1000.0
+        self.action_poll_interval_s = 0.02
 
         self._init_service()
 
@@ -259,7 +264,7 @@ class LeRobotServicePolicyClient(Policy):
         """Reset per-episode client state so the policy server starts a fresh action chunk."""
         self.latest_action_step = 0
         self.skip_send_observation = False
-        self.must_go_next_observation = True
+        self.must_go_next_observation = False
         self.empty_action_count = 0
         if self.task_type == "so101leader":
             self.last_action = np.zeros((1, 6))
@@ -279,7 +284,7 @@ class LeRobotServicePolicyClient(Policy):
         except grpc.RpcError:
             raise RuntimeError("Failed to connect to policy server")
 
-    def _send_observation(self, observation_dict: dict):
+    def _send_observation(self, observation_dict: dict, must_go: bool = False, advance_timestep: bool = True):
         raw_observation = {
             f"{key}": observation_dict[key].cpu().numpy().astype(np.uint8)[0] for key in self.camera_keys
         }
@@ -305,14 +310,14 @@ class LeRobotServicePolicyClient(Policy):
                 "task": "pick_and_place",
             }
         """
-        self.latest_action_step += 1
+        if advance_timestep:
+            self.latest_action_step += 1
         observation = TimedObservation(
             timestamp=time.time(),
             observation=raw_observation,
             timestep=self.latest_action_step,
-            must_go=self.must_go_next_observation,
+            must_go=must_go or self.force_must_go,
         )
-        self.must_go_next_observation = False
 
         # send observation to policy server
         observation_bytes = pickle.dumps(observation)
@@ -325,11 +330,24 @@ class LeRobotServicePolicyClient(Policy):
         _ = self.stub.SendObservations(observation_iterator)
 
     def _receive_action(self) -> dict:
-        actions_chunk = self.stub.GetActions(services_pb2.Empty())
-        if len(actions_chunk.data) == 0:
-            print("Received `Empty` from policy server, waiting for next call")
-            return None
-        return pickle.loads(actions_chunk.data)
+        deadline = time.monotonic() + self.action_poll_timeout_s
+        empty_attempts = 0
+
+        while True:
+            actions_chunk = self.stub.GetActions(services_pb2.Empty())
+            if len(actions_chunk.data) > 0:
+                if empty_attempts > 0:
+                    print(f"Received action chunk after {empty_attempts} empty poll(s).")
+                return pickle.loads(actions_chunk.data)
+
+            empty_attempts += 1
+            if time.monotonic() >= deadline:
+                print(
+                    "Received `Empty` from policy server after "
+                    f"{empty_attempts} poll(s) over {self.action_poll_timeout_s:.2f}s."
+                )
+                return None
+            time.sleep(self.action_poll_interval_s)
 
     def get_action(self, observation_dict: dict) -> torch.Tensor:
         if not self.skip_send_observation:
@@ -337,16 +355,24 @@ class LeRobotServicePolicyClient(Policy):
         action_chunk = self._receive_action()
         if action_chunk is None:
             self.empty_action_count += 1
-            self.must_go_next_observation = True
             print(
                 "[WARN] Policy server returned empty action chunk; "
-                f"forcing next observation (empty {self.empty_action_count}/{self.max_empty_action_count})."
+                f"retrying current observation with must_go=True "
+                f"(empty {self.empty_action_count}/{self.max_empty_action_count})."
             )
+            self._send_observation(observation_dict, must_go=True, advance_timestep=False)
+            action_chunk = self._receive_action()
+            if action_chunk is not None:
+                print("[INFO] Policy server recovered after must_go retry.")
+                self.empty_action_count = 0
+            else:
+                print("[WARN] Policy server still returned empty after must_go retry; holding last action.")
             if self.empty_action_count >= self.max_empty_action_count:
                 print("[WARN] Re-sending policy instructions to recover policy server action stream.")
                 self._init_service()
                 self.empty_action_count = 0
-            return torch.from_numpy(self.last_action).repeat(self.actions_per_chunk, 1)[:, None, :]
+            if action_chunk is None:
+                return torch.from_numpy(self.last_action).repeat(self.actions_per_chunk, 1)[:, None, :]
 
         action_list = [action.get_action()[None, :] for action in action_chunk]
         concat_action = torch.cat(action_list, dim=0)

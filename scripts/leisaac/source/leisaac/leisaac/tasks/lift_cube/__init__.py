@@ -42,6 +42,66 @@ gym.register(
 )
 
 gym.register(
+    id="LeIsaac-SO101-LiftCube-RewardDense-AwkwardReset-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_cube_env_cfg:LiftCubeRewardDenseAwkwardResetEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeRewardDensePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="LeIsaac-SO101-LiftCube-RewardDense-AwkwardReset-Train-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_cube_env_cfg:LiftCubeRewardDenseAwkwardResetTrainEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeRewardDensePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="LeIsaac-SO101-LiftCube-RewardDense-AwkwardReset-Collect-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_cube_env_cfg:LiftCubeRewardDenseAwkwardResetCollectEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeRewardDensePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="LeIsaac-SO101-LiftCube-RewardDense-Vision-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_cube_env_cfg:LiftCubeRewardDenseVisionEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeRewardDenseVisionPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="LeIsaac-SO101-LiftCube-RewardDense-Vision-Train-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_cube_env_cfg:LiftCubeRewardDenseVisionTrainEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeRewardDenseVisionPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="LeIsaac-SO101-LiftCube-RewardDense-Vision-Collect-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_cube_env_cfg:LiftCubeRewardDenseVisionCollectEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeRewardDenseVisionPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="LeIsaac-SO101-LiftCube-Mimic-v0",
     entry_point=f"leisaac.enhance.envs:ManagerBasedRLLeIsaacMimicEnv",
     disable_env_checker=True,

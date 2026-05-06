@@ -57,8 +57,20 @@ def _progress_mask_per_orange(
             lifted_history = getattr(env, "_pick_orange_lifted_history", None)
             if lifted_history is not None and lifted_history.shape == progress_mask.shape:
                 lifted_history[reset_env_ids] = False
+            active_idx = getattr(env, "_pick_orange_active_idx", None)
+            if active_idx is not None and active_idx.shape == (env.num_envs,):
+                active_idx[reset_env_ids] = 0
         return progress_mask
     return _placed_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
+
+
+def _active_orange_index(env: ManagerBasedRLEnv | DirectRLEnv, progress_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return explicit active orange index when rewards have initialized it, otherwise first incomplete."""
+    active_idx = getattr(env, "_pick_orange_active_idx", None)
+    if active_idx is None or active_idx.shape != (env.num_envs,):
+        active_idx = torch.argmin(progress_mask.int(), dim=1)
+    all_placed = torch.all(progress_mask, dim=1)
+    return active_idx, all_placed
 
 
 def orange_grasped(
@@ -157,17 +169,28 @@ def active_unplaced_orange_position_in_robot_root_frame(
     plate_cfg: SceneEntityCfg = SceneEntityCfg("Plate"),
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Position of the first not-yet-placed orange in robot base frame."""
+    """Position of the explicit active orange in robot base frame."""
     robot: Articulation = env.scene[robot_cfg.name]
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
-    active_idx = torch.argmin(placed_mask.int(), dim=1)
-    all_placed = torch.all(placed_mask, dim=1)
+    active_idx, all_placed = _active_orange_index(env, placed_mask)
 
     orange_positions = torch.stack([env.scene[orange_cfg.name].data.root_pos_w[:, :3] for orange_cfg in oranges_cfg], dim=1)
     env_ids = torch.arange(env.num_envs, device=robot.data.root_pos_w.device)
     active_pos_w = orange_positions[env_ids, active_idx]
     active_pos_b, _ = subtract_frame_transforms(robot.data.root_state_w[:, :3], robot.data.root_state_w[:, 3:7], active_pos_w)
     return torch.where(all_placed.unsqueeze(1), torch.zeros_like(active_pos_b), active_pos_b)
+
+
+def active_orange_one_hot(
+    env: ManagerBasedRLEnv | DirectRLEnv,
+    oranges_cfg: list[SceneEntityCfg],
+    plate_cfg: SceneEntityCfg = SceneEntityCfg("Plate"),
+) -> torch.Tensor:
+    """One-hot encoding of the explicit active orange command."""
+    placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
+    active_idx, all_placed = _active_orange_index(env, placed_mask)
+    one_hot = torch.nn.functional.one_hot(active_idx, num_classes=len(oranges_cfg)).float()
+    return torch.where(all_placed.unsqueeze(1), torch.zeros_like(one_hot), one_hot)
 
 
 def placed_oranges_flags(

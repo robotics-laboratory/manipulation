@@ -93,6 +93,13 @@ class PickOrangeMlpObservationsCfg:
                 "robot_cfg": SceneEntityCfg("robot"),
             },
         )
+        active_orange_one_hot = ObsTerm(
+            func=mdp.active_orange_one_hot,
+            params={
+                "oranges_cfg": [SceneEntityCfg("Orange001"), SceneEntityCfg("Orange002"), SceneEntityCfg("Orange003")],
+                "plate_cfg": SceneEntityCfg("Plate"),
+            },
+        )
         orange_positions = ObsTerm(
             func=mdp.objects_positions_in_robot_root_frame,
             params={

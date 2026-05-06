@@ -61,11 +61,36 @@ def _reset_episode_progress_if_needed(env: ManagerBasedRLEnv, num_oranges: int) 
         env._pick_orange_lifted_history = torch.zeros((env.num_envs, num_oranges), dtype=torch.bool, device=env.device)
     if not hasattr(env, "_pick_orange_progress_mask"):
         env._pick_orange_progress_mask = torch.zeros((env.num_envs, num_oranges), dtype=torch.bool, device=env.device)
+    if not hasattr(env, "_pick_orange_active_idx"):
+        env._pick_orange_active_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
 
     reset_env_ids = (env.episode_length_buf <= 1).nonzero(as_tuple=True)[0]
     if reset_env_ids.numel() > 0:
         env._pick_orange_lifted_history[reset_env_ids] = False
         env._pick_orange_progress_mask[reset_env_ids] = False
+        env._pick_orange_active_idx[reset_env_ids] = 0
+
+
+def _ensure_active_orange_state(env: ManagerBasedRLEnv, num_oranges: int) -> torch.Tensor:
+    """Ensure and return the explicit per-env active orange index."""
+    if not hasattr(env, "_pick_orange_active_idx"):
+        env._pick_orange_active_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    if env._pick_orange_active_idx.shape != (env.num_envs,):
+        env._pick_orange_active_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    return env._pick_orange_active_idx
+
+
+def _advance_active_orange_if_needed(env: ManagerBasedRLEnv, progress_mask: torch.Tensor) -> torch.Tensor:
+    """Advance each env's active orange to the first incomplete orange once current target is done."""
+    active_idx = _ensure_active_orange_state(env, progress_mask.shape[1])
+    all_placed = torch.all(progress_mask, dim=1)
+    env_ids = torch.arange(env.num_envs, device=progress_mask.device)
+    current_done = progress_mask[env_ids, active_idx]
+    should_advance = torch.logical_and(current_done, torch.logical_not(all_placed))
+    if torch.any(should_advance):
+        first_incomplete = torch.argmin(progress_mask.int(), dim=1)
+        active_idx[should_advance] = first_incomplete[should_advance]
+    return active_idx
 
 
 def _gripper_near_closed_mask(
@@ -178,12 +203,13 @@ def _progress_mask_per_orange(
         close_joint_threshold=close_joint_threshold,
     )
     env._pick_orange_progress_mask = torch.logical_and(placed_mask, lifted_history)
+    _advance_active_orange_if_needed(env, env._pick_orange_progress_mask)
     return env._pick_orange_progress_mask
 
 
-def _active_target_mask(placed_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return one-hot mask for first unplaced orange and all-placed flag."""
-    active_idx = torch.argmin(placed_mask.int(), dim=1)
+def _active_target_mask(env: ManagerBasedRLEnv, placed_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return one-hot mask for the explicit active orange and all-placed flag."""
+    active_idx = _ensure_active_orange_state(env, placed_mask.shape[1])
     all_placed = torch.all(placed_mask, dim=1)
     active_mask = torch.nn.functional.one_hot(active_idx, num_classes=placed_mask.shape[1]).bool()
     active_mask = torch.logical_and(active_mask, torch.logical_not(all_placed).unsqueeze(1))
@@ -203,7 +229,7 @@ def reach_unplaced_oranges_dense(
     ee_pos = ee_frame.data.target_pos_w[:, ee_frame_index, :3]
 
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
-    active_mask, all_placed = _active_target_mask(placed_mask)
+    active_mask, all_placed = _active_target_mask(env, placed_mask)
     distance_list = []
     for orange_cfg in oranges_cfg:
         orange: RigidObject = env.scene[orange_cfg.name]
@@ -240,7 +266,7 @@ def grasp_unplaced_oranges_dense(
     gripper_closed = (robot.data.joint_pos[:, -1] < close_joint_threshold).float()
 
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
-    active_mask, all_placed = _active_target_mask(placed_mask)
+    active_mask, all_placed = _active_target_mask(env, placed_mask)
     near_scores = []
     lift_factors = []
     effective_height = max(lift_progress_height, 1.0e-6)
@@ -275,7 +301,7 @@ def lift_unplaced_oranges_dense(
 ) -> torch.Tensor:
     """Reward vertical lift progress only when the gripper is plausibly holding the active orange."""
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
-    active_mask, all_placed = _active_target_mask(placed_mask)
+    active_mask, all_placed = _active_target_mask(env, placed_mask)
     grasped_mask = _gripper_near_closed_mask(
         env,
         oranges_cfg=oranges_cfg,
@@ -306,7 +332,7 @@ def active_orange_over_lift_penalty(
 ) -> torch.Tensor:
     """Penalty for lifting the active orange far above the useful carry height."""
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
-    active_mask, all_placed = _active_target_mask(placed_mask)
+    active_mask, all_placed = _active_target_mask(env, placed_mask)
 
     penalties = []
     for orange_cfg in oranges_cfg:
@@ -334,7 +360,7 @@ def move_unplaced_oranges_to_plate_dense(
     """
     plate: RigidObject = env.scene[plate_cfg.name]
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg, lifted_height_delta=lifted_height_delta)
-    active_mask, all_placed = _active_target_mask(placed_mask)
+    active_mask, all_placed = _active_target_mask(env, placed_mask)
 
     scores = []
     held_now = _currently_held_per_orange(env, oranges_cfg=oranges_cfg, lifted_height_delta=lifted_height_delta)
@@ -366,7 +392,7 @@ def lower_unplaced_oranges_to_plate_dense(
     plate: RigidObject = env.scene[plate_cfg.name]
     plate_pos = plate.data.root_pos_w[:, :3]
     placed_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg, lifted_height_delta=lifted_height_delta)
-    active_mask, all_placed = _active_target_mask(placed_mask)
+    active_mask, all_placed = _active_target_mask(env, placed_mask)
     held_now = _currently_held_per_orange(env, oranges_cfg=oranges_cfg, lifted_height_delta=lifted_height_delta)
 
     scores = []
@@ -475,7 +501,7 @@ def non_active_orange_displacement_penalty(
 ) -> torch.Tensor:
     """Penalty for sweeping future oranges away before they become the active target."""
     progress_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg)
-    active_mask, _ = _active_target_mask(progress_mask)
+    active_mask, _ = _active_target_mask(env, progress_mask)
     future_mask = torch.logical_and(torch.logical_not(progress_mask), torch.logical_not(active_mask))
 
     displacements = []
@@ -502,7 +528,7 @@ def active_orange_pre_lift_displacement_penalty(
     closes the lift-then-drop-and-sweep loophole left open by the prior history-based gate.
     """
     progress_mask = _progress_mask_per_orange(env, oranges_cfg=oranges_cfg, plate_cfg=plate_cfg, lifted_height_delta=lifted_height_delta)
-    active_mask, _ = _active_target_mask(progress_mask)
+    active_mask, _ = _active_target_mask(env, progress_mask)
 
     below_lift_list = []
     displacements = []

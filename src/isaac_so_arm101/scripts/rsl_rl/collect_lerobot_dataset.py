@@ -33,7 +33,22 @@ parser.add_argument(
     "--repo_id",
     type=str,
     default="igor-saprygin/so101-lift-cube",
-    help="LeRobot dataset repository ID or local dataset ID.",
+    help="Backward-compatible alias for --target_repo_id.",
+)
+parser.add_argument(
+    "--source_repo_id",
+    type=str,
+    default=None,
+    help=(
+        "Optional source LeRobot dataset repo to copy before collection. "
+        "Use this to create base-plus-extension ablation datasets."
+    ),
+)
+parser.add_argument(
+    "--target_repo_id",
+    type=str,
+    default=None,
+    help="LeRobot dataset repo to write. Defaults to --source_repo_id when provided, otherwise --repo_id.",
 )
 parser.add_argument("--fps", type=int, default=30, help="LeRobot dataset frames per second.")
 parser.add_argument(
@@ -106,6 +121,12 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
+if args_cli.target_repo_id is None:
+    args_cli.target_repo_id = args_cli.source_repo_id or args_cli.repo_id
+if args_cli.source_repo_id is None:
+    args_cli.source_repo_id = args_cli.target_repo_id
+args_cli.repo_id = args_cli.target_repo_id
+
 if args_cli.num_envs != 1:
     raise ValueError("LeRobotRecorderManager records env index 0 only; use --num_envs 1 for dataset collection.")
 if not args_cli.success_only:
@@ -145,9 +166,12 @@ from leisaac.enhance.managers.lerobot_recorder_manager import LeRobotRecorderMan
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 try:
-    from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+    from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 except ModuleNotFoundError:
-    get_published_pretrained_checkpoint = None
+    try:
+        from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+    except ModuleNotFoundError:
+        get_published_pretrained_checkpoint = None
 
 import isaaclab_tasks  # noqa: F401
 import isaac_so_arm101.tasks  # noqa: F401
@@ -195,17 +219,46 @@ def _prepare_lerobot_dataset_path(repo_id: str) -> None:
     print(f"[INFO] Overwriting existing local LeRobot dataset: {dataset_path}")
 
 
+def _copy_source_dataset_to_target_if_needed() -> bool:
+    """Materialize a target LeRobot dataset by copying a source dataset cache."""
+    if args_cli.source_repo_id == args_cli.target_repo_id:
+        return False
+
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    except ImportError as err:
+        raise RuntimeError("LeRobot must be installed to clone source datasets.") from err
+
+    print(f"[INFO] Preparing target dataset from source: {args_cli.source_repo_id} -> {args_cli.target_repo_id}")
+    LeRobotDataset(repo_id=args_cli.source_repo_id)
+    source_path = _lerobot_cache_path(args_cli.source_repo_id)
+    target_path = _lerobot_cache_path(args_cli.target_repo_id)
+    if not source_path.exists():
+        raise FileNotFoundError(f"Source LeRobot dataset cache does not exist after download: {source_path}")
+    if target_path.exists():
+        if args_cli.no_overwrite:
+            raise FileExistsError(f"Target local LeRobot dataset already exists: {target_path}")
+        shutil.rmtree(target_path)
+        print(f"[INFO] Removed existing target local LeRobot dataset: {target_path}")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_path, target_path)
+    print(f"[INFO] Copied source dataset cache to target: {target_path}")
+    return True
+
+
 def _replace_lerobot_recorder(env, env_cfg: ManagerBasedRLEnvCfg) -> None:
     """Replace Isaac Lab's recorder with the LeRobot recorder used by LeIsaac."""
     if env_cfg.recorders is None:
         raise ValueError("The collection environment must define recorder terms.")
 
-    if args_cli.resume_dataset:
+    copied_source_dataset = _copy_source_dataset_to_target_if_needed()
+    if args_cli.resume_dataset or copied_source_dataset:
         dataset_path = _lerobot_cache_path(args_cli.repo_id)
         if not dataset_path.exists():
             raise FileNotFoundError(f"Cannot resume missing local LeRobot dataset: {dataset_path}")
         env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_SUCCEEDED_ONLY_RESUME
-        print(f"[INFO] Resuming existing local LeRobot dataset: {dataset_path}")
+        mode = "source-copy" if copied_source_dataset else "resume"
+        print(f"[INFO] Appending to local LeRobot dataset ({mode}): {dataset_path}")
     else:
         env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
         _prepare_lerobot_dataset_path(args_cli.repo_id)
