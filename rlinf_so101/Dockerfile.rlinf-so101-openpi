@@ -1,0 +1,22 @@
+FROM rlinf/rlinf:agentic-rlinf0.2-isaaclab
+
+SHELL ["/bin/bash", "-lc"]
+
+# Install OpenPI without rerunning RLinf's full IsaacLab installer. The base
+# image already contains the IsaacLab stack; the official installer would also
+# rebuild flash-attn, which is slow and unnecessary for this derivative image.
+RUN command -v uv >/dev/null 2>&1 || /opt/venv/gr00t/bin/python -m pip install --no-cache-dir uv && \
+    uv pip install --python /opt/venv/gr00t/bin/python git+https://github.com/RLinf/openpi && \
+    SITE_PACKAGES=$(/opt/venv/gr00t/bin/python -c "import site; print(site.getsitepackages()[0])") && \
+    cp -r "$SITE_PACKAGES/openpi/models_pytorch/transformers_replace/"* "$SITE_PACKAGES/transformers/"
+
+# Bake LeIsaac into the image so Ray/Isaac subprocesses can import it without
+# relying on per-container editable installs or PYTHONPATH-only setup.
+COPY scripts/leisaac/source/leisaac /opt/leisaac
+RUN /opt/venv/gr00t/bin/python -m pip install --no-cache-dir -e /opt/leisaac
+
+ENV PYTHONPATH=/workspace/RLinf:/opt/leisaac
+ENV EMBODIED_PATH=/workspace/RLinf/examples/embodiment
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+WORKDIR /workspace/RLinf
