@@ -1,0 +1,1278 @@
+diff --git a/scripts/serve_policy.py b/scripts/serve_policy.py
+index 30f121a..b402456 100644
+--- a/scripts/serve_policy.py
++++ b/scripts/serve_policy.py
+@@ -28,6 +28,12 @@ class Checkpoint:
+     config: str
+     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
+     dir: str
++    # If true, pi0-FAST policies return sampled action tokens and token logprobs for PPO rollouts.
++    return_token_logprobs: bool = False
++    # Sampling temperature passed to policy.sample_actions.
++    temperature: float | None = None
++    # Optional maximum number of FAST tokens to decode.
++    max_decoding_steps: int | None = None
+ 
+ 
+ @dataclasses.dataclass
+@@ -50,6 +56,12 @@ class Args:
+     port: int = 8000
+     # Record the policy's behavior for debugging.
+     record: bool = False
++    # If true, pi0-FAST policies return sampled action tokens and token logprobs for PPO rollouts.
++    return_token_logprobs: bool = False
++    # Sampling temperature passed to policy.sample_actions.
++    temperature: float = 0.0
++    # Optional maximum number of FAST tokens to decode.
++    max_decoding_steps: int | None = None
+ 
+     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
+     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+@@ -76,24 +88,47 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
+ }
+ 
+ 
+-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
++def sample_kwargs_from_args(args: Args) -> dict:
++    sample_kwargs = {"temperature": args.temperature}
++    if args.return_token_logprobs:
++        sample_kwargs["return_token_logprobs"] = True
++    if args.max_decoding_steps is not None:
++        sample_kwargs["max_decoding_steps"] = args.max_decoding_steps
++    if isinstance(args.policy, Checkpoint):
++        if args.policy.temperature is not None:
++            sample_kwargs["temperature"] = args.policy.temperature
++        if args.policy.return_token_logprobs:
++            sample_kwargs["return_token_logprobs"] = True
++        if args.policy.max_decoding_steps is not None:
++            sample_kwargs["max_decoding_steps"] = args.policy.max_decoding_steps
++    return sample_kwargs
++
++
++def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, sample_kwargs: dict | None = None) -> _policy.Policy:
+     """Create a default policy for the given environment."""
+     if checkpoint := DEFAULT_CHECKPOINT.get(env):
+         return _policy_config.create_trained_policy(
+-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
++            _config.get_config(checkpoint.config),
++            checkpoint.dir,
++            default_prompt=default_prompt,
++            sample_kwargs=sample_kwargs,
+         )
+     raise ValueError(f"Unsupported environment mode: {env}")
+ 
+ 
+ def create_policy(args: Args) -> _policy.Policy:
+     """Create a policy from the given arguments."""
++    sample_kwargs = sample_kwargs_from_args(args)
+     match args.policy:
+         case Checkpoint():
+             return _policy_config.create_trained_policy(
+-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
++                _config.get_config(args.policy.config),
++                args.policy.dir,
++                default_prompt=args.default_prompt,
++                sample_kwargs=sample_kwargs,
+             )
+         case Default():
+-            return create_default_policy(args.env, default_prompt=args.default_prompt)
++            return create_default_policy(args.env, default_prompt=args.default_prompt, sample_kwargs=sample_kwargs)
+ 
+ 
+ def main(args: Args) -> None:
+diff --git a/src/openpi/models/pi0_fast.py b/src/openpi/models/pi0_fast.py
+index e6b5bd1..08e727d 100644
+--- a/src/openpi/models/pi0_fast.py
++++ b/src/openpi/models/pi0_fast.py
+@@ -241,6 +241,22 @@ class Pi0FAST(_model.BaseModel):
+         max_decoding_steps: int | at.Int[at.Array, ""] = 256,
+         temperature: float = 0.0,
+     ) -> _model.Actions:
++        output_tokens, _, _ = self.sample_actions_with_logprobs(
++            rng,
++            observation,
++            max_decoding_steps=max_decoding_steps,
++            temperature=temperature,
++        )
++        return output_tokens
++
++    def sample_actions_with_logprobs(
++        self,
++        rng: at.KeyArrayLike,
++        observation: _model.Observation,
++        *,
++        max_decoding_steps: int | at.Int[at.Array, ""] = 256,
++        temperature: float = 0.0,
++    ) -> tuple[_model.Actions, at.Float[at.Array, "*b s"], at.Bool[at.Array, "*b s"]]:
+         # TODO: this is a hack to get the image keys.
+         observation = _model.preprocess_observation(
+             None, observation, train=False, image_keys=list(observation.images.keys())
+@@ -268,21 +284,43 @@ class Pi0FAST(_model.BaseModel):
+ 
+         # prepare decoding -- final logit decodes the first token
+         last_logit = prefix_logits[:, -1:]
+-        output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps))
++        output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps), dtype=jnp.int32)
++        token_logprobs = jnp.zeros((last_logit.shape[0], max_decoding_steps), dtype=jnp.float32)
++        token_mask = jnp.zeros((last_logit.shape[0], max_decoding_steps), dtype=jnp.bool_)
+ 
+         def step(carry):
+-            rng, last_logit, output_tokens, cache, _, step = carry
++            rng, last_logit, output_tokens, token_logprobs, token_mask, cache, _, step = carry
+ 
+             # Sample token from last logit
+             # Split RNG for this step
+             rng, rng_step = jax.random.split(rng)
++            sampling_logits = jax.lax.cond(
++                temperature > 0.0,
++                lambda _: last_logit / temperature,
++                lambda _: last_logit,
++                operand=None,
++            )
+             token = jax.lax.cond(
+                 temperature > 0.0,
+-                lambda _: jax.random.categorical(rng_step, last_logit / temperature, axis=-1),
+-                lambda _: jnp.argmax(last_logit, axis=-1),
++                lambda _: jax.random.categorical(rng_step, sampling_logits, axis=-1),
++                lambda _: jnp.argmax(sampling_logits, axis=-1),
+                 operand=None,
+             )
+             output_tokens = put_along_last_axis(output_tokens, jnp.broadcast_to(step, (token.shape[0], 1)), token)
++            token_logprob = jnp.squeeze(
++                jnp.take_along_axis(jax.nn.log_softmax(sampling_logits, axis=-1), token[..., None], axis=-1),
++                axis=-1,
++            )
++            token_logprobs = put_along_last_axis(
++                token_logprobs,
++                jnp.broadcast_to(step, (token.shape[0], 1)),
++                token_logprob,
++            )
++            token_mask = put_along_last_axis(
++                token_mask,
++                jnp.broadcast_to(step, (token.shape[0], 1)),
++                jnp.ones_like(token, dtype=jnp.bool_),
++            )
+ 
+             # Check for early stopping --> stop if all batch elements have EOS token
+             has_eos = jnp.any(token == PALIGEMMA_EOS_TOKEN, axis=-1)
+@@ -300,14 +338,67 @@ class Pi0FAST(_model.BaseModel):
+                 embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
+             )
+ 
+-            return rng, last_logit, output_tokens, kv_cache, all_eos, step + 1
++            return rng, last_logit, output_tokens, token_logprobs, token_mask, kv_cache, all_eos, step + 1
+ 
+         def cond(carry):
+-            _, _, _, _, all_eos, step = carry
++            _, _, _, _, _, _, all_eos, step = carry
+             return (~all_eos) & (step < max_decoding_steps)
+ 
+         # Use lax.while_loop so we can jit the full decoding loop.
+-        _, _, output_tokens, _, _, _ = jax.lax.while_loop(
+-            cond, step, (rng, last_logit, output_tokens, kv_cache, False, 0)
++        _, _, output_tokens, token_logprobs, token_mask, _, _, _ = jax.lax.while_loop(
++            cond, step, (rng, last_logit, output_tokens, token_logprobs, token_mask, kv_cache, False, 0)
+         )
+-        return output_tokens
++        return output_tokens, token_logprobs, token_mask
++
++    def score_action_tokens(
++        self,
++        observation: _model.Observation,
++        action_tokens: at.Int[at.Array, "*b s"],
++        *,
++        temperature: float = 1.0,
++    ) -> at.Float[at.Array, "*b s"]:
++        """Return teacher-forced logprobs for generated FAST tokens."""
++        observation = _model.preprocess_observation(
++            None, observation, train=False, image_keys=list(observation.images.keys())
++        )
++
++        prefix_token_embeddings, prefix_mask, prefix_ar_mask = self.embed_inputs(observation)
++        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
++        prefix_token_embeddings, prefix_mask, prefix_attn_mask = left_to_right_align(
++            prefix_token_embeddings, prefix_mask, prefix_attn_mask
++        )
++        num_action_tokens = action_tokens.shape[1]
++        prefill_size = prefix_token_embeddings.shape[1]
++        prefill_len = jnp.sum(prefix_mask, axis=-1)
++        prefix_start = prefill_size - prefill_len
++
++        prefix_attn_mask = jnp.pad(prefix_attn_mask, ((0, 0), (0, 0), (0, num_action_tokens)))
++        prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
++        prefix_logits, kv_cache, _ = self.PaliGemma.llm(
++            embedded_prefix=prefix_token_embeddings, mask=prefix_attn_mask, positions=prefix_positions, decode=True
++        )
++
++        last_logit = prefix_logits[:, -1:]
++        logprob_temperature = jnp.maximum(jnp.asarray(temperature, dtype=last_logit.dtype), 1.0e-6)
++
++        def step(carry, step_index):
++            last_logit, cache = carry
++            step = step_index.astype(jnp.int32)
++            token = jax.lax.dynamic_slice(action_tokens, (0, step), (action_tokens.shape[0], 1)).astype(jnp.int32)
++            logp = jax.nn.log_softmax(last_logit / logprob_temperature, axis=-1)
++            token_logprob = jnp.squeeze(jnp.take_along_axis(logp, token[..., None], axis=-1), axis=-1)
++
++            token_embedding = self.PaliGemma.llm(token, embed_only=True)
++            positions = prefill_len[:, None] + step + 1
++            mask = jnp.logical_and(
++                jnp.arange(prefill_size + num_action_tokens)[None, None, :] >= prefix_start[:, None, None],
++                jnp.arange(prefill_size + num_action_tokens)[None, None, :]
++                < (jnp.broadcast_to(prefill_size + step + 1, (prefix_start.shape[0], 1, 1))),
++            )
++            last_logit, kv_cache, _ = self.PaliGemma.llm(
++                embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
++            )
++            return (last_logit, kv_cache), token_logprob[:, 0]
++
++        _, token_logprobs = jax.lax.scan(step, (last_logit, kv_cache), jnp.arange(num_action_tokens))
++        return jnp.swapaxes(token_logprobs, 0, 1)
+diff --git a/src/openpi/policies/policy.py b/src/openpi/policies/policy.py
+index b9b708b..5f7b6c4 100644
+--- a/src/openpi/policies/policy.py
++++ b/src/openpi/policies/policy.py
+@@ -50,10 +50,16 @@ class Policy(BasePolicy):
+         self._model = model
+         self._input_transform = _transforms.compose(transforms)
+         self._output_transform = _transforms.compose(output_transforms)
+-        self._sample_kwargs = sample_kwargs or {}
++        self._sample_kwargs = dict(sample_kwargs or {})
++        self._return_token_logprobs = bool(self._sample_kwargs.pop("return_token_logprobs", False))
+         self._metadata = metadata or {}
+         self._is_pytorch_model = is_pytorch
+         self._pytorch_device = pytorch_device
++        logging.info(
++            "Policy sampling options: return_token_logprobs=%s sample_kwargs=%s",
++            self._return_token_logprobs,
++            self._sample_kwargs,
++        )
+ 
+         if self._is_pytorch_model:
+             self._model = self._model.to(pytorch_device)
+@@ -61,7 +67,11 @@ class Policy(BasePolicy):
+             self._sample_actions = model.sample_actions
+         else:
+             # JAX model setup
+-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
++            sample_fn = model.sample_actions_with_logprobs if self._return_token_logprobs else model.sample_actions
++            if "max_decoding_steps" in self._sample_kwargs:
++                self._sample_actions = nnx_utils.module_jit(sample_fn, static_argnames=("max_decoding_steps",))
++            else:
++                self._sample_actions = nnx_utils.module_jit(sample_fn)
+             self._rng = rng or jax.random.key(0)
+ 
+     @override
+@@ -89,10 +99,20 @@ class Policy(BasePolicy):
+ 
+         observation = _model.Observation.from_dict(inputs)
+         start_time = time.monotonic()
++        sample_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+         outputs = {
+             "state": inputs["state"],
+-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+         }
++        logging.debug("Policy sample result type: %s", type(sample_result))
++        if isinstance(sample_result, tuple):
++            logging.debug("Policy sample returned FAST token logprob tuple with %d items.", len(sample_result))
++            action_tokens, action_token_logprobs, action_token_mask = sample_result
++            outputs["actions"] = action_tokens
++            outputs["action_tokens"] = action_tokens
++            outputs["action_token_logprobs"] = action_token_logprobs
++            outputs["action_token_mask"] = action_token_mask
++        else:
++            outputs["actions"] = sample_result
+         model_time = time.monotonic() - start_time
+         if self._is_pytorch_model:
+             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+diff --git a/src/openpi/serving/websocket_policy_server.py b/src/openpi/serving/websocket_policy_server.py
+index bdefa98..70132d4 100644
+--- a/src/openpi/serving/websocket_policy_server.py
++++ b/src/openpi/serving/websocket_policy_server.py
+@@ -6,7 +6,10 @@ import traceback
+ 
+ from openpi_client import base_policy as _base_policy
+ from openpi_client import msgpack_numpy
+-import websockets.asyncio.server as _server
++try:
++    import websockets.asyncio.server as _server
++except ModuleNotFoundError:
++    import websockets.server as _server
+ import websockets.frames
+ 
+ logger = logging.getLogger(__name__)
+@@ -45,7 +48,7 @@ class WebsocketPolicyServer:
+         ) as server:
+             await server.serve_forever()
+ 
+-    async def _handler(self, websocket: _server.ServerConnection):
++    async def _handler(self, websocket):
+         logger.info(f"Connection from {websocket.remote_address} opened")
+         packer = msgpack_numpy.Packer()
+ 
+@@ -83,8 +86,13 @@ class WebsocketPolicyServer:
+                 raise
+ 
+ 
+-def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:
+-    if request.path == "/healthz":
+-        return connection.respond(http.HTTPStatus.OK, "OK\n")
++def _health_check(*args):
++    if len(args) == 2 and hasattr(args[1], "path"):
++        connection, request = args
++        if request.path == "/healthz":
++            return connection.respond(http.HTTPStatus.OK, "OK\n")
++        return None
++    if len(args) >= 1 and args[0] == "/healthz":
++        return http.HTTPStatus.OK, [], b"OK\n"
+     # Continue with the normal request handling.
+     return None
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..d10734e 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -557,6 +557,8 @@ class TrainConfig:
+ 
+ 
+ # Use `get_config` if you need to get a config by name in your code.
++import openpi.training.so101_config as so101_config
++
+ _CONFIGS = [
+     #
+     # Inference Aloha configs.
+@@ -966,6 +968,7 @@ _CONFIGS = [
+         wandb_enabled=False,
+     ),
+     # RoboArena & PolaRiS configs.
++    *so101_config.get_so101_configs(),
+     *roboarena_config.get_roboarena_configs(),
+     *polaris_config.get_polaris_configs(),
+ ]
+diff --git a/scripts/train_fast_ppo_rollouts.py b/scripts/train_fast_ppo_rollouts.py
+new file mode 100644
+index 0000000..c88d930
+--- /dev/null
++++ b/scripts/train_fast_ppo_rollouts.py
+@@ -0,0 +1,399 @@
++"""Single-process PPO finetuning for pi0-FAST rollouts.
++
++This learner consumes rollout ``.npz`` files from LeIsaac that include sampled
++FAST action tokens and behavior-policy token logprobs. It intentionally avoids
++Ray, shared-memory IPC, and simulator workers: rollouts are file handoffs and
++the update is a normal OpenPI/JAX training process.
++"""
++
++from __future__ import annotations
++
++import argparse
++import dataclasses
++import functools
++import json
++import logging
++from pathlib import Path
++from typing import Any
++
++import flax.nnx as nnx
++import jax
++import jax.numpy as jnp
++import numpy as np
++import optax
++import orbax.checkpoint as ocp
++import tqdm_loggable.auto as tqdm
++
++import openpi.models.model as _model
++import openpi.shared.array_typing as at
++import openpi.shared.download as download
++import openpi.shared.normalize as _normalize
++import openpi.transforms as _transforms
++import openpi.training.config as _config
++import openpi.training.utils as training_utils
++
++
++LOGGER = logging.getLogger("openpi.fast_ppo")
++IMAGE_SHAPE = (224, 224, 3)
++
++
++@dataclasses.dataclass(frozen=True)
++class PPOExample:
++    state: np.ndarray
++    action_tokens: np.ndarray
++    old_token_logprobs: np.ndarray
++    action_token_mask: np.ndarray
++    advantage: float
++    prompt: str
++    front_image: np.ndarray
++    wrist_image: np.ndarray
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", default="pi0_fast_so101_lift_cube")
++    parser.add_argument("--rollout_dir", type=Path, required=True)
++    parser.add_argument("--init_checkpoint", default=None)
++    parser.add_argument("--save_dir", type=Path, default=None)
++    parser.add_argument("--num_train_steps", type=int, default=1)
++    parser.add_argument("--batch_size", type=int, default=1)
++    parser.add_argument("--learning_rate", type=float, default=1e-6)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--gamma", type=float, default=0.99)
++    parser.add_argument("--clip_epsilon", type=float, default=0.2)
++    parser.add_argument("--kl_coef", type=float, default=0.0)
++    parser.add_argument("--logprob_temperature", type=float, default=1.0)
++    parser.add_argument("--max_examples", type=int, default=512)
++    parser.add_argument("--make_smoke_rollout", action="store_true")
++    parser.add_argument("--dry_run_data", action="store_true")
++    parser.add_argument("--init_random", action="store_true")
++    return parser.parse_args()
++
++
++def discounted_returns(rewards: np.ndarray, gamma: float) -> np.ndarray:
++    returns = np.zeros_like(rewards, dtype=np.float32)
++    running = 0.0
++    for index in range(len(rewards) - 1, -1, -1):
++        running = float(rewards[index]) + gamma * running
++        returns[index] = running
++    return returns
++
++
++def rollout_prompt(data: np.lib.npyio.NpzFile) -> str:
++    if "meta_json" not in data:
++        return "Lift the red cube up."
++    meta = json.loads(str(data["meta_json"].item()))
++    return str(meta.get("prompt") or "Lift the red cube up.")
++
++
++def make_smoke_rollout(rollout_dir: Path, *, action_dim: int, token_len: int = 16) -> None:
++    rollout_dir.mkdir(parents=True, exist_ok=True)
++    path = rollout_dir / "episode_000000.npz"
++    if path.exists():
++        return
++
++    steps = 4
++    states = np.zeros((steps, action_dim), dtype=np.float32)
++    actions = np.zeros((steps, action_dim), dtype=np.float32)
++    rewards = np.linspace(0.0, 1.0, steps, dtype=np.float32)
++    action_tokens = np.zeros((1, token_len), dtype=np.int32)
++    old_logprobs = np.full((1, token_len), -8.0, dtype=np.float32)
++    action_token_mask = np.ones((1, token_len), dtype=np.bool_)
++    meta = {
++        "episode": 0,
++        "task": "LeIsaac-SO101-LiftCube-v0",
++        "prompt": "Lift the red cube up.",
++        "steps": steps,
++        "return": float(np.sum(rewards)),
++        "smoke": True,
++    }
++    np.savez_compressed(
++        path,
++        states=states,
++        actions_lerobot=actions,
++        rewards=rewards,
++        terminations=np.asarray([False, False, False, True], dtype=np.bool_),
++        truncations=np.zeros((steps,), dtype=np.bool_),
++        chunk_start_steps=np.asarray([0], dtype=np.int32),
++        chunk_lengths=np.asarray([steps], dtype=np.int32),
++        action_tokens=action_tokens,
++        action_token_logprobs=old_logprobs,
++        action_token_mask=action_token_mask,
++        meta_json=np.asarray(json.dumps(meta), dtype=np.str_),
++    )
++
++
++def _array(data: np.lib.npyio.NpzFile, *names: str) -> np.ndarray:
++    for name in names:
++        if name in data:
++            value = np.asarray(data[name])
++            if value.ndim == 3 and value.shape[1] == 1:
++                value = value[:, 0]
++            return value
++    raise KeyError(f"Missing any of {names} in rollout file.")
++
++
++def _optional_images(data: np.lib.npyio.NpzFile, name: str, step: int) -> np.ndarray:
++    if name not in data:
++        return np.zeros(IMAGE_SHAPE, dtype=np.uint8)
++    return np.asarray(data[name][step], dtype=np.uint8)
++
++
++def normalize_advantages(examples: list[PPOExample]) -> list[PPOExample]:
++    advantages = np.asarray([example.advantage for example in examples], dtype=np.float32)
++    if float(np.std(advantages)) > 1.0e-6:
++        advantages = (advantages - float(np.mean(advantages))) / (float(np.std(advantages)) + 1.0e-6)
++    elif float(np.max(np.abs(advantages))) > 1.0e-6:
++        advantages = advantages / (float(np.max(np.abs(advantages))) + 1.0e-6)
++
++    return [
++        dataclasses.replace(example, advantage=float(advantage))
++        for example, advantage in zip(examples, advantages, strict=True)
++    ]
++
++
++def load_examples(rollout_dir: Path, *, gamma: float, max_examples: int) -> list[PPOExample]:
++    examples: list[PPOExample] = []
++    for path in sorted(rollout_dir.glob("episode_*.npz")):
++        with np.load(path, allow_pickle=True) as data:
++            states = np.asarray(data["states"], dtype=np.float32)
++            rewards = np.asarray(data["rewards"], dtype=np.float32)
++            returns = discounted_returns(rewards, gamma)
++            prompt = rollout_prompt(data)
++            action_tokens = _array(data, "action_tokens", "tokens").astype(np.int32)
++            old_logprobs = _array(data, "action_token_logprobs", "token_logprobs", "logprobs").astype(np.float32)
++            if "action_token_mask" in data:
++                token_mask = np.asarray(data["action_token_mask"], dtype=np.bool_)
++            else:
++                token_mask = np.ones_like(action_tokens, dtype=np.bool_)
++            if token_mask.ndim == 3 and token_mask.shape[1] == 1:
++                token_mask = token_mask[:, 0]
++
++            if "chunk_start_steps" in data:
++                chunk_starts = np.asarray(data["chunk_start_steps"], dtype=np.int32)
++            else:
++                chunk_starts = np.arange(len(action_tokens), dtype=np.int32)
++
++            chunks = min(len(chunk_starts), len(action_tokens), len(old_logprobs), len(token_mask))
++            for chunk_index in range(chunks):
++                step = int(chunk_starts[chunk_index])
++                if step >= len(states) or step >= len(returns):
++                    continue
++                examples.append(
++                    PPOExample(
++                        state=states[step],
++                        action_tokens=action_tokens[chunk_index],
++                        old_token_logprobs=old_logprobs[chunk_index],
++                        action_token_mask=token_mask[chunk_index],
++                        advantage=float(returns[step]),
++                        prompt=prompt,
++                        front_image=_optional_images(data, "front_images", step),
++                        wrist_image=_optional_images(data, "wrist_images", step),
++                    )
++                )
++                if len(examples) >= max_examples:
++                    return normalize_advantages(examples)
++    return normalize_advantages(examples)
++
++
++def make_transform(train_config: _config.TrainConfig) -> _transforms.DataTransformFn:
++    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
++    return _transforms.compose(
++        [
++            *data_config.data_transforms.inputs,
++            _transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
++            *data_config.model_transforms.inputs,
++        ]
++    )
++
++
++def transform_example(transform: _transforms.DataTransformFn, example: PPOExample) -> dict[str, Any]:
++    return transform(
++        {
++            "observation/image": example.front_image,
++            "observation/wrist_image": example.wrist_image,
++            "observation/state": example.state,
++            "prompt": example.prompt,
++        }
++    )
++
++
++def stack_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
++    return jax.tree.map(lambda *xs: np.stack(xs), *items)
++
++
++def sample_batch(
++    rng: np.random.Generator,
++    examples: list[PPOExample],
++    transform: _transforms.DataTransformFn,
++    batch_size: int,
++) -> tuple[_model.Observation, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
++    indices = rng.integers(0, len(examples), size=batch_size)
++    selected = [examples[int(index)] for index in indices]
++    raw_batch = [transform_example(transform, example) for example in selected]
++    batch = stack_batch(raw_batch)
++    observation = _model.Observation.from_dict(jax.tree.map(jnp.asarray, batch))
++    return (
++        observation,
++        jnp.asarray(np.stack([example.action_tokens for example in selected]), dtype=jnp.int32),
++        jnp.asarray(np.stack([example.old_token_logprobs for example in selected]), dtype=jnp.float32),
++        jnp.asarray(np.stack([example.action_token_mask for example in selected]), dtype=jnp.float32),
++        jnp.asarray([example.advantage for example in selected], dtype=jnp.float32),
++    )
++
++
++def init_state(
++    train_config: _config.TrainConfig,
++    rng: at.KeyArrayLike,
++    *,
++    learning_rate: float,
++    init_checkpoint: str | None,
++    init_random: bool,
++) -> training_utils.TrainState:
++    model = train_config.model.create(rng)
++    graphdef, params = nnx.split(model)
++    if not init_random:
++        if init_checkpoint is None:
++            LOGGER.info("Loading initial params from config weight_loader")
++            restored = train_config.weight_loader.load(params.to_pure_dict())
++        else:
++            params_path = init_checkpoint if str(init_checkpoint).endswith("/params") else f"{init_checkpoint}/params"
++            LOGGER.info("Loading initial params from %s", params_path)
++            restored = _model.restore_params(download.maybe_download(params_path), dtype=jnp.bfloat16)
++        params.replace_by_pure_dict(restored)
++
++    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate, weight_decay=1e-10))
++    return training_utils.TrainState(
++        step=0,
++        params=params,
++        model_def=graphdef,
++        tx=tx,
++        opt_state=tx.init(params.filter(train_config.trainable_filter)),
++        ema_decay=None,
++        ema_params=None,
++    )
++
++
++@functools.partial(jax.jit, static_argnums=0)
++def train_step(
++    train_config: _config.TrainConfig,
++    state: training_utils.TrainState,
++    observation: _model.Observation,
++    action_tokens: jnp.ndarray,
++    old_token_logprobs: jnp.ndarray,
++    action_token_mask: jnp.ndarray,
++    advantages: jnp.ndarray,
++    clip_epsilon: float,
++    kl_coef: float,
++    logprob_temperature: float,
++) -> tuple[training_utils.TrainState, dict[str, jnp.ndarray]]:
++    model = nnx.merge(state.model_def, state.params)
++    model.train()
++
++    def loss_fn(model: _model.BaseModel) -> jnp.ndarray:
++        new_token_logprobs = model.score_action_tokens(
++            observation,
++            action_tokens,
++            temperature=logprob_temperature,
++        )
++        token_mask = jax.lax.stop_gradient(action_token_mask)
++        new_logprob = jnp.sum(new_token_logprobs * token_mask, axis=-1)
++        old_logprob = jnp.sum(jax.lax.stop_gradient(old_token_logprobs) * token_mask, axis=-1)
++        advantage = jax.lax.stop_gradient(advantages)
++
++        log_ratio = jnp.clip(new_logprob - old_logprob, -20.0, 20.0)
++        ratio = jnp.exp(log_ratio)
++        unclipped = ratio * advantage
++        clipped = jnp.clip(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantage
++        policy_loss = -jnp.mean(jnp.minimum(unclipped, clipped))
++        approx_kl = 0.5 * jnp.mean(jnp.square(new_logprob - old_logprob))
++        return policy_loss + kl_coef * approx_kl
++
++    diff_state = nnx.DiffState(0, train_config.trainable_filter)
++    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model)
++    params = state.params.filter(train_config.trainable_filter)
++    updates, opt_state = state.tx.update(grads, state.opt_state, params)
++    new_params = optax.apply_updates(params, updates)
++    nnx.update(model, new_params)
++    next_state = dataclasses.replace(
++        state,
++        step=state.step + 1,
++        params=nnx.state(model),
++        opt_state=opt_state,
++    )
++    return next_state, {"loss": loss, "grad_norm": optax.global_norm(grads)}
++
++
++def save_checkpoint(save_dir: Path, state: training_utils.TrainState, train_config: _config.TrainConfig) -> None:
++    params_dir = save_dir / "params"
++    params_dir.parent.mkdir(parents=True, exist_ok=True)
++    with ocp.PyTreeCheckpointer() as checkpointer:
++        checkpointer.save(params_dir, {"params": state.params})
++    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
++    if data_config.norm_stats is not None and data_config.asset_id is not None:
++        _normalize.save(save_dir / "assets" / data_config.asset_id, data_config.norm_stats)
++
++
++def main() -> None:
++    logging.basicConfig(level=logging.INFO, force=True)
++    args = parse_args()
++    train_config = _config.get_config(args.config)
++
++    if args.make_smoke_rollout:
++        make_smoke_rollout(args.rollout_dir, action_dim=train_config.model.action_dim)
++
++    examples = load_examples(args.rollout_dir, gamma=args.gamma, max_examples=args.max_examples)
++    if not examples:
++        raise ValueError(f"No PPO rollout examples found in {args.rollout_dir}")
++
++    transform = make_transform(train_config)
++    np_rng = np.random.default_rng(args.seed)
++    observation, action_tokens, old_logprobs, token_mask, advantages = sample_batch(
++        np_rng, examples, transform, args.batch_size
++    )
++    LOGGER.info(
++        "Loaded %d PPO chunks. Batch: state=%s action_tokens=%s advantage=%s",
++        len(examples),
++        observation.state.shape,
++        action_tokens.shape,
++        np.asarray(advantages),
++    )
++
++    if args.dry_run_data:
++        return
++
++    rng = jax.random.key(args.seed)
++    state = init_state(
++        train_config,
++        rng,
++        learning_rate=args.learning_rate,
++        init_checkpoint=args.init_checkpoint,
++        init_random=args.init_random,
++    )
++
++    for step in tqdm.tqdm(range(args.num_train_steps)):
++        observation, action_tokens, old_logprobs, token_mask, advantages = sample_batch(
++            np_rng, examples, transform, args.batch_size
++        )
++        state, info = train_step(
++            train_config,
++            state,
++            observation,
++            action_tokens,
++            old_logprobs,
++            token_mask,
++            advantages,
++            args.clip_epsilon,
++            args.kl_coef,
++            args.logprob_temperature,
++        )
++        info = jax.device_get(info)
++        LOGGER.info("step=%d loss=%.6f grad_norm=%.6f", step, float(info["loss"]), float(info["grad_norm"]))
++
++    if args.save_dir is not None:
++        save_checkpoint(args.save_dir, state, train_config)
++        LOGGER.info("Saved params to %s", args.save_dir / "params")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/train_fast_reward_weighted_rollouts.py b/scripts/train_fast_reward_weighted_rollouts.py
+new file mode 100644
+index 0000000..2df8424
+--- /dev/null
++++ b/scripts/train_fast_reward_weighted_rollouts.py
+@@ -0,0 +1,354 @@
++"""Reward-weighted online rollout finetuning for pi0-FAST.
++
++This is a small smokeable learner for LeIsaac online RL experiments. It reads
++rollouts produced by ``manipulation/scripts/leisaac/scripts/training/online_pi_fast_so101.py``
++and updates pi0-FAST by weighting the action-token negative log likelihood by
++episode returns. It is not a full PPO implementation, but it exercises the
++online data path and provides a stable first RL-style update without a BC stage.
++"""
++
++from __future__ import annotations
++
++import argparse
++import dataclasses
++import functools
++import json
++import logging
++from pathlib import Path
++from typing import Any
++
++import flax.nnx as nnx
++import jax
++import jax.numpy as jnp
++import numpy as np
++import optax
++import orbax.checkpoint as ocp
++import tqdm_loggable.auto as tqdm
++
++import openpi.models.model as _model
++import openpi.shared.array_typing as at
++import openpi.shared.download as download
++import openpi.transforms as _transforms
++import openpi.training.config as _config
++import openpi.training.utils as training_utils
++
++
++LOGGER = logging.getLogger("openpi.rollout_rl")
++IMAGE_SHAPE = (224, 224, 3)
++
++
++@dataclasses.dataclass(frozen=True)
++class Example:
++    state: np.ndarray
++    action_chunk: np.ndarray
++    reward_to_go: float
++    prompt: str
++    front_image: np.ndarray
++    wrist_image: np.ndarray
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", default="pi0_fast_so101_lift_cube")
++    parser.add_argument("--rollout_dir", type=Path, required=True)
++    parser.add_argument("--init_checkpoint", default=None)
++    parser.add_argument("--save_dir", type=Path, default=None)
++    parser.add_argument("--num_train_steps", type=int, default=1)
++    parser.add_argument("--batch_size", type=int, default=1)
++    parser.add_argument("--learning_rate", type=float, default=1e-6)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--gamma", type=float, default=0.99)
++    parser.add_argument("--max_examples", type=int, default=128)
++    parser.add_argument("--make_smoke_rollout", action="store_true")
++    parser.add_argument(
++        "--dry_run_data",
++        action="store_true",
++        help="Only build and print a transformed batch; do not initialize the model.",
++    )
++    parser.add_argument(
++        "--init_random",
++        action="store_true",
++        help="Skip checkpoint loading. Useful only for pipeline smoke tests.",
++    )
++    return parser.parse_args()
++
++
++def make_smoke_rollout(rollout_dir: Path, *, action_horizon: int, action_dim: int) -> None:
++    rollout_dir.mkdir(parents=True, exist_ok=True)
++    path = rollout_dir / "episode_000000.npz"
++    if path.exists():
++        return
++
++    steps = max(action_horizon, 4)
++    states = np.zeros((steps, action_dim), dtype=np.float32)
++    actions = np.zeros((steps, action_dim), dtype=np.float32)
++    actions[:, 5] = 80.0
++    rewards = np.linspace(0.0, 1.0, steps, dtype=np.float32)
++    terminations = np.zeros((steps,), dtype=np.bool_)
++    terminations[-1] = True
++    truncations = np.zeros((steps,), dtype=np.bool_)
++    meta = {
++        "episode": 0,
++        "task": "LeIsaac-SO101-LiftCube-v0",
++        "prompt": "Lift the red cube up.",
++        "steps": int(steps),
++        "return": float(np.sum(rewards)),
++        "success": True,
++        "timeout": False,
++        "smoke": True,
++    }
++    np.savez_compressed(
++        path,
++        states=states,
++        actions_lerobot=actions,
++        rewards=rewards,
++        terminations=terminations,
++        truncations=truncations,
++        meta_json=np.asarray(json.dumps(meta), dtype=np.str_),
++    )
++
++
++def discounted_returns(rewards: np.ndarray, gamma: float) -> np.ndarray:
++    returns = np.zeros_like(rewards, dtype=np.float32)
++    running = 0.0
++    for index in range(len(rewards) - 1, -1, -1):
++        running = float(rewards[index]) + gamma * running
++        returns[index] = running
++    return returns
++
++
++def action_chunk(actions: np.ndarray, start: int, horizon: int, action_dim: int) -> np.ndarray:
++    chunk = np.zeros((horizon, action_dim), dtype=np.float32)
++    available = actions[start : start + horizon, :action_dim]
++    chunk[: len(available)] = available
++    if 0 < len(available) < horizon:
++        chunk[len(available) :] = available[-1]
++    return chunk
++
++
++def rollout_prompt(data: np.lib.npyio.NpzFile) -> str:
++    if "meta_json" not in data:
++        return "Lift the red cube up."
++    meta = json.loads(str(data["meta_json"].item()))
++    return str(meta.get("prompt") or "Lift the red cube up.")
++
++
++def load_examples(rollout_dir: Path, *, action_horizon: int, action_dim: int, gamma: float, max_examples: int) -> list[Example]:
++    examples: list[Example] = []
++    for path in sorted(rollout_dir.glob("episode_*.npz")):
++        with np.load(path, allow_pickle=True) as data:
++            states = np.asarray(data["states"], dtype=np.float32)
++            actions = np.asarray(data["actions_lerobot"], dtype=np.float32)
++            rewards = np.asarray(data["rewards"], dtype=np.float32)
++            prompt = rollout_prompt(data)
++            returns = discounted_returns(rewards, gamma)
++            front_images = data["front_images"] if "front_images" in data else None
++            wrist_images = data["wrist_images"] if "wrist_images" in data else None
++
++            steps = min(len(states), len(actions), len(rewards))
++            for step in range(steps):
++                front = (
++                    np.asarray(front_images[step], dtype=np.uint8)
++                    if front_images is not None
++                    else np.zeros(IMAGE_SHAPE, dtype=np.uint8)
++                )
++                wrist = (
++                    np.asarray(wrist_images[step], dtype=np.uint8)
++                    if wrist_images is not None
++                    else np.zeros(IMAGE_SHAPE, dtype=np.uint8)
++                )
++                examples.append(
++                    Example(
++                        state=states[step, :action_dim],
++                        action_chunk=action_chunk(actions, step, action_horizon, action_dim),
++                        reward_to_go=float(returns[step]),
++                        prompt=prompt,
++                        front_image=front,
++                        wrist_image=wrist,
++                    )
++                )
++                if len(examples) >= max_examples:
++                    return examples
++    return examples
++
++
++def make_transform(train_config: _config.TrainConfig) -> _transforms.DataTransformFn:
++    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
++    return _transforms.compose(
++        [
++            *data_config.data_transforms.inputs,
++            _transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
++            *data_config.model_transforms.inputs,
++        ]
++    )
++
++
++def transform_example(transform: _transforms.DataTransformFn, example: Example) -> dict[str, Any]:
++    return transform(
++        {
++            "observation/image": example.front_image,
++            "observation/wrist_image": example.wrist_image,
++            "observation/state": example.state,
++            "actions": example.action_chunk,
++            "prompt": example.prompt,
++        }
++    )
++
++
++def stack_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
++    return jax.tree.map(lambda *xs: np.stack(xs), *items)
++
++
++def sample_batch(
++    rng: np.random.Generator,
++    examples: list[Example],
++    transform: _transforms.DataTransformFn,
++    batch_size: int,
++) -> tuple[_model.Observation, jnp.ndarray, jnp.ndarray]:
++    indices = rng.integers(0, len(examples), size=batch_size)
++    raw_batch = [transform_example(transform, examples[int(index)]) for index in indices]
++    weights = np.asarray([examples[int(index)].reward_to_go for index in indices], dtype=np.float32)
++    if float(np.std(weights)) > 1e-6:
++        weights = (weights - float(np.mean(weights))) / (float(np.std(weights)) + 1e-6)
++    elif float(np.max(np.abs(weights))) > 1e-6:
++        weights = weights / (float(np.max(np.abs(weights))) + 1e-6)
++    else:
++        weights = np.ones_like(weights)
++
++    batch = stack_batch(raw_batch)
++    observation = _model.Observation.from_dict(jax.tree.map(jnp.asarray, batch))
++    actions = jnp.asarray(batch["actions"], dtype=jnp.float32)
++    return observation, actions, jnp.asarray(weights, dtype=jnp.float32)
++
++
++def init_state(
++    train_config: _config.TrainConfig,
++    rng: at.KeyArrayLike,
++    *,
++    learning_rate: float,
++    init_checkpoint: str | None,
++    init_random: bool,
++) -> training_utils.TrainState:
++    model = train_config.model.create(rng)
++    graphdef, params = nnx.split(model)
++    if not init_random:
++        if init_checkpoint is None:
++            LOGGER.info("Loading initial params from config weight_loader")
++            restored = train_config.weight_loader.load(params.to_pure_dict())
++        else:
++            params_path = init_checkpoint if str(init_checkpoint).endswith("/params") else f"{init_checkpoint}/params"
++            LOGGER.info("Loading initial params from %s", params_path)
++            restored = _model.restore_params(download.maybe_download(params_path), dtype=jnp.bfloat16)
++        params.replace_by_pure_dict(restored)
++
++    tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate, weight_decay=1e-10))
++    return training_utils.TrainState(
++        step=0,
++        params=params,
++        model_def=graphdef,
++        tx=tx,
++        opt_state=tx.init(params.filter(train_config.trainable_filter)),
++        ema_decay=None,
++        ema_params=None,
++    )
++
++
++@functools.partial(jax.jit, static_argnums=0)
++def train_step(
++    train_config: _config.TrainConfig,
++    rng: at.KeyArrayLike,
++    state: training_utils.TrainState,
++    observation: _model.Observation,
++    actions: jnp.ndarray,
++    weights: jnp.ndarray,
++) -> tuple[training_utils.TrainState, dict[str, jnp.ndarray]]:
++    model = nnx.merge(state.model_def, state.params)
++    model.train()
++
++    def loss_fn(model: _model.BaseModel) -> jnp.ndarray:
++        per_example_loss = model.compute_loss(rng, observation, actions, train=True)
++        return jnp.mean(per_example_loss * jax.lax.stop_gradient(weights))
++
++    diff_state = nnx.DiffState(0, train_config.trainable_filter)
++    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model)
++    params = state.params.filter(train_config.trainable_filter)
++    updates, opt_state = state.tx.update(grads, state.opt_state, params)
++    new_params = optax.apply_updates(params, updates)
++    nnx.update(model, new_params)
++    next_state = dataclasses.replace(
++        state,
++        step=state.step + 1,
++        params=nnx.state(model),
++        opt_state=opt_state,
++    )
++    return next_state, {"loss": loss, "grad_norm": optax.global_norm(grads)}
++
++
++def save_params(save_dir: Path, state: training_utils.TrainState) -> None:
++    params_dir = save_dir / "params"
++    params_dir.parent.mkdir(parents=True, exist_ok=True)
++    with ocp.PyTreeCheckpointer() as checkpointer:
++        checkpointer.save(params_dir, {"params": state.params})
++
++
++def main() -> None:
++    logging.basicConfig(level=logging.INFO, force=True)
++    args = parse_args()
++    train_config = _config.get_config(args.config)
++
++    if args.make_smoke_rollout:
++        make_smoke_rollout(
++            args.rollout_dir,
++            action_horizon=train_config.model.action_horizon,
++            action_dim=train_config.model.action_dim,
++        )
++
++    examples = load_examples(
++        args.rollout_dir,
++        action_horizon=train_config.model.action_horizon,
++        action_dim=train_config.model.action_dim,
++        gamma=args.gamma,
++        max_examples=args.max_examples,
++    )
++    if not examples:
++        raise ValueError(f"No rollout examples found in {args.rollout_dir}")
++
++    transform = make_transform(train_config)
++    np_rng = np.random.default_rng(args.seed)
++    observation, actions, weights = sample_batch(np_rng, examples, transform, args.batch_size)
++    LOGGER.info(
++        "Loaded %d examples. Batch: state=%s actions=%s tokens=%s weights=%s",
++        len(examples),
++        observation.state.shape,
++        actions.shape,
++        observation.tokenized_prompt.shape if observation.tokenized_prompt is not None else None,
++        np.asarray(weights),
++    )
++
++    if args.dry_run_data:
++        return
++
++    rng = jax.random.key(args.seed)
++    init_rng, train_rng = jax.random.split(rng)
++    state = init_state(
++        train_config,
++        init_rng,
++        learning_rate=args.learning_rate,
++        init_checkpoint=args.init_checkpoint,
++        init_random=args.init_random,
++    )
++
++    for step in tqdm.tqdm(range(args.num_train_steps)):
++        observation, actions, weights = sample_batch(np_rng, examples, transform, args.batch_size)
++        step_rng = jax.random.fold_in(train_rng, step)
++        state, info = train_step(train_config, step_rng, state, observation, actions, weights)
++        info = jax.device_get(info)
++        LOGGER.info("step=%d loss=%.6f grad_norm=%.6f", step, float(info["loss"]), float(info["grad_norm"]))
++
++    if args.save_dir is not None:
++        save_params(args.save_dir, state)
++        LOGGER.info("Saved params to %s", args.save_dir / "params")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/openpi/training/so101_config.py b/src/openpi/training/so101_config.py
+new file mode 100644
+index 0000000..cdb51f3
+--- /dev/null
++++ b/src/openpi/training/so101_config.py
+@@ -0,0 +1,157 @@
++"""OpenPI config for pi0-FAST on LeIsaac SO-101 LiftCube."""
++
++from __future__ import annotations
++
++import dataclasses
++import pathlib
++from collections.abc import Sequence
++
++import einops
++import numpy as np
++from typing_extensions import override
++
++import openpi.models.model as _model
++import openpi.models.pi0_fast as pi0_fast
++import openpi.training.weight_loaders as weight_loaders
++import openpi.transforms as _transforms
++from openpi.training.config import (
++    AssetsConfig,
++    DataConfig,
++    DataConfigFactory,
++    ModelTransformFactory,
++    TrainConfig,
++)
++
++
++def so101_norm_stats() -> dict[str, _transforms.NormStats]:
++    """Simple SO-101 motor-unit normalization for state and action."""
++
++    low = np.asarray([-100.0, -100.0, -100.0, -100.0, -100.0, 0.0], dtype=np.float32)
++    high = np.asarray([100.0, 100.0, 100.0, 100.0, 100.0, 100.0], dtype=np.float32)
++    mean = (low + high) / 2.0
++    std = np.maximum((high - low) / 4.0, 1e-6).astype(np.float32)
++    stats = _transforms.NormStats(mean=mean, std=std, q01=low, q99=high)
++    return {"state": stats, "actions": stats}
++
++
++def _parse_image(image: np.ndarray) -> np.ndarray:
++    image = np.asarray(image)
++    if np.issubdtype(image.dtype, np.floating):
++        image = (255 * image).astype(np.uint8)
++    if image.ndim == 3 and image.shape[0] in (1, 3, 4):
++        image = einops.rearrange(image, "c h w -> h w c")
++    if image.ndim == 3 and image.shape[-1] == 4:
++        image = image[..., :3]
++    return image
++
++
++@dataclasses.dataclass(frozen=True)
++class SO101LiftCubeInputs(_transforms.DataTransformFn):
++    """Convert LeIsaac SO-101 observations into OpenPI model inputs."""
++
++    model_type: _model.ModelType
++
++    def __call__(self, data: dict) -> dict:
++        base_image = _parse_image(data["observation/image"])
++        wrist_image = _parse_image(data["observation/wrist_image"])
++        if self.model_type == _model.ModelType.PI0_FAST:
++            image_names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
++            images = (base_image, np.zeros_like(base_image), wrist_image)
++            image_masks = (np.True_, np.True_, np.True_)
++        else:
++            image_names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
++            images = (base_image, wrist_image, np.zeros_like(base_image))
++            image_masks = (np.True_, np.True_, np.False_)
++
++        inputs = {
++            "state": np.asarray(data["observation/state"], dtype=np.float32),
++            "image": dict(zip(image_names, images, strict=True)),
++            "image_mask": dict(zip(image_names, image_masks, strict=True)),
++        }
++        if "actions" in data:
++            inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
++        if "prompt" in data:
++            inputs["prompt"] = data["prompt"]
++        return inputs
++
++
++@dataclasses.dataclass(frozen=True)
++class SO101LiftCubeOutputs(_transforms.DataTransformFn):
++    """Keep OpenPI outputs as 6D SO-101 motor-unit actions."""
++
++    def __call__(self, data: dict) -> dict:
++        actions = np.asarray(data["actions"], dtype=np.float32)[..., :6]
++        low = np.asarray([-100.0, -100.0, -100.0, -100.0, -100.0, 0.0], dtype=np.float32)
++        high = np.asarray([100.0, 100.0, 100.0, 100.0, 100.0, 100.0], dtype=np.float32)
++        return {**data, "actions": np.clip(actions, low, high)}
++
++
++@dataclasses.dataclass(frozen=True)
++class LeRobotSO101LiftCubeDataConfig(DataConfigFactory):
++    """OpenPI data config for LeIsaac SO-101 LiftCube."""
++
++    default_prompt: str | None = "Lift the red cube up."
++    action_sequence_keys: Sequence[str] = ("action",)
++
++    @override
++    def create(
++        self,
++        assets_dirs: pathlib.Path,
++        model_config: _model.BaseModelConfig,
++    ) -> DataConfig:
++        repack_transform = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/image": "observation.images.front",
++                        "observation/wrist_image": "observation.images.wrist",
++                        "observation/state": "observation.state",
++                        "actions": "action",
++                        "prompt": "task",
++                    }
++                )
++            ]
++        )
++        data_transforms = _transforms.Group(
++            inputs=[SO101LiftCubeInputs(model_type=model_config.model_type)],
++            outputs=[SO101LiftCubeOutputs()],
++        )
++        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(
++            model_config
++        )
++        base = self.create_base_config(assets_dirs, model_config)
++        return dataclasses.replace(
++            base,
++            norm_stats=base.norm_stats or so101_norm_stats(),
++            repack_transforms=repack_transform,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=self.action_sequence_keys,
++        )
++
++
++def get_so101_configs() -> list[TrainConfig]:
++    lora_model = pi0_fast.Pi0FASTConfig(
++        action_dim=6,
++        action_horizon=10,
++        max_token_len=180,
++        paligemma_variant="gemma_2b_lora",
++    )
++    return [
++        TrainConfig(
++            name="pi0_fast_so101_lift_cube",
++            model=lora_model,
++            data=LeRobotSO101LiftCubeDataConfig(
++                repo_id="so101_lift_cube_rl",
++                base_config=DataConfig(prompt_from_task=False),
++                assets=AssetsConfig(asset_id="so101_lift_cube_rl"),
++            ),
++            weight_loader=weight_loaders.CheckpointWeightLoader(
++                "gs://openpi-assets/checkpoints/pi0_fast_base/params"
++            ),
++            num_train_steps=30_000,
++            batch_size=32,
++            freeze_filter=lora_model.get_freeze_filter(),
++            ema_decay=None,
++        )
++    ]
