@@ -40,6 +40,8 @@ ENV PIP_CONFIG_FILE=/dev/null
 ENV PIP_TRUSTED_HOST="mirrors.aliyun.com files.pythonhosted.org download.pytorch.org"
 # Pip-installed CLIs (huggingface-cli, hf, …) live next to Isaac Sim's Python.
 ENV PATH="/isaac-sim/kit/python/bin:${PATH}"
+# Force RLinf's isaac_sim/python.sh wrapper to use Isaac Sim's Python runtime.
+ENV PYTHONEXE=/isaac-sim/kit/python/bin/python3
 WORKDIR ${PROJECT_DIR}
 
 # ---- Copy project files ----
@@ -101,6 +103,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     mkdir -p /isaac-sim/kit/python/lib/assets && \
     cp -r ${PROJECT_DIR}/scripts/leisaac/assets/* /isaac-sim/kit/python/lib/assets/
 
+# ---- RLinf runtime deps ----
+# RLinf source is mounted at runtime to /workspace/RLinf via docker-compose.
+# Install the core Python dependencies here so RLinf configs/train entrypoints run
+# without manual pip steps inside the container.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /isaac-sim/python.sh -m pip install \
+      "omegaconf>=2.3.0,<2.5.0" \
+      "hydra-core>=1.3.0,<1.5.0" \
+      "ray[default]>=2.47.0" \
+      "tensorboard>=2.15.0" \
+      "scipy>=1.10.0" \
+      "einops>=0.7.0" \
+      "nvitop>=1.3.0" \
+      "timm>=1.0.0" \
+      "gymnasium>=0.29.0" \
+      "gym==0.23.1"
+
 # ---- Install the isaac_so_arm101 extension ----
 # Registers Gym environments (Isaac-SO-ARM101-Lift-Cube-v0, etc.)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -109,7 +128,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     echo "Extension installed via PYTHONPATH (pip editable install not critical)"
 
 # ---- Ensure extension is on PYTHONPATH ----
-ENV PYTHONPATH="${PROJECT_DIR}/src:${PROJECT_DIR}/isaac_so_arm101/src:${PYTHONPATH}"
+ENV PYTHONPATH="${PROJECT_DIR}/src:${PROJECT_DIR}/isaac_so_arm101/src:/workspace/RLinf:${PYTHONPATH}"
 
 # ---- Convenience aliases ----
 RUN echo "export PROJECT_DIR=${PROJECT_DIR}" >> /root/.bashrc && \

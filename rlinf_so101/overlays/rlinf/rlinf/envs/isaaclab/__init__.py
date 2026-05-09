@@ -18,6 +18,15 @@ from .tasks.stack_cube import IsaaclabStackCubeEnv
 REGISTER_ISAACLAB_ENVS = {
     "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0": IsaaclabStackCubeEnv,
     "LeIsaac-SO101-LiftCube-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-Train-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-Collect-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-AwkwardReset-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-AwkwardReset-Train-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-AwkwardReset-Collect-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-Vision-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-Vision-Train-v0": IsaaclabSO101LiftCubeEnv,
+    "LeIsaac-SO101-LiftCube-RewardDense-Vision-Collect-v0": IsaaclabSO101LiftCubeEnv,
 }
 
 __all__ = [list(REGISTER_ISAACLAB_ENVS.keys())]

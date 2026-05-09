@@ -15,6 +15,10 @@ RUN command -v uv >/dev/null 2>&1 || /opt/venv/gr00t/bin/python -m pip install -
 COPY scripts/leisaac/source/leisaac /opt/leisaac
 RUN /opt/venv/gr00t/bin/python -m pip install --no-cache-dir -e /opt/leisaac
 
+# Bake the SO-101 RLinf overlay into the image for Vast-style custom container
+# launches where the image itself is the runtime environment.
+COPY rlinf_so101/overlays/rlinf/ /workspace/RLinf/
+
 ENV PYTHONPATH=/workspace/RLinf:/opt/leisaac
 ENV EMBODIED_PATH=/workspace/RLinf/examples/embodiment
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

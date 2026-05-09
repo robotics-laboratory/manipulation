@@ -144,16 +144,49 @@ class IsaaclabSO101LiftCubeEnv(IsaaclabBaseEnv):
 
     def _wrap_obs(self, obs):
         policy_obs = obs["policy"]
+        record_obs = obs.get("record", None)
         instruction = [self.task_description] * self.num_envs
-        states = self._convert_leisaac_state_to_lerobot(policy_obs["joint_pos"])
+
+        # Prefer record observations when available (collection/dense variants) since
+        # they contain raw camera frames and absolute joint positions.
+        if isinstance(record_obs, dict):
+            joint_pos = record_obs.get("joint_pos_abs", record_obs.get("joint_pos", None))
+            front = record_obs.get("front", None)
+            wrist = record_obs.get("wrist", None)
+        elif isinstance(policy_obs, dict):
+            joint_pos = policy_obs.get("joint_pos", None)
+            front = policy_obs.get("front", None)
+            wrist = policy_obs.get("wrist", None)
+        else:
+            joint_pos, front, wrist = None, None, None
+
+        if joint_pos is None:
+            if not torch.is_tensor(policy_obs):
+                raise TypeError(
+                    "Expected `obs['policy']` to be either dict or tensor, "
+                    f"got {type(policy_obs)}."
+                )
+            # Dense train envs may return concatenated state vectors without camera keys.
+            # Use the first six joint dimensions as SO101 state fallback.
+            joint_pos = policy_obs[..., : len(SO101_JOINT_NAMES)]
+
+        states = self._convert_leisaac_state_to_lerobot(joint_pos)
+
+        if front is None or wrist is None:
+            # Some dense reward configs disable raw camera observations. Provide
+            # placeholder frames so SmolVLA input contract stays valid.
+            h = int(self.cfg.init_params.front_cam.height)
+            w = int(self.cfg.init_params.front_cam.width)
+            front = torch.zeros((self.num_envs, h, w, 3), dtype=torch.uint8, device=states.device)
+            wrist = torch.zeros((self.num_envs, h, w, 3), dtype=torch.uint8, device=states.device)
 
         env_obs = {
-            "main_images": policy_obs["front"],
+            "main_images": front,
             "task_descriptions": instruction,
             "states": states,
-            "wrist_images": policy_obs["wrist"],
+            "wrist_images": wrist,
         }
-        if "ee_frame_state" in policy_obs:
+        if isinstance(policy_obs, dict) and "ee_frame_state" in policy_obs:
             env_obs["ee_frame_states"] = policy_obs["ee_frame_state"]
         return env_obs
 
