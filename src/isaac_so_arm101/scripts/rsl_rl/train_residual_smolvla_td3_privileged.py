@@ -171,7 +171,7 @@ class LocalSmolVLAPolicy:
         "gripper.pos",
     )
 
-    def __init__(self, pretrained_name_or_path: str, device: str):
+    def __init__(self, pretrained_name_or_path: str, device: str, actions_per_chunk: int):
         try:
             from lerobot.policies.factory import make_pre_post_processors
             from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -184,7 +184,10 @@ class LocalSmolVLAPolicy:
 
         self._build_inference_frame = build_inference_frame
         self.device = torch.device(device)
+        self.actions_per_chunk = int(actions_per_chunk)
         self.policy = SmolVLAPolicy.from_pretrained(pretrained_name_or_path).to(self.device).eval()
+        if hasattr(self.policy, "config") and hasattr(self.policy.config, "n_action_steps"):
+            self.policy.config.n_action_steps = self.actions_per_chunk
         preprocess, postprocess = make_pre_post_processors(
             self.policy.config,
             pretrained_name_or_path,
@@ -214,8 +217,13 @@ class LocalSmolVLAPolicy:
         }
 
     def reset(self) -> None:
-        # Keep interface compatible with service policy client.
-        return
+        # Match service-policy episodic reset semantics as closely as possible.
+        if hasattr(self.policy, "reset") and callable(self.policy.reset):
+            self.policy.reset()
+        if hasattr(self.preprocess, "reset") and callable(self.preprocess.reset):
+            self.preprocess.reset()
+        if hasattr(self.postprocess, "reset") and callable(self.postprocess.reset):
+            self.postprocess.reset()
 
     def get_action(self, observation_dict: dict) -> torch.Tensor:
         front = observation_dict["front"][0].detach().cpu().numpy().astype(np.uint8)
@@ -241,6 +249,8 @@ class LocalSmolVLAPolicy:
         action = self.postprocess(action)
         if action.ndim == 1:
             action = action.unsqueeze(0)
+        if action.ndim >= 2 and action.shape[0] > self.actions_per_chunk:
+            action = action[: self.actions_per_chunk]
         action = convert_lerobot_action_to_leisaac(action)
         return torch.from_numpy(action[:, None, :])
 
@@ -351,6 +361,7 @@ def _build_policy_client(env: ManagerBasedRLEnv, task_type: str):
         return LocalSmolVLAPolicy(
             pretrained_name_or_path=args_cli.policy_checkpoint_path,
             device=args_cli.device,
+            actions_per_chunk=args_cli.policy_action_horizon,
         )
     print(f"[INFO] Base policy backend: service ({args_cli.policy_host}:{args_cli.policy_port}).")
     return LeRobotServicePolicyClient(
