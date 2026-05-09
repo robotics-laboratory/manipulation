@@ -83,7 +83,7 @@ python scripts/evaluation/policy_inference.py \
     --policy_host=localhost \
     --policy_port=5555 \
     --policy_timeout_ms=5000 \
-    --policy_action_horizon=16 \
+    --policy_action_horizon=1 \
     --policy_language_instruction="Pick up the orange and place it on the plate" \
     --device=cuda \
     --enable_cameras
@@ -109,7 +109,7 @@ python scripts/evaluation/policy_inference.py \
 
 - `--policy_timeout_ms`: Timeout for the policy server in milliseconds (default: `5000`).
 
-- `--policy_action_horizon`: Number of actions to predict per inference (default: `16`).
+- `--policy_action_horizon`: Number of actions to predict per inference (default: `1`).
 
 - `--policy_language_instruction`: Language instruction for the policy (e.g., task description in natural language).
 

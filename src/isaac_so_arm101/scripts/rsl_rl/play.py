@@ -34,6 +34,21 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--no_export_policy",
+    action="store_true",
+    default=False,
+    help="Skip JIT/ONNX export after load. Use when the checkpoint lives on a read-only volume (e.g. good_checkpoints:ro).",
+)
+parser.add_argument(
+    "--policy_export_dir",
+    type=str,
+    default=None,
+    help=(
+        "Directory for policy.pt / policy.onnx export. "
+        "Defaults to <checkpoint_dir>/exported. Ignored if --no_export_policy."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -169,10 +184,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         normalizer = None
 
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    # export policy to onnx/jit (optional; read-only checkpoint dirs need --no_export_policy or --policy_export_dir)
+    if args_cli.no_export_policy:
+        print("[INFO] Skipping policy JIT/ONNX export (--no_export_policy).")
+    else:
+        if args_cli.policy_export_dir:
+            export_model_dir = os.path.abspath(os.path.expanduser(args_cli.policy_export_dir))
+        else:
+            export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        os.makedirs(export_model_dir, exist_ok=True)
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 
