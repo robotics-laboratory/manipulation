@@ -18,6 +18,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -73,6 +74,19 @@ parser.add_argument(
     default=False,
     help="Also evaluate base policy in this run. Disabled by default for faster residual-only checks.",
 )
+parser.add_argument(
+    "--record_video",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Record per-episode eval videos from record.front camera.",
+)
+parser.add_argument(
+    "--video_dir",
+    type=str,
+    default="logs/eval_videos",
+    help="Directory where eval videos are saved when --record_video is enabled.",
+)
+parser.add_argument("--video_fps", type=int, default=25, help="FPS for saved evaluation videos.")
 
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -213,10 +227,9 @@ def _configure_lerobot_absolute_joint_actions(env_cfg, task_type: str) -> None:
 def _restore_dense_reward_setup(env_cfg, task: str) -> None:
     if "LiftCube" not in task:
         return
-    from leisaac.tasks.lift_cube.lift_cube_env_cfg import LiftCubeRewardDenseCurriculumCfg, LiftCubeRewardDenseRewardsCfg
-
-    env_cfg.rewards = LiftCubeRewardDenseRewardsCfg()
-    env_cfg.curriculum = LiftCubeRewardDenseCurriculumCfg()
+    dense_cfg = parse_env_cfg("LeIsaac-SO101-LiftCube-RewardDense-v0", device=args_cli.device, num_envs=1)
+    env_cfg.rewards = dense_cfg.rewards
+    env_cfg.curriculum = dense_cfg.curriculum
 
 
 def _ensure_collect_env_terminations(env_cfg, task: str) -> None:
@@ -304,6 +317,30 @@ def _build_base_obs(obs_dict: dict, task_description: str) -> dict:
     }
 
 
+def _extract_front_frame_np(obs_dict: dict) -> np.ndarray:
+    rec = obs_dict["record"]
+    front = rec["front"][0]
+    frame = front.detach().cpu().numpy() if torch.is_tensor(front) else np.asarray(front)
+    if frame.ndim != 3:
+        raise RuntimeError(f"Unexpected front frame shape: {tuple(frame.shape)}")
+    if frame.dtype != np.uint8:
+        if np.issubdtype(frame.dtype, np.floating):
+            frame = np.clip(frame, 0.0, 1.0) * 255.0 if frame.max() <= 1.0 else np.clip(frame, 0.0, 255.0)
+        frame = frame.astype(np.uint8)
+    return frame
+
+
+def _save_episode_video(frames: list[np.ndarray], video_path: Path, fps: int) -> None:
+    if len(frames) == 0:
+        return
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import imageio.v2 as imageio
+    except Exception as exc:
+        raise RuntimeError("Video recording requires imageio. Install it or run without --record_video.") from exc
+    imageio.mimwrite(str(video_path), frames, fps=max(1, int(fps)))
+
+
 def _get_action_bounds(env: ManagerBasedRLEnv, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     action_space = env.single_action_space
     low = torch.as_tensor(action_space.low, dtype=torch.float32, device=device)
@@ -343,6 +380,9 @@ def _run_eval(
     prompt: str,
     use_residual: bool,
     success_height_threshold: float,
+    record_video: bool,
+    video_dir: str,
+    video_fps: int,
 ) -> EvalSummary:
     success_count = 0
     returns: list[float] = []
@@ -353,6 +393,9 @@ def _run_eval(
         obs_dict, _ = sim_env.reset()
         if hasattr(policy, "reset"):
             policy.reset()
+        video_frames: list[np.ndarray] = []
+        if record_video:
+            video_frames.append(_extract_front_frame_np(obs_dict))
         ep_return = 0.0
         ep_max_height = -1e9
         success = False
@@ -373,6 +416,8 @@ def _run_eval(
             if env.cfg.dynamic_reset_gripper_effort_limit:
                 dynamic_reset_gripper_effort_limit_sim(env, task_type)
             obs_dict, reward, terminated, truncated, _ = sim_env.step(action.unsqueeze(0))
+            if record_video:
+                video_frames.append(_extract_front_frame_np(obs_dict))
             ep_max_height = max(ep_max_height, _cube_height_above_base_m(env))
             ep_return += float(reward[0].detach().cpu().item())
             done = bool((terminated[0] | truncated[0]).detach().cpu().item())
@@ -392,6 +437,11 @@ def _run_eval(
                 f"max_height_above_base_m={ep_max_height:.4f} final_height_above_base_m={final_height:.4f} "
                 f"success_by_height={int(success_by_height)}"
             )
+        if record_video:
+            video_path = Path(video_dir) / f"{label}_ep{ep + 1:03d}_success{int(success)}.mp4"
+            _save_episode_video(video_frames, video_path=video_path, fps=video_fps)
+            if args_cli.print_episode_debug:
+                print(f"[EVAL:{label}] saved_video={video_path}")
     return EvalSummary(
         sr=float(success_count / max(args_cli.num_episodes, 1)),
         ret=float(np.mean(returns) if returns else 0.0),
@@ -448,7 +498,8 @@ def main() -> None:
     print(
         f"[INFO] Eval config: task={args_cli.task}, episodes={args_cli.num_episodes}, "
         f"state_source={state_source}, residual_scale={residual_scale:.3f}, skip_teleop={skip_teleop}, "
-        f"eval_base={args_cli.eval_base}, success_height_threshold={success_height_threshold:.3f}"
+        f"eval_base={args_cli.eval_base}, success_height_threshold={success_height_threshold:.3f}, "
+        f"record_video={args_cli.record_video}, video_dir={args_cli.video_dir}, video_fps={args_cli.video_fps}"
     )
 
     base: EvalSummary | None = None
@@ -467,6 +518,9 @@ def main() -> None:
             prompt=prompt,
             use_residual=False,
             success_height_threshold=success_height_threshold,
+            record_video=args_cli.record_video,
+            video_dir=args_cli.video_dir,
+            video_fps=args_cli.video_fps,
         )
     residual = _run_eval(
         sim_env=sim_env,
@@ -482,6 +536,9 @@ def main() -> None:
         prompt=prompt,
         use_residual=True,
         success_height_threshold=success_height_threshold,
+        record_video=args_cli.record_video,
+        video_dir=args_cli.video_dir,
+        video_fps=args_cli.video_fps,
     )
 
     if base is not None:

@@ -40,6 +40,13 @@ parser.add_argument(
     choices=["resfit_vit", "privileged_cube_pose"],
     help="Training recipe preset. privileged_cube_pose uses full policy-state (incl. cube pose) without vision encoder.",
 )
+parser.add_argument(
+    "--reward_mode",
+    type=str,
+    default="dense",
+    choices=["dense", "sparse"],
+    help="Reward used for residual updates: dense env reward or sparse terminal success reward.",
+)
 parser.add_argument("--task", type=str, default="LeIsaac-SO101-LiftCube-RewardDense-Collect-v0")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--total_steps", type=int, default=250_000)
@@ -54,7 +61,7 @@ parser.add_argument(
 parser.add_argument(
     "--warmup_noise_scale",
     type=float,
-    default=0.2,
+    default=0.05,
     help="Uniform action noise scale during warmup; applied as base_action + U[-s, s].",
 )
 parser.add_argument("--batch_size", type=int, default=256)
@@ -80,7 +87,7 @@ parser.add_argument(
     default=True,
     help="Add TD3 target policy smoothing noise on residual target actions.",
 )
-parser.add_argument("--residual_scale", type=float, default=0.1)
+parser.add_argument("--residual_scale", type=float, default=0.05)
 parser.add_argument(
     "--no_residual",
     action="store_true",
@@ -172,7 +179,7 @@ parser.add_argument("--offline_hf_config", type=str, default=None)
 parser.add_argument(
     "--offline_hf_cache_dir",
     type=str,
-    default=None,
+    default="logs/residual_td3/hf_cache",
     help="Directory for cached preprocessed HF transitions (includes base/next_base actions).",
 )
 parser.add_argument(
@@ -188,25 +195,6 @@ parser.add_argument(
     type=float,
     default=0.5,
     help="Fraction of each training batch drawn from offline replay.",
-)
-parser.add_argument(
-    "--reward_profile",
-    type=str,
-    default="residual_aligned",
-    choices=["dense", "residual_aligned"],
-    help="Reward profile for residual training. 'residual_aligned' emphasizes true success over dense proxies.",
-)
-parser.add_argument(
-    "--reward_align_height_threshold_m",
-    type=float,
-    default=0.20,
-    help="Lift threshold (m above robot base) used by success-aligned reward shaping.",
-)
-parser.add_argument(
-    "--reward_align_success_bonus_weight",
-    type=float,
-    default=25.0,
-    help="Weight for success-aligned height bonus term under residual_aligned profile.",
 )
 parser.add_argument("--eval_interval", type=int, default=10_000)
 parser.add_argument("--eval_episodes", type=int, default=10)
@@ -755,67 +743,14 @@ def _configure_lerobot_absolute_joint_actions(env_cfg, task_type: str) -> None:
 
 
 def _restore_dense_reward_setup(env_cfg) -> None:
-    """Collect env disables reward/curriculum; restore dense terms for this ablation."""
+    """Collect env disables reward/curriculum; restore from registered dense env config."""
+    if args_cli.reward_mode != "dense":
+        return
     if "LiftCube" not in args_cli.task:
         return
-    from leisaac.tasks.lift_cube.lift_cube_env_cfg import (
-        LiftCubeRewardDenseCurriculumCfg,
-        LiftCubeRewardDenseRewardsCfg,
-    )
-
-    env_cfg.rewards = LiftCubeRewardDenseRewardsCfg()
-    env_cfg.curriculum = LiftCubeRewardDenseCurriculumCfg()
-
-
-def _apply_residual_aligned_reward_profile(env_cfg) -> None:
-    """Retune dense terms so residual learning optimizes true task success instead of proxy plateaus."""
-    if "LiftCube" not in args_cli.task or args_cli.reward_profile != "residual_aligned":
-        return
-
-    rewards = getattr(env_cfg, "rewards", None)
-    if rewards is None:
-        return
-
-    h_thresh = float(args_cli.reward_align_height_threshold_m)
-
-    # Keep early shaping signals, but reduce their dominance.
-    if hasattr(rewards, "reach_cube"):
-        rewards.reach_cube.weight = 0.75
-    if hasattr(rewards, "grasp_cube"):
-        rewards.grasp_cube.weight = 1.5
-    if hasattr(rewards, "gripper_action_rate"):
-        rewards.gripper_action_rate.weight = -1.0e-3
-
-    # Align vertical progress and success bonus to the same geometric threshold.
-    if hasattr(rewards, "lift_cube"):
-        rewards.lift_cube.weight = 12.0
-        if isinstance(rewards.lift_cube.params, dict):
-            rewards.lift_cube.params["target_height_delta"] = h_thresh
-
-    if hasattr(rewards, "success_bonus"):
-        rewards.success_bonus.weight = float(args_cli.reward_align_success_bonus_weight)
-        if isinstance(rewards.success_bonus.params, dict):
-            rewards.success_bonus.params["height_threshold"] = h_thresh
-            rewards.success_bonus.params["ramp_width"] = 0.02
-
-    # Prevent harvesting "lifted-stability" rewards far below true success.
-    for term_name, target_weight in (
-        ("lifted_stillness", 0.75),
-        ("lifted_angular_stillness", 0.5),
-        ("human_lift_posture", 0.0),
-        ("xy_position_stability", 0.2),
-    ):
-        if not hasattr(rewards, term_name):
-            continue
-        term = getattr(rewards, term_name)
-        term.weight = target_weight
-        if isinstance(term.params, dict) and "lifted_height_delta" in term.params:
-            term.params["lifted_height_delta"] = h_thresh
-
-    if hasattr(rewards, "wrist_flip"):
-        rewards.wrist_flip.weight = -1.0
-    if hasattr(rewards, "excessive_lift"):
-        rewards.excessive_lift.weight = -1.5
+    dense_cfg = parse_env_cfg("LeIsaac-SO101-LiftCube-RewardDense-v0", device=args_cli.device, num_envs=1)
+    env_cfg.rewards = dense_cfg.rewards
+    env_cfg.curriculum = dense_cfg.curriculum
 
 
 def _ensure_collect_env_terminations(env_cfg) -> None:
@@ -831,6 +766,14 @@ def _ensure_collect_env_terminations(env_cfg) -> None:
         },
     )
     env_cfg.terminations.time_out = TerminationTermCfg(func=isaac_mdp.time_out, time_out=True)
+
+
+def _select_step_reward(env_reward: float, done: bool, success: bool) -> float:
+    if args_cli.reward_mode == "sparse":
+        # ResFiT-style sparse terminal reward for online replay:
+        # 1.0 only on successful terminal transitions.
+        return 1.0 if (done and success) else 0.0
+    return float(env_reward)
 
 
 def _build_policy_client(env: ManagerBasedRLEnv, task_type: str):
@@ -870,7 +813,6 @@ def _create_env(task: str, device: str) -> tuple[gym.Env, ManagerBasedRLEnv, str
     env_cfg.seed = args_cli.seed
     env_cfg.recorders = None
     _restore_dense_reward_setup(env_cfg)
-    _apply_residual_aligned_reward_profile(env_cfg)
     _ensure_collect_env_terminations(env_cfg)
     sim_env = gym.make(task, cfg=env_cfg, render_mode=None)
     return sim_env, sim_env.unwrapped, task_type
@@ -1343,10 +1285,10 @@ def _evaluate(
             if env.cfg.dynamic_reset_gripper_effort_limit:
                 dynamic_reset_gripper_effort_limit_sim(env, task_type)
             obs_dict, reward, terminated, truncated, _ = sim_env.step(action.unsqueeze(0))
-            ep_return += float(reward[0].detach().cpu().item())
             done = bool((terminated[0] | truncated[0]).detach().cpu().item())
+            success = bool(env.reset_terminated[0].detach().cpu().item()) if done else False
+            ep_return += _select_step_reward(float(reward[0].detach().cpu().item()), done=done, success=success)
             if done:
-                success = bool(env.reset_terminated[0].detach().cpu().item())
                 if success:
                     success_count += 1
                 break
@@ -1357,12 +1299,8 @@ def _evaluate(
 def main() -> None:
     os.makedirs(args_cli.log_dir, exist_ok=True)
     print(f"[INFO] Recipe: {args_cli.recipe}")
+    print(f"[INFO] Reward mode: {args_cli.reward_mode}")
     print(f"[INFO] Requested base policy backend: {args_cli.policy_backend}")
-    print(
-        f"[INFO] Reward profile: {args_cli.reward_profile} "
-        f"(height_threshold={args_cli.reward_align_height_threshold_m:.3f}m, "
-        f"success_bonus_w={args_cli.reward_align_success_bonus_weight:.2f})"
-    )
     print(
         f"[INFO] Residual TD3 hypers: residual_scale={args_cli.residual_scale:.3f}, "
         f"actor_lr={args_cli.actor_lr:.1e}, critic_lr={args_cli.critic_lr:.1e}, "
@@ -1429,7 +1367,7 @@ def main() -> None:
             f"params_per_camera={obs_encoder.params_per_camera:,} total={obs_encoder.params_total:,}"
         )
 
-    if len(getattr(env.reward_manager, "active_terms", [])) == 0:
+    if args_cli.reward_mode == "dense" and len(getattr(env.reward_manager, "active_terms", [])) == 0:
         raise RuntimeError(
             "No active reward terms after dense reward restoration. "
             "This ablation requires LiftCube dense reward terms to be active."
@@ -1549,9 +1487,9 @@ def main() -> None:
         if env.cfg.dynamic_reset_gripper_effort_limit:
             dynamic_reset_gripper_effort_limit_sim(env, task_type)
         next_obs_dict, reward, terminated, truncated, _ = sim_env.step(action.unsqueeze(0))
-        rew = float(reward[0].detach().cpu().item())
         done = bool((terminated[0] | truncated[0]).detach().cpu().item())
         success = bool(env.reset_terminated[0].detach().cpu().item()) if done else False
+        rew = _select_step_reward(float(reward[0].detach().cpu().item()), done=done, success=success)
 
         next_front, next_wrist, _ = _extract_record_modalities(next_obs_dict)
         next_state = _extract_residual_state(next_obs_dict)
