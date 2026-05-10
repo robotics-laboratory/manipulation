@@ -1,0 +1,41 @@
+model_type: "smolvla"
+
+# SmolVLA checkpoint path (HF local clone or exported directory).
+model_path: "/workspace/RLinf/models/SmolVLA"
+
+precision: "fp32"
+
+# Action and chunk settings (SO101 lift cube uses 6 DoF action).
+num_action_chunks: 1
+action_dim: 6
+
+# PPO training settings.
+add_value_head: True
+state_dim: 6
+hidden_dim: 256
+residual_scale: 0.2
+
+# Runtime safety defaults for SO101 in IsaacLab.
+action_low: -3.2
+action_high: 3.2
+
+# LoRA is not used for this adapter.
+is_lora: False
+lora_rank: 32
+
+smolvla:
+  model_path: ${actor.model.model_path}
+  action_dim: ${actor.model.action_dim}
+  num_action_chunks: ${actor.model.num_action_chunks}
+  add_value_head: ${actor.model.add_value_head}
+  state_dim: ${actor.model.state_dim}
+  hidden_dim: ${actor.model.hidden_dim}
+  residual_scale: ${actor.model.residual_scale}
+  action_low: ${actor.model.action_low}
+  action_high: ${actor.model.action_high}
+  log_std_init: -2.0
+  noise_method: "gaussian_fixed"
+  noise_level: 0.08
+  noise_anneal: False
+  noise_params: [0.20, 0.05, 20000]
+  policy_language_instruction: "Lift the red cube up."

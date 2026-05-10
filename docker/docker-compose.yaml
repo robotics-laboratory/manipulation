@@ -58,6 +58,10 @@ services:
       - ../output:/workspace/isaac-bridge/output
       # --- Videos recorded to the default policy_inference.py video folder ---
       - ../videos:/workspace/isaac-bridge/videos
+      # --- RLinf checkout + SO101 overlay helper scripts ---
+      # Host path is IsaacLab/RLinf (compose file lives in IsaacLab/manipulation/docker).
+      - ../../RLinf:/workspace/RLinf
+      - ../rlinf_so101:/workspace/isaac-bridge/rlinf_so101
       # --- Optional: host Isaac Lab package (use local patches, e.g. utils __init__ without eager mesh/pxr).
       # Requires repo layout: IsaacLab/manipulation/docker with ../../source/isaaclab present.
       # Uncomment if /workspace/isaaclab in the image is stale vs your host clone:

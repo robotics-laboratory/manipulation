@@ -50,3 +50,32 @@ source /workspace/RLinf/isaac_sim/setup_conda_env.sh
   runner.logger.log_path=/workspace/RLinf/logs/so101_openpi_ppo_smoke \
   actor.model.model_path=/workspace/RLinf/pi_model/RLinf-pi05-SFT-Stack-cube
 ```
+
+## Run SmolVLA SO101 PPO
+
+```bash
+source /workspace/RLinf/isaac_sim/setup_conda_env.sh
+
+/opt/venv/gr00t/bin/python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name isaaclab_so101_lift_cube_ppo_smolvla \
+  runner.max_epochs=5 \
+  runner.logger.log_path=/workspace/RLinf/logs/so101_smolvla_ppo \
+  actor.model.model_path=/workspace/RLinf/models/SmolVLA
+```
+
+## SmolVLA Smoke Run
+
+```bash
+source /workspace/RLinf/isaac_sim/setup_conda_env.sh
+
+/opt/venv/gr00t/bin/python examples/embodiment/train_embodied_agent.py \
+  --config-path /workspace/RLinf/examples/embodiment/config \
+  --config-name isaaclab_so101_lift_cube_ppo_smolvla \
+  runner.max_epochs=1 \
+  env.train.total_num_envs=1 \
+  env.train.max_steps_per_rollout_epoch=16 \
+  env.train.max_episode_steps=16 \
+  runner.logger.log_path=/workspace/RLinf/logs/so101_smolvla_smoke \
+  actor.model.model_path=/workspace/RLinf/models/SmolVLA
+```
