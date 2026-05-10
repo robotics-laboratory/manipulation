@@ -13,11 +13,22 @@ def _detect_git_root() -> Path:
         return Path(__file__).resolve().parents[4]
 
 
+def _package_assets_root() -> Path:
+    """…/scripts/leisaac/assets next to the vendored LeIsaac tree (see layout below ``source/``)."""
+    # constant.py -> .../source/leisaac/leisaac/utils/constant.py  => parents[4] == scripts/leisaac
+    return Path(__file__).resolve().parents[4] / "assets"
+
+
 def _resolve_assets_root() -> str:
-    """Return env override if provided, otherwise default assets directory."""
+    """Return env override if set; else prefer package-local assets when the lift scene exists."""
     env_root = os.environ.get("LEISAAC_ASSETS_ROOT")
     if env_root:
         return Path(env_root).expanduser().resolve().as_posix()
+
+    package_assets = _package_assets_root().resolve()
+    marker = package_assets / "scenes" / "table_with_cube" / "scene.usd"
+    if marker.is_file():
+        return package_assets.as_posix()
 
     return (_detect_git_root() / "assets").resolve().as_posix()
 

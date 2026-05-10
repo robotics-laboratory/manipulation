@@ -1,0 +1,1 @@
+{"episode": 0, "task": "LeIsaac-SO101-LiftCube-v0", "prompt": "Lift the red cube up.", "steps": 32, "return": 0.0, "success": false, "timeout": false, "random_policy": false, "saved_images": false, "obs_schema": "openpi", "rollout_path": "rollouts/sft_smoke/episode_000000.npz"}
