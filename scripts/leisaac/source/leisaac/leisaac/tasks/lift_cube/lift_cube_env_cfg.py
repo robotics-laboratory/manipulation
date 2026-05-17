@@ -1,6 +1,7 @@
 import isaaclab.sim as sim_utils
 import torch
 from isaaclab.assets import AssetBaseCfg
+from isaaclab.envs import mdp as isaaclab_mdp
 from isaaclab.envs.mdp.recorders.recorders_cfg import (
     ActionStateRecorderManagerCfg,
     InitialStateRecorderCfg,
@@ -741,6 +742,30 @@ class LiftCubeRewardDenseCollectEnvCfg(LiftCubeEnvCfg):
             frame[frame_key] = obs_data[camera_key][-1].cpu().numpy()
 
         return frame
+
+
+@configclass
+class LiftCubeGuidanceSparseCollectEnvCfg(LiftCubeRewardDenseCollectEnvCfg):
+    """Collect-style env for trajectory-guidance RL with sparse task reward semantics.
+
+    This variant intentionally disables dense reward/curriculum terms so external guidance
+    reward can be combined with sparse terminal success in the trainer.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.rewards = None
+        self.curriculum = None
+        self.terminations.success = DoneTerm(
+            func=mdp.cube_height_above_base,
+            params={
+                "cube_cfg": SceneEntityCfg("cube"),
+                "robot_cfg": SceneEntityCfg("robot"),
+                "robot_base_name": "base",
+                "height_threshold": 0.20,
+            },
+        )
+        self.terminations.time_out = DoneTerm(func=isaaclab_mdp.time_out, time_out=True)
 
 
 @configclass

@@ -62,10 +62,15 @@ parser.add_argument("--step_hz", type=float, default=60.0)
 parser.add_argument("--policy_host", type=str, default="localhost")
 parser.add_argument("--policy_port", type=int, default=8080)
 parser.add_argument("--policy_timeout_ms", type=int, default=5000)
-parser.add_argument("--policy_action_horizon", type=int, default=50)
+parser.add_argument("--policy_action_horizon", type=int, default=1)
 parser.add_argument("--policy_language_instruction", type=str, default="Lift the red cube up.")
 parser.add_argument("--policy_checkpoint_path", type=str, required=True)
-parser.add_argument("--policy_must_go", action="store_true", default=False)
+parser.add_argument(
+    "--policy_must_go",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Use must-go policy mode by default. Pass --no-policy_must_go to disable.",
+)
 parser.add_argument("--policy_type", type=str, default="smolvla")
 parser.add_argument(
     "--policy_backend",

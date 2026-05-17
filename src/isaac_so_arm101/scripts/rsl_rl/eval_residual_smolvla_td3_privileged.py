@@ -15,15 +15,21 @@ This script is focused on the privileged/state residual recipe and reports:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import NormalDist
+from typing import Callable
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from isaaclab.app import AppLauncher
+from tqdm.auto import tqdm
 
 # isort: off
 import isaac_so_arm101.scripts.rsl_rl.cli_args as cli_args
@@ -33,12 +39,37 @@ import isaac_so_arm101.scripts.rsl_rl.cli_args as cli_args
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--task", type=str, default="LeIsaac-SO101-LiftCube-RewardDense-Collect-v0")
 parser.add_argument("--residual_checkpoint", type=str, required=True, help="Path to residual TD3 checkpoint (.pt).")
-parser.add_argument("--num_episodes", type=int, default=20)
+parser.add_argument(
+    "--num_episodes",
+    type=int,
+    default=None,
+    help=(
+        "Evaluation episodes. If omitted and --target_ci_half_width is set, script computes strict minimum n "
+        "so Wilson CI half-width is <= target at --confidence_level. If both are omitted, defaults to 20."
+    ),
+)
+parser.add_argument(
+    "--target_ci_half_width",
+    type=float,
+    default=None,
+    help="Optional target half-width for strict Wilson CI auto-sizing of --num_episodes.",
+)
+parser.add_argument(
+    "--confidence_level",
+    type=float,
+    default=0.95,
+    help="Confidence level used with --target_ci_half_width (default: 0.95).",
+)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--policy_checkpoint_path", type=str, default=None)
 parser.add_argument("--policy_backend", type=str, choices=["local", "service"], default=None)
-parser.add_argument("--policy_action_horizon", type=int, default=None)
-parser.add_argument("--policy_must_go", action="store_true", default=False)
+parser.add_argument("--policy_action_horizon", type=int, default=1)
+parser.add_argument(
+    "--policy_must_go",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Use must-go policy mode by default. Pass --no-policy_must_go to disable.",
+)
 parser.add_argument("--policy_host", type=str, default="localhost")
 parser.add_argument("--policy_port", type=int, default=8080)
 parser.add_argument("--policy_timeout_ms", type=int, default=5000)
@@ -57,22 +88,55 @@ parser.add_argument(
     help="Override residual state source. If omitted, use checkpoint args.",
 )
 parser.add_argument(
+    "--auto_state_source_fallback",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "If actor load fails due to shape mismatch, try alternate state_source automatically. "
+        "Disabled by default to avoid mixing incompatible setup checkpoints."
+    ),
+)
+parser.add_argument(
     "--residual_scale",
     type=float,
     default=None,
     help="Override residual scale. If omitted, use checkpoint args.",
 )
 parser.add_argument(
+    "--residual_scale_min",
+    type=float,
+    default=None,
+    help="Lower bound for applied residual action scale. If omitted, use checkpoint args or 0.01.",
+)
+parser.add_argument(
+    "--residual_scale_max",
+    type=float,
+    default=None,
+    help="Upper bound for applied residual action scale. If omitted, use checkpoint args or 0.2.",
+)
+parser.add_argument(
     "--print_episode_debug",
     action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Print per-episode return/success/max-height debug (default: False).",
+)
+parser.add_argument(
+    "--episode_progress_bar",
+    action=argparse.BooleanOptionalAction,
     default=True,
-    help="Print per-episode return/success/max-height debug.",
+    help="Show tqdm progress bar across evaluation episodes.",
 )
 parser.add_argument(
     "--eval_base",
     action=argparse.BooleanOptionalAction,
     default=False,
     help="Also evaluate base policy in this run. Disabled by default for faster residual-only checks.",
+)
+parser.add_argument(
+    "--base_only",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Evaluate only base policy (skip residual evaluation).",
 )
 parser.add_argument(
     "--record_video",
@@ -87,6 +151,12 @@ parser.add_argument(
     help="Directory where eval videos are saved when --record_video is enabled.",
 )
 parser.add_argument("--video_fps", type=int, default=25, help="FPS for saved evaluation videos.")
+parser.add_argument(
+    "--output_json",
+    type=str,
+    default=None,
+    help="Optional path to dump structured eval metrics (for post-hoc checkpoint selection).",
+)
 
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -107,6 +177,55 @@ from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim, get_
 from leisaac.utils.robot_utils import convert_leisaac_action_to_lerobot, convert_lerobot_action_to_leisaac
 
 import leisaac  # noqa: F401
+
+
+def _z_from_confidence_level(confidence_level: float) -> float:
+    if not (0.0 < confidence_level < 1.0):
+        raise ValueError(f"--confidence_level must be in (0, 1), got: {confidence_level}")
+    alpha = 1.0 - confidence_level
+    return float(NormalDist().inv_cdf(1.0 - alpha / 2.0))
+
+
+def _wilson_interval(successes: int, n: int, z: float) -> tuple[float, float]:
+    if n <= 0:
+        return 0.0, 0.0
+    phat = float(successes) / float(n)
+    z2 = z * z
+    denom = 1.0 + z2 / float(n)
+    center = (phat + z2 / (2.0 * float(n))) / denom
+    half = z * math.sqrt((phat * (1.0 - phat) + z2 / (4.0 * float(n))) / float(n)) / denom
+    low = max(0.0, center - half)
+    high = min(1.0, center + half)
+    return float(low), float(high)
+
+
+def _max_wilson_half_width_for_n(n: int, z: float) -> float:
+    if n <= 0:
+        return 1.0
+    max_half = 0.0
+    for successes in range(n + 1):
+        low, high = _wilson_interval(successes, n, z)
+        half = 0.5 * (high - low)
+        if half > max_half:
+            max_half = half
+    return float(max_half)
+
+
+def _required_episodes_strict_wilson(target_half_width: float, confidence_level: float) -> int:
+    if target_half_width <= 0.0 or target_half_width >= 1.0:
+        raise ValueError(f"--target_ci_half_width must be in (0, 1), got: {target_half_width}")
+    z = _z_from_confidence_level(confidence_level)
+    approx = int(math.ceil((z * z * 0.25) / (target_half_width * target_half_width)))
+    n = max(1, approx - 50)
+    max_n = 2_000_000
+    while n <= max_n:
+        if _max_wilson_half_width_for_n(n, z) <= target_half_width:
+            return int(n)
+        n += 1
+    raise RuntimeError(
+        f"Failed to find required episodes up to {max_n} for target_half_width={target_half_width} "
+        f"confidence_level={confidence_level}"
+    )
 
 
 class LocalSmolVLAPolicy:
@@ -189,7 +308,17 @@ class LocalSmolVLAPolicy:
 
 
 class ResidualActor(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int, num_layers: int, use_layer_norm: bool):
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        use_layer_norm: bool,
+        use_state_gate: bool,
+        gate_hidden_dim: int,
+        gate_init_bias: float,
+    ):
         super().__init__()
         layers: list[nn.Module] = []
         dim = obs_dim + action_dim
@@ -201,9 +330,175 @@ class ResidualActor(nn.Module):
             dim = hidden_dim
         layers.append(nn.Linear(dim, action_dim))
         self.net = nn.Sequential(*layers)
+        self.use_state_gate = bool(use_state_gate)
+        if self.use_state_gate:
+            gate_dim = max(1, int(gate_hidden_dim))
+            self.gate_net = nn.Sequential(
+                nn.Linear(obs_dim, gate_dim),
+                nn.ReLU(),
+                nn.Linear(gate_dim, 1),
+            )
+            nn.init.constant_(self.gate_net[-1].bias, float(gate_init_bias))
+        else:
+            self.gate_net = None
 
-    def forward(self, obs: torch.Tensor, base_action: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.net(torch.cat([obs, base_action], dim=-1)))
+    def forward(self, obs: torch.Tensor, base_action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        residual_unit = torch.tanh(self.net(torch.cat([obs, base_action], dim=-1)))
+        if self.use_state_gate and self.gate_net is not None:
+            gate = torch.sigmoid(self.gate_net(obs))
+        else:
+            gate = torch.ones((obs.shape[0], 1), device=obs.device, dtype=obs.dtype)
+        return residual_unit, gate
+
+
+class EvalVisualObsEncoder(nn.Module):
+    """Inference-only visual encoder matching train_residual_smolvla_td3_privileged setup."""
+
+    class _PatchEmbed2(nn.Module):
+        def __init__(self, embed_dim: int, patch_size: int):
+            super().__init__()
+            self.embed = nn.Sequential(
+                nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=2),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            y = self.embed(x)
+            return y.flatten(2).transpose(1, 2)
+
+    class _TransformerLayer(nn.Module):
+        def __init__(self, embed_dim: int, num_heads: int):
+            super().__init__()
+            self.norm1 = nn.LayerNorm(embed_dim)
+            self.attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+            self.norm2 = nn.LayerNorm(embed_dim)
+            self.ff = nn.Sequential(
+                nn.Linear(embed_dim, 4 * embed_dim),
+                nn.GELU(),
+                nn.Linear(4 * embed_dim, embed_dim),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            y, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)
+            x = x + y
+            x = x + self.ff(self.norm2(x))
+            return x
+
+    class _MinViT(nn.Module):
+        def __init__(self, *, image_size: int, patch_size: int, embed_dim: int, num_heads: int, depth: int):
+            super().__init__()
+            self.patch_embed = EvalVisualObsEncoder._PatchEmbed2(embed_dim=embed_dim, patch_size=patch_size)
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, image_size, image_size)
+                num_patches = int(self.patch_embed(dummy).shape[1])
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+            self.blocks = nn.Sequential(
+                *[EvalVisualObsEncoder._TransformerLayer(embed_dim=embed_dim, num_heads=num_heads) for _ in range(depth)]
+            )
+            self.norm = nn.LayerNorm(embed_dim)
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+            self.num_patches = num_patches
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.patch_embed(x)
+            x = x + self.pos_embed
+            x = self.blocks(x)
+            return self.norm(x)
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        state_dim: int,
+        vit_image_size: int,
+        vit_depth: int,
+        vit_embed_dim: int,
+        vit_num_heads: int,
+        vit_patch_size: int,
+        vit_proj_dim: int,
+        project_tokens: bool,
+    ):
+        super().__init__()
+        self.device = device
+        self.state_dim = int(state_dim)
+        self.vit_image_size = int(vit_image_size)
+        self.vit_depth = int(vit_depth)
+        self.vit_embed_dim = int(vit_embed_dim)
+        self.vit_num_heads = int(vit_num_heads)
+        self.vit_patch_size = int(vit_patch_size)
+        self.vit_proj_dim = int(vit_proj_dim)
+        self.project_tokens = bool(project_tokens)
+        self.vit_front = EvalVisualObsEncoder._MinViT(
+            image_size=self.vit_image_size,
+            patch_size=self.vit_patch_size,
+            embed_dim=self.vit_embed_dim,
+            num_heads=self.vit_num_heads,
+            depth=self.vit_depth,
+        ).to(self.device)
+        self.vit_wrist = EvalVisualObsEncoder._MinViT(
+            image_size=self.vit_image_size,
+            patch_size=self.vit_patch_size,
+            embed_dim=self.vit_embed_dim,
+            num_heads=self.vit_num_heads,
+            depth=self.vit_depth,
+        ).to(self.device)
+        self.front_proj: nn.Linear | None = None
+        self.wrist_proj: nn.Linear | None = None
+        if self.project_tokens:
+            self.front_proj = nn.Linear(self.vit_embed_dim, self.vit_proj_dim).to(self.device)
+            self.wrist_proj = nn.Linear(self.vit_embed_dim, self.vit_proj_dim).to(self.device)
+            self.output_dim = int(self.state_dim + 2 * self.vit_proj_dim)
+        else:
+            token_dim = self.vit_embed_dim * self.vit_front.num_patches
+            self.output_dim = int(self.state_dim + 2 * token_dim)
+
+    def _to_hwc_uint8(self, image) -> np.ndarray:
+        arr = image.detach().cpu().numpy() if torch.is_tensor(image) else np.asarray(image)
+        if arr.ndim == 3 and arr.shape[0] in (1, 3):
+            arr = np.transpose(arr, (1, 2, 0))
+        if arr.dtype != np.uint8:
+            if np.issubdtype(arr.dtype, np.floating):
+                arr = np.clip(arr, 0.0, 1.0) * 255.0 if arr.max() <= 1.0 else np.clip(arr, 0.0, 255.0)
+            arr = arr.astype(np.uint8)
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        return arr
+
+    def _prep_image(self, image) -> torch.Tensor:
+        arr = self._to_hwc_uint8(image)
+        x = torch.from_numpy(arr).permute(2, 0, 1).float().unsqueeze(0).to(self.device)
+        if x.shape[-2] != self.vit_image_size or x.shape[-1] != self.vit_image_size:
+            x = F.interpolate(x, size=(self.vit_image_size, self.vit_image_size), mode="bilinear", align_corners=False)
+        x = x / 255.0 if x.max() > 1.0 else x
+        return x - 0.5
+
+    def _fit_state_dim(self, state) -> torch.Tensor:
+        arr = state.detach().cpu().numpy() if torch.is_tensor(state) else np.asarray(state)
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+        out = np.zeros((self.state_dim,), dtype=np.float32)
+        n = min(self.state_dim, arr.shape[0])
+        if n > 0:
+            out[:n] = arr[:n]
+        return torch.from_numpy(out).unsqueeze(0).to(self.device)
+
+    @torch.no_grad()
+    def encode_single_no_grad(self, *, front, wrist, joint_state) -> torch.Tensor:
+        joint_t = self._fit_state_dim(joint_state)
+        front_x = self._prep_image(front)
+        wrist_x = self._prep_image(wrist)
+        front_tokens = self.vit_front(front_x)
+        wrist_tokens = self.vit_wrist(wrist_x)
+        if self.project_tokens:
+            assert self.front_proj is not None and self.wrist_proj is not None
+            front_feat = self.front_proj(front_tokens.mean(dim=1))
+            wrist_feat = self.wrist_proj(wrist_tokens.mean(dim=1))
+        else:
+            front_feat = front_tokens.flatten(1, 2)
+            wrist_feat = wrist_tokens.flatten(1, 2)
+        return torch.cat([joint_t, front_feat, wrist_feat], dim=-1).squeeze(0)
 
 
 @dataclass
@@ -212,6 +507,8 @@ class EvalSummary:
     ret: float
     mean_max_height: float
     max_max_height: float
+    successes: int
+    episodes: int
 
 
 def _configure_lerobot_absolute_joint_actions(env_cfg, task_type: str) -> None:
@@ -351,9 +648,24 @@ def _get_action_bounds(env: ManagerBasedRLEnv, device: torch.device) -> tuple[to
 
 
 def _compose_action(
-    base_action: torch.Tensor, residual_unit: torch.Tensor, residual_scale: float, low: torch.Tensor, high: torch.Tensor
+    base_action: torch.Tensor,
+    residual_unit: torch.Tensor,
+    residual_scale: float,
+    low: torch.Tensor,
+    high: torch.Tensor,
+    residual_scale_min: float,
+    residual_scale_max: float,
+    residual_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.clamp(base_action + residual_scale * residual_unit, low, high)
+    scale_min = float(min(residual_scale_min, residual_scale_max))
+    scale_max = float(max(residual_scale_min, residual_scale_max))
+    scale_cap = float(np.clip(float(residual_scale), scale_min, scale_max))
+    if residual_gate is None:
+        delta = scale_cap * residual_unit
+    else:
+        gated_scale = scale_min + (scale_cap - scale_min) * torch.clamp(residual_gate, 0.0, 1.0)
+        delta = gated_scale * residual_unit
+    return torch.clamp(base_action + delta, low, high)
 
 
 def _cube_height_above_base_m(env: ManagerBasedRLEnv) -> float:
@@ -376,7 +688,10 @@ def _run_eval(
     low: torch.Tensor,
     high: torch.Tensor,
     residual_scale: float,
+    residual_scale_min: float,
+    residual_scale_max: float,
     state_source: str,
+    state_extractor: Callable[[dict], np.ndarray],
     prompt: str,
     use_residual: bool,
     success_height_threshold: float,
@@ -389,7 +704,14 @@ def _run_eval(
     max_heights: list[float] = []
     label = "residual" if use_residual else "base"
     actor.eval()
-    for ep in range(args_cli.num_episodes):
+    ep_iter = tqdm(
+        range(args_cli.num_episodes),
+        desc=f"eval:{label}",
+        unit="ep",
+        leave=False,
+        disable=not args_cli.episode_progress_bar,
+    )
+    for ep in ep_iter:
         obs_dict, _ = sim_env.reset()
         if hasattr(policy, "reset"):
             policy.reset()
@@ -403,14 +725,25 @@ def _run_eval(
         success_by_height = False
         while simulation_app.is_running():
             ep_max_height = max(ep_max_height, _cube_height_above_base_m(env))
-            state_vec = _extract_state(obs_dict, state_source)
+            state_vec = state_extractor(obs_dict)
             state_t = torch.from_numpy(state_vec.astype(np.float32)).to(device).unsqueeze(0)
             base_obs = _build_base_obs(obs_dict, prompt)
             base_action = policy.get_action(base_obs).to(device)[0, 0, :].float()
             if use_residual:
                 with torch.no_grad():
-                    residual_unit = actor(state_t, base_action.unsqueeze(0)).squeeze(0)
-                action = _compose_action(base_action, residual_unit, residual_scale, low, high)
+                    residual_unit, residual_gate = actor(state_t, base_action.unsqueeze(0))
+                    residual_unit = residual_unit.squeeze(0)
+                    residual_gate = residual_gate.squeeze(0)
+                action = _compose_action(
+                    base_action,
+                    residual_unit,
+                    residual_scale,
+                    low,
+                    high,
+                    residual_scale_min,
+                    residual_scale_max,
+                    residual_gate,
+                )
             else:
                 action = base_action
             if env.cfg.dynamic_reset_gripper_effort_limit:
@@ -430,6 +763,7 @@ def _run_eval(
                 break
         returns.append(ep_return)
         max_heights.append(ep_max_height)
+        ep_iter.set_postfix(sr=f"{success_count / max(ep + 1, 1):.3f}", ret=f"{np.mean(returns):.3f}")
         if args_cli.print_episode_debug:
             print(
                 f"[EVAL:{label}] ep={ep + 1}/{args_cli.num_episodes} "
@@ -442,15 +776,34 @@ def _run_eval(
             _save_episode_video(video_frames, video_path=video_path, fps=video_fps)
             if args_cli.print_episode_debug:
                 print(f"[EVAL:{label}] saved_video={video_path}")
+    ep_iter.close()
     return EvalSummary(
         sr=float(success_count / max(args_cli.num_episodes, 1)),
         ret=float(np.mean(returns) if returns else 0.0),
         mean_max_height=float(np.mean(max_heights) if max_heights else 0.0),
         max_max_height=float(np.max(max_heights) if max_heights else 0.0),
+        successes=int(success_count),
+        episodes=int(args_cli.num_episodes),
     )
 
 
 def main() -> None:
+    if args_cli.num_episodes is None:
+        if args_cli.target_ci_half_width is not None:
+            args_cli.num_episodes = _required_episodes_strict_wilson(
+                target_half_width=float(args_cli.target_ci_half_width),
+                confidence_level=float(args_cli.confidence_level),
+            )
+            print(
+                "[INFO] Auto-computed strict num_episodes for Wilson CI: "
+                f"n={args_cli.num_episodes} (target_half_width={args_cli.target_ci_half_width:.4f}, "
+                f"confidence={args_cli.confidence_level:.3f})"
+            )
+        else:
+            args_cli.num_episodes = 20
+    elif args_cli.num_episodes <= 0:
+        raise ValueError(f"--num_episodes must be > 0 when provided, got: {args_cli.num_episodes}")
+
     ckpt = torch.load(args_cli.residual_checkpoint, map_location="cpu")
     ckpt_args = ckpt.get("args", {})
     if not isinstance(ckpt_args, dict):
@@ -460,15 +813,31 @@ def main() -> None:
     policy_ckpt = args_cli.policy_checkpoint_path or ckpt_args.get("policy_checkpoint_path")
     if not policy_ckpt:
         raise ValueError("--policy_checkpoint_path is required (or available in checkpoint args).")
-    action_horizon = int(args_cli.policy_action_horizon or ckpt_args.get("policy_action_horizon", 1))
+    action_horizon = int(
+        args_cli.policy_action_horizon
+        if args_cli.policy_action_horizon is not None
+        else ckpt_args.get("policy_action_horizon", 1)
+    )
     state_source = str(args_cli.state_source or ckpt_args.get("state_source", "record_joint6"))
+    obs_encoder_mode = str(ckpt_args.get("obs_encoder", "state"))
+    if obs_encoder_mode not in {"state", "vit"}:
+        obs_encoder_mode = "state"
     residual_scale = float(args_cli.residual_scale if args_cli.residual_scale is not None else ckpt_args.get("residual_scale", 0.1))
+    residual_scale_min = float(
+        args_cli.residual_scale_min if args_cli.residual_scale_min is not None else ckpt_args.get("residual_scale_min", 0.01)
+    )
+    residual_scale_max = float(
+        args_cli.residual_scale_max if args_cli.residual_scale_max is not None else ckpt_args.get("residual_scale_max", 0.2)
+    )
     skip_teleop = bool(
         args_cli.skip_teleop_device_setup
         if args_cli.skip_teleop_device_setup is not None
-        else ckpt_args.get("skip_teleop_device_setup", True)
+        else ckpt_args.get("skip_teleop_device_setup", False)
     )
     success_height_threshold = 0.20
+    if args_cli.base_only and not args_cli.eval_base:
+        print("[INFO] --base_only enabled: forcing --eval_base.")
+        args_cli.eval_base = True
 
     device = torch.device(args_cli.device)
     torch.manual_seed(args_cli.seed)
@@ -476,28 +845,100 @@ def main() -> None:
 
     sim_env, env, task_type = _create_env(args_cli.task, args_cli.device, skip_teleop=skip_teleop, seed=args_cli.seed)
     prompt = str(getattr(env.cfg, "task_description", "Lift the red cube up."))
+    print(f"[INFO] Policy checkpoint: {policy_ckpt}")
     policy = _build_policy_client(env, task_type, policy_backend, str(policy_ckpt), action_horizon)
     low, high = _get_action_bounds(env, device)
 
     obs0, _ = sim_env.reset()
     if hasattr(policy, "reset"):
         policy.reset()
-    state_dim = int(_extract_state(obs0, state_source).shape[0])
     act_dim = int(env.single_action_space.shape[0])
 
-    actor = ResidualActor(
-        obs_dim=state_dim,
-        action_dim=act_dim,
-        hidden_dim=int(ckpt_args.get("hidden_dim", 256)),
-        num_layers=int(ckpt_args.get("actor_num_layers", 2)),
-        use_layer_norm=bool(ckpt_args.get("use_layer_norm", True)),
-    ).to(device)
-    actor.load_state_dict(ckpt["actor"])
+    def _build_eval_setup(source: str) -> tuple[ResidualActor, Callable[[dict], np.ndarray], int]:
+        state_dim_local = int(_extract_state(obs0, source).shape[0])
+        obs_dim_local = state_dim_local
+        vit_encoder: EvalVisualObsEncoder | None = None
+        if obs_encoder_mode == "vit":
+            obs_encoder_state = ckpt.get("obs_encoder")
+            if not isinstance(obs_encoder_state, dict):
+                raise SystemExit(
+                    "[EVAL-LOAD-MISMATCH] Checkpoint expects obs_encoder=vit but no obs_encoder weights were found."
+                )
+            has_token_projection = any(k.startswith("front_proj.") or k.startswith("wrist_proj.") for k in obs_encoder_state.keys())
+            project_tokens = bool(ckpt_args.get("obs_vit_project_tokens", has_token_projection))
+            if has_token_projection:
+                project_tokens = True
+            vit_encoder = EvalVisualObsEncoder(
+                device=device,
+                state_dim=state_dim_local,
+                vit_image_size=int(ckpt_args.get("obs_vit_image_size", 84)),
+                vit_depth=int(ckpt_args.get("obs_vit_depth", 1)),
+                vit_embed_dim=int(ckpt_args.get("obs_vit_embed_dim", 128)),
+                vit_num_heads=int(ckpt_args.get("obs_vit_num_heads", 4)),
+                vit_patch_size=int(ckpt_args.get("obs_vit_patch_size", 8)),
+                vit_proj_dim=int(ckpt_args.get("obs_vit_proj_dim", 128)),
+                project_tokens=project_tokens,
+            ).to(device)
+            vit_encoder.load_state_dict(obs_encoder_state)
+            vit_encoder.eval()
+            obs_dim_local = int(vit_encoder.output_dim)
+
+            def _extractor(obs_dict: dict) -> np.ndarray:
+                front, wrist, _ = _extract_record_modalities(obs_dict)
+                encoded = vit_encoder.encode_single_no_grad(front=front, wrist=wrist, joint_state=_extract_state(obs_dict, source))
+                return encoded.detach().cpu().numpy().astype(np.float32).reshape(-1)
+
+        else:
+
+            def _extractor(obs_dict: dict) -> np.ndarray:
+                return _extract_state(obs_dict, source)
+
+        actor_local = ResidualActor(
+            obs_dim=obs_dim_local,
+            action_dim=act_dim,
+            hidden_dim=int(ckpt_args.get("hidden_dim", 256)),
+            num_layers=int(ckpt_args.get("actor_num_layers", 2)),
+            use_layer_norm=bool(ckpt_args.get("use_layer_norm", True)),
+            use_state_gate=bool(ckpt_args.get("use_state_gate", False)),
+            gate_hidden_dim=int(ckpt_args.get("gate_hidden_dim", 64)),
+            gate_init_bias=float(ckpt_args.get("gate_init_bias", -2.0)),
+        ).to(device)
+        return actor_local, _extractor, obs_dim_local
+
+    actor, state_extractor, state_dim = _build_eval_setup(state_source)
+    try:
+        actor.load_state_dict(ckpt["actor"])
+    except RuntimeError as exc:
+        # Keep strict behavior by default so incompatible setup checkpoints fail fast
+        # and can be skipped by the batch selector.
+        if args_cli.auto_state_source_fallback and args_cli.state_source is None:
+            alt_state_source = "policy" if state_source == "record_joint6" else "record_joint6"
+            alt_actor, alt_state_extractor, alt_state_dim = _build_eval_setup(alt_state_source)
+            alt_actor.load_state_dict(ckpt["actor"])
+            actor = alt_actor
+            state_extractor = alt_state_extractor
+            state_dim = alt_state_dim
+            state_source = alt_state_source
+            print(
+                "[INFO] Actor load mismatch resolved by auto-switching state_source to "
+                f"{state_source} (obs_encoder={obs_encoder_mode}, state_dim={state_dim})."
+            )
+        else:
+            if "size mismatch" in str(exc):
+                raise SystemExit(
+                    "[EVAL-LOAD-MISMATCH] Incompatible checkpoint for this eval setup "
+                    f"(obs_encoder={obs_encoder_mode}, state_source={state_source}, state_dim={state_dim})."
+                ) from None
+            raise exc
 
     print(f"[INFO] Loaded checkpoint: {args_cli.residual_checkpoint}")
     print(
         f"[INFO] Eval config: task={args_cli.task}, episodes={args_cli.num_episodes}, "
-        f"state_source={state_source}, residual_scale={residual_scale:.3f}, skip_teleop={skip_teleop}, "
+        f"obs_encoder={obs_encoder_mode}, state_source={state_source}, residual_state_dim={state_dim}, "
+        f"obs_vit_project_tokens={bool(ckpt_args.get('obs_vit_project_tokens', False))}, "
+        f"use_state_gate={bool(ckpt_args.get('use_state_gate', False))}, "
+        f"residual_scale={residual_scale:.3f}, residual_scale_range=[{residual_scale_min:.3f},{residual_scale_max:.3f}], "
+        f"skip_teleop={skip_teleop}, "
         f"eval_base={args_cli.eval_base}, success_height_threshold={success_height_threshold:.3f}, "
         f"record_video={args_cli.record_video}, video_dir={args_cli.video_dir}, video_fps={args_cli.video_fps}"
     )
@@ -514,7 +955,10 @@ def main() -> None:
             low=low,
             high=high,
             residual_scale=residual_scale,
+            residual_scale_min=residual_scale_min,
+            residual_scale_max=residual_scale_max,
             state_source=state_source,
+            state_extractor=state_extractor,
             prompt=prompt,
             use_residual=False,
             success_height_threshold=success_height_threshold,
@@ -522,26 +966,31 @@ def main() -> None:
             video_dir=args_cli.video_dir,
             video_fps=args_cli.video_fps,
         )
-    residual = _run_eval(
-        sim_env=sim_env,
-        env=env,
-        task_type=task_type,
-        policy=policy,
-        actor=actor,
-        device=device,
-        low=low,
-        high=high,
-        residual_scale=residual_scale,
-        state_source=state_source,
-        prompt=prompt,
-        use_residual=True,
-        success_height_threshold=success_height_threshold,
-        record_video=args_cli.record_video,
-        video_dir=args_cli.video_dir,
-        video_fps=args_cli.video_fps,
-    )
+    residual: EvalSummary | None = None
+    if not args_cli.base_only:
+        residual = _run_eval(
+            sim_env=sim_env,
+            env=env,
+            task_type=task_type,
+            policy=policy,
+            actor=actor,
+            device=device,
+            low=low,
+            high=high,
+            residual_scale=residual_scale,
+        residual_scale_min=residual_scale_min,
+        residual_scale_max=residual_scale_max,
+            state_source=state_source,
+            state_extractor=state_extractor,
+            prompt=prompt,
+            use_residual=True,
+            success_height_threshold=success_height_threshold,
+            record_video=args_cli.record_video,
+            video_dir=args_cli.video_dir,
+            video_fps=args_cli.video_fps,
+        )
 
-    if base is not None:
+    if base is not None and residual is not None:
         print(
             f"[RESULT] base_sr={base.sr:.3f} residual_sr={residual.sr:.3f} "
             f"base_ret={base.ret:.3f} residual_ret={residual.ret:.3f}"
@@ -550,11 +999,47 @@ def main() -> None:
             f"[HEIGHT] base_mean_max={base.mean_max_height:.4f}m residual_mean_max={residual.mean_max_height:.4f}m "
             f"base_global_max={base.max_max_height:.4f}m residual_global_max={residual.max_max_height:.4f}m"
         )
-    else:
+    elif residual is not None:
         print(f"[RESULT] residual_sr={residual.sr:.3f} residual_ret={residual.ret:.3f}")
         print(
             f"[HEIGHT] residual_mean_max={residual.mean_max_height:.4f}m residual_global_max={residual.max_max_height:.4f}m"
         )
+    elif base is not None:
+        print(f"[RESULT] base_sr={base.sr:.3f} base_ret={base.ret:.3f}")
+        print(f"[HEIGHT] base_mean_max={base.mean_max_height:.4f}m base_global_max={base.max_max_height:.4f}m")
+    else:
+        raise RuntimeError("Nothing evaluated: enable --eval_base or disable --base_only.")
+
+    if args_cli.output_json:
+        payload: dict[str, object] = {
+            "checkpoint": str(args_cli.residual_checkpoint),
+            "task": str(args_cli.task),
+            "num_episodes": int(args_cli.num_episodes),
+            "seed": int(args_cli.seed),
+            "mode": "base_only" if args_cli.base_only else ("base_and_residual" if args_cli.eval_base else "residual_only"),
+        }
+        if residual is not None:
+            payload["residual"] = {
+                "success_rate": float(residual.sr),
+                "successes": int(residual.successes),
+                "episodes": int(residual.episodes),
+                "mean_return": float(residual.ret),
+                "mean_max_height": float(residual.mean_max_height),
+                "max_max_height": float(residual.max_max_height),
+            }
+        if base is not None:
+            payload["base"] = {
+                "success_rate": float(base.sr),
+                "successes": int(base.successes),
+                "episodes": int(base.episodes),
+                "mean_return": float(base.ret),
+                "mean_max_height": float(base.mean_max_height),
+                "max_max_height": float(base.max_max_height),
+            }
+        output_path = Path(args_cli.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"[RESULT] wrote_json={output_path}")
 
     sim_env.close()
     simulation_app.close()

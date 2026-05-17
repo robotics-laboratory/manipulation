@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 import time
@@ -37,8 +38,12 @@ parser.add_argument(
     "--recipe",
     type=str,
     default="resfit_vit",
-    choices=["resfit_vit", "privileged_cube_pose"],
-    help="Training recipe preset. privileged_cube_pose uses full policy-state (incl. cube pose) without vision encoder.",
+    choices=["resfit_vit", "privileged_cube_pose", "guidance"],
+    help=(
+        "Training recipe preset. "
+        "privileged_cube_pose uses full policy-state (incl. cube pose) without vision encoder. "
+        "guidance enforces sparse + trajectory-guidance reward."
+    ),
 )
 parser.add_argument(
     "--reward_mode",
@@ -77,8 +82,26 @@ parser.add_argument("--tau", type=float, default=0.005)
 parser.add_argument("--policy_delay", type=int, default=2)
 parser.add_argument("--actor_lr", type=float, default=1e-6)
 parser.add_argument("--critic_lr", type=float, default=1e-4)
+parser.add_argument(
+    "--actor_lr_warmup_updates",
+    type=int,
+    default=0,
+    help="Linearly warm up actor LR over this many actor-update attempts (0 disables).",
+)
 parser.add_argument("--hidden_dim", type=int, default=256)
 parser.add_argument("--exploration_std", type=float, default=0.05)
+parser.add_argument(
+    "--exploration_std_min",
+    type=float,
+    default=None,
+    help="Final exploration std after linear decay (None keeps fixed --exploration_std).",
+)
+parser.add_argument(
+    "--exploration_std_decay_steps",
+    type=int,
+    default=0,
+    help="Linearly decay exploration std from --exploration_std to --exploration_std_min over this many env steps.",
+)
 parser.add_argument("--target_noise_std", type=float, default=0.05)
 parser.add_argument("--target_noise_clip", type=float, default=0.05)
 parser.add_argument(
@@ -87,7 +110,31 @@ parser.add_argument(
     default=True,
     help="Add TD3 target policy smoothing noise on residual target actions.",
 )
+parser.add_argument(
+    "--use_base_policy_for_warmup",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Warmup exploration mode: base_action + noise (True) or pure random action (False).",
+)
 parser.add_argument("--residual_scale", type=float, default=0.05)
+parser.add_argument(
+    "--residual_scale_min",
+    type=float,
+    default=0.01,
+    help="Lower bound for applied residual action scale.",
+)
+parser.add_argument(
+    "--residual_scale_max",
+    type=float,
+    default=0.2,
+    help="Upper bound for applied residual action scale.",
+)
+parser.add_argument(
+    "--progressive_clipping_steps",
+    type=int,
+    default=0,
+    help="Linearly ramp residual scale from 0 to --residual_scale over this many env steps (0 disables).",
+)
 parser.add_argument(
     "--no_residual",
     action="store_true",
@@ -95,7 +142,44 @@ parser.add_argument(
     help="Disable residual action contribution (runs pure base policy for sanity checks).",
 )
 parser.add_argument("--residual_reg_weight", type=float, default=1e-3)
+parser.add_argument(
+    "--use_state_gate",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Enable state-dependent gate g(s) in [0,1] for residual scaling.",
+)
+parser.add_argument(
+    "--gate_hidden_dim",
+    type=int,
+    default=64,
+    help="Hidden dimension for state-dependent residual gate MLP.",
+)
+parser.add_argument(
+    "--gate_init_bias",
+    type=float,
+    default=-2.0,
+    help="Initial bias for gate head logits (negative keeps early gate conservative).",
+)
+parser.add_argument(
+    "--actor_last_layer_init_scale",
+    type=float,
+    default=0.0,
+    help="Residual actor last-layer initialization scale (0.0 starts near base policy behavior).",
+)
+parser.add_argument(
+    "--actor_last_layer_init_distribution",
+    type=str,
+    choices=["normal", "orthogonal", "xavier_uniform"],
+    default="normal",
+    help="Initialization distribution for residual actor last layer.",
+)
 parser.add_argument("--n_step", type=int, default=5, help="n-step return horizon for TD targets.")
+parser.add_argument(
+    "--clip_q_target_to_reward_range",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Clip TD target Q to [0, 1] when using sparse reward mode.",
+)
 parser.add_argument(
     "--obs_encoder",
     type=str,
@@ -114,7 +198,13 @@ parser.add_argument(
     "--obs_vit_proj_dim",
     type=int,
     default=128,
-    help="Per-camera pooled feature dimension (state + 2*proj_dim total).",
+    help="Per-camera pooled feature dimension when token projection is enabled (state + 2*proj_dim total).",
+)
+parser.add_argument(
+    "--obs_vit_project_tokens",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Project pooled ViT tokens to compact per-camera features for faster training.",
 )
 parser.add_argument(
     "--obs_vit_image_size",
@@ -177,6 +267,27 @@ parser.add_argument("--offline_hf_dataset", type=str, default=None)
 parser.add_argument("--offline_hf_split", type=str, default="train")
 parser.add_argument("--offline_hf_config", type=str, default=None)
 parser.add_argument(
+    "--offline_use_base_policy_for_base_actions",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "Offline replay base-action mode: True uses base-policy-inferred base actions; "
+        "False reuses dataset GT actions as base actions."
+    ),
+)
+parser.add_argument(
+    "--offline_state_normalize",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Normalize residual state vectors using offline dataset stats when available.",
+)
+parser.add_argument(
+    "--offline_state_min_std",
+    type=float,
+    default=1e-3,
+    help="Lower bound on state std when building offline-derived normalizer.",
+)
+parser.add_argument(
     "--offline_hf_cache_dir",
     type=str,
     default="logs/residual_td3/hf_cache",
@@ -196,8 +307,51 @@ parser.add_argument(
     default=0.5,
     help="Fraction of each training batch drawn from offline replay.",
 )
+parser.add_argument(
+    "--sampling_strategy",
+    type=str,
+    choices=["uniform", "prioritized_replay"],
+    default="uniform",
+    help="Replay sampling strategy for online/offline buffers.",
+)
+parser.add_argument(
+    "--priority_alpha",
+    type=float,
+    default=0.6,
+    help="PER alpha exponent (used when --sampling_strategy=prioritized_replay).",
+)
+parser.add_argument(
+    "--priority_beta_start",
+    type=float,
+    default=0.4,
+    help="Initial PER beta (importance sampling correction).",
+)
+parser.add_argument(
+    "--priority_beta_end",
+    type=float,
+    default=1.0,
+    help="Final PER beta at end of training.",
+)
+parser.add_argument(
+    "--priority_eps",
+    type=float,
+    default=1e-6,
+    help="Small epsilon added to priorities for numerical stability.",
+)
 parser.add_argument("--eval_interval", type=int, default=10_000)
 parser.add_argument("--eval_episodes", type=int, default=10)
+parser.add_argument(
+    "--eval_first",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Run one evaluation pass before training starts (only when in-loop eval is enabled).",
+)
+parser.add_argument(
+    "--eval_base_during_training",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Run base-policy evaluation at eval intervals (default: False to reduce overhead).",
+)
 parser.add_argument("--save_interval", type=int, default=25_000)
 parser.add_argument("--log_interval", type=int, default=1_000)
 parser.add_argument(
@@ -210,15 +364,23 @@ parser.add_argument("--step_hz", type=float, default=60.0)
 parser.add_argument("--policy_host", type=str, default="localhost")
 parser.add_argument("--policy_port", type=int, default=8080)
 parser.add_argument("--policy_timeout_ms", type=int, default=5000)
-parser.add_argument("--policy_action_horizon", type=int, default=50)
+parser.add_argument("--policy_action_horizon", type=int, default=1)
 parser.add_argument("--policy_language_instruction", type=str, default="Lift the red cube up.")
 parser.add_argument("--policy_checkpoint_path", type=str, required=True)
-parser.add_argument("--policy_must_go", action="store_true", default=False)
+parser.add_argument(
+    "--policy_must_go",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Use must-go policy mode by default. Pass --no-policy_must_go to disable.",
+)
 parser.add_argument(
     "--skip_teleop_device_setup",
     action=argparse.BooleanOptionalAction,
-    default=True,
-    help="Skip env_cfg.use_teleop_device(...) in this trainer (avoids reset hangs in some headless Collect runs).",
+    default=False,
+    help=(
+        "Whether to skip env_cfg.use_teleop_device(...) in this trainer. "
+        "Default is False (teleop setup enabled). Pass --skip_teleop_device_setup to disable."
+    ),
 )
 parser.add_argument("--policy_type", type=str, default="smolvla")
 parser.add_argument(
@@ -228,8 +390,60 @@ parser.add_argument(
     choices=["local", "service"],
     help="Backend for base policy inference. 'local' avoids policy-server RPC overhead.",
 )
-parser.add_argument("--log_dir", type=str, default="logs/residual_td3/lift_cube_privileged")
+_DEFAULT_LOG_DIR = "logs/residual_td3/lift_cube_privileged"
+parser.add_argument(
+    "--log_dir",
+    type=str,
+    default=_DEFAULT_LOG_DIR,
+    help=(
+        "Checkpoint/log directory. If left at default, trainer auto-expands to a unique per-run path "
+        "(includes recipe and optional timestamp) to avoid overwrites."
+    ),
+)
+parser.add_argument(
+    "--log_dir_use_timestamp",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="When auto-expanding default --log_dir, append timestamp for unique run folders.",
+)
 parser.add_argument("--num_envs", type=int, default=1)
+parser.add_argument(
+    "--traj_guidance_db",
+    type=str,
+    default=None,
+    help="Directory containing trajectory_*.npz reference trajectories for guidance/reset.",
+)
+parser.add_argument(
+    "--traj_guidance_sampling",
+    type=str,
+    choices=["round_robin", "random"],
+    default="round_robin",
+    help="How to select a reference trajectory for each new episode.",
+)
+parser.add_argument("--traj_guidance_seed", type=int, default=7)
+parser.add_argument(
+    "--traj_guidance_lambda",
+    type=float,
+    default=0.5,
+    help="Overall scale multiplier for trajectory guidance reward added to task reward.",
+)
+parser.add_argument("--traj_guidance_progress_weight", type=float, default=1.0)
+parser.add_argument("--traj_guidance_xy_weight", type=float, default=0.25)
+parser.add_argument(
+    "--traj_guidance_gripper_weight",
+    type=float,
+    default=0.25,
+    help="Weight for gripper-state alignment term in trajectory guidance reward.",
+)
+parser.add_argument("--traj_guidance_xy_scale", type=float, default=0.08)
+parser.add_argument("--traj_guidance_gripper_scale", type=float, default=15.0)
+parser.add_argument("--traj_guidance_progress_power", type=float, default=1.0)
+parser.add_argument(
+    "--traj_guidance_reset_from_reference",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Reset cube pose to sampled reference initial pose each episode.",
+)
 
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -244,8 +458,31 @@ if args_cli.recipe == "privileged_cube_pose":
     args_cli.obs_train_encoder = False
     args_cli.obs_use_drq_aug = False
 
-if args_cli.num_envs != 1:
-    raise ValueError("Residual TD3 currently supports --num_envs 1 only.")
+if args_cli.recipe == "guidance":
+    # Guidance recipe is explicitly sparse + trajectory guidance.
+    args_cli.obs_encoder = "state"
+    args_cli.state_source = "policy"
+    args_cli.offline_source = "none"
+    args_cli.offline_mix_ratio = 0.0
+    args_cli.obs_train_encoder = False
+    args_cli.obs_use_drq_aug = False
+    args_cli.reward_mode = "sparse"
+    if not args_cli.traj_guidance_db:
+        raise ValueError("--traj_guidance_db is required when --recipe=guidance.")
+    if "GuidanceSparse" not in str(args_cli.task):
+        print(
+            "[INFO] Guidance recipe: overriding --task to "
+            "'LeIsaac-SO101-LiftCube-GuidanceSparse-Collect-v0'."
+        )
+        args_cli.task = "LeIsaac-SO101-LiftCube-GuidanceSparse-Collect-v0"
+
+# Any run using trajectory guidance should use sparse task reward.
+if args_cli.traj_guidance_db and args_cli.reward_mode != "sparse":
+    print(
+        "[INFO] Trajectory guidance enabled: overriding --reward_mode to 'sparse' "
+        "(sparse+guidance reward)."
+    )
+    args_cli.reward_mode = "sparse"
 
 sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
@@ -253,7 +490,7 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 from isaaclab.envs import ManagerBasedRLEnv, mdp as isaac_mdp
-from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
+from isaaclab.managers import EventTermCfg, SceneEntityCfg, TerminationTermCfg
 from isaaclab.sensors import Camera
 from isaaclab_tasks.utils import parse_env_cfg
 from leisaac.policy import LeRobotServicePolicyClient
@@ -283,12 +520,27 @@ class RateLimiter:
 
 
 class ReplayBuffer:
-    def __init__(self, action_dim: int, capacity: int, image_size: int, state_dim: int, store_images: bool = True):
+    def __init__(
+        self,
+        action_dim: int,
+        capacity: int,
+        image_size: int,
+        state_dim: int,
+        store_images: bool = True,
+        sampling_strategy: str = "uniform",
+        priority_alpha: float = 0.6,
+        priority_eps: float = 1e-6,
+    ):
         self.capacity = capacity
         self.state_dim = int(state_dim)
         self.store_images = bool(store_images)
+        self.sampling_strategy = str(sampling_strategy)
+        self.priority_alpha = float(priority_alpha)
+        self.priority_eps = float(priority_eps)
         self.ptr = 0
         self.size = 0
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.max_priority = 1.0
         self.obs_joint = np.zeros((capacity, self.state_dim), dtype=np.float32)
         replay_image_size = int(image_size) if self.store_images else 1
         self.obs_front = np.zeros((capacity, replay_image_size, replay_image_size, 3), dtype=np.uint8)
@@ -333,11 +585,17 @@ class ReplayBuffer:
         self.rew[i, 0] = rew
         self.done[i, 0] = float(done)
         self.discount[i, 0] = float(discount)
+        self.priorities[i] = float(self.max_priority)
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample_indices(self, idx: np.ndarray, device: torch.device) -> dict[str, torch.Tensor]:
-        return {
+    def sample_indices(
+        self,
+        idx: np.ndarray,
+        device: torch.device,
+        is_weight: np.ndarray | None = None,
+    ) -> dict[str, torch.Tensor]:
+        batch = {
             "obs_joint": torch.from_numpy(self.obs_joint[idx]).to(device),
             "obs_front": torch.from_numpy(self.obs_front[idx]).to(device),
             "obs_wrist": torch.from_numpy(self.obs_wrist[idx]).to(device),
@@ -351,10 +609,52 @@ class ReplayBuffer:
             "done": torch.from_numpy(self.done[idx]).to(device),
             "discount": torch.from_numpy(self.discount[idx]).to(device),
         }
+        if is_weight is None:
+            is_weight = np.ones((len(idx),), dtype=np.float32)
+        batch["is_weight"] = torch.from_numpy(np.asarray(is_weight, dtype=np.float32)[:, None]).to(device)
+        return batch
 
     def sample(self, batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
+        batch, _ = self.sample_with_indices(batch_size, device)
+        return batch
+
+    def sample_with_indices(
+        self,
+        batch_size: int,
+        device: torch.device,
+        beta: float = 1.0,
+    ) -> tuple[dict[str, torch.Tensor], np.ndarray]:
+        if self.size <= 0:
+            raise ValueError("Cannot sample from an empty replay buffer.")
+        if self.sampling_strategy == "prioritized_replay":
+            priorities = self.priorities[: self.size]
+            if priorities.sum() <= 0.0:
+                probs = np.full((self.size,), 1.0 / self.size, dtype=np.float32)
+            else:
+                scaled = np.power(priorities + self.priority_eps, self.priority_alpha)
+                probs = scaled / np.maximum(scaled.sum(), 1e-12)
+            idx = np.random.choice(self.size, size=batch_size, replace=True, p=probs)
+            weights = np.power(self.size * probs[idx], -float(beta))
+            weights = weights / np.maximum(weights.max(), 1e-12)
+            batch = self.sample_indices(idx, device, is_weight=weights.astype(np.float32))
+            return batch, idx.astype(np.int64)
         idx = np.random.randint(0, self.size, size=batch_size)
-        return self.sample_indices(idx, device)
+        batch = self.sample_indices(idx, device)
+        return batch, idx.astype(np.int64)
+
+    def update_priorities(self, idx: np.ndarray, priorities: np.ndarray) -> None:
+        if self.sampling_strategy != "prioritized_replay":
+            return
+        if idx is None or len(idx) == 0:
+            return
+        idx_np = np.asarray(idx, dtype=np.int64).reshape(-1)
+        pri_np = np.asarray(priorities, dtype=np.float32).reshape(-1)
+        if pri_np.shape[0] != idx_np.shape[0]:
+            return
+        pri_np = np.maximum(pri_np + self.priority_eps, self.priority_eps)
+        self.priorities[idx_np] = pri_np
+        if pri_np.size > 0:
+            self.max_priority = float(max(self.max_priority, float(pri_np.max())))
 
 
 class RandomShiftsAug(nn.Module):
@@ -374,10 +674,12 @@ class RandomShiftsAug(nn.Module):
         crop_max = 2 * self.pad + 1
         top = torch.randint(0, crop_max, (n,), device=x.device)
         left = torch.randint(0, crop_max, (n,), device=x.device)
-        out = torch.empty((n, x.shape[1], h, w), device=x.device, dtype=x.dtype)
-        for i in range(n):
-            out[i] = x[i, :, top[i] : top[i] + h, left[i] : left[i] + w]
-        return out
+        rows = top[:, None] + torch.arange(h, device=x.device)[None, :]
+        cols = left[:, None] + torch.arange(w, device=x.device)[None, :]
+        batch = torch.arange(n, device=x.device)[:, None, None]
+        # Gather each sample's (h, w) crop directly from padded image.
+        out = x[batch, :, rows[:, :, None], cols[:, None, :]]
+        return out.permute(0, 3, 1, 2).contiguous()
 
 
 class VisualObsEncoder(nn.Module):
@@ -446,6 +748,8 @@ class VisualObsEncoder(nn.Module):
         vit_embed_dim: int,
         vit_num_heads: int,
         vit_patch_size: int,
+        vit_proj_dim: int,
+        project_tokens: bool,
         train_encoder: bool,
         use_drq_aug: bool,
         random_shift_pad: int,
@@ -459,12 +763,16 @@ class VisualObsEncoder(nn.Module):
         self.vit_embed_dim = int(vit_embed_dim)
         self.vit_num_heads = int(vit_num_heads)
         self.vit_patch_size = int(vit_patch_size)
+        self.vit_proj_dim = int(vit_proj_dim)
+        self.project_tokens = bool(project_tokens)
         self.train_encoder = bool(train_encoder)
         self.use_drq_aug = bool(use_drq_aug)
         self.aug = RandomShiftsAug(pad=random_shift_pad)
 
         self.vit_front: VisualObsEncoder._MinViT | None = None
         self.vit_wrist: VisualObsEncoder._MinViT | None = None
+        self.front_proj: nn.Linear | None = None
+        self.wrist_proj: nn.Linear | None = None
         if self.mode == "vit":
             self.vit_front = VisualObsEncoder._MinViT(
                 image_size=self.vit_image_size,
@@ -485,8 +793,13 @@ class VisualObsEncoder(nn.Module):
                 self.vit_wrist.requires_grad_(False).eval()
             self.params_per_camera = int(sum(p.numel() for p in self.vit_front.parameters()))
             self.params_total = int(self.params_per_camera * 2)
-            token_dim = self.vit_embed_dim * self.vit_front.num_patches
-            self.output_dim = self.state_dim + 2 * token_dim
+            if self.project_tokens:
+                self.front_proj = nn.Linear(self.vit_embed_dim, self.vit_proj_dim).to(self.device)
+                self.wrist_proj = nn.Linear(self.vit_embed_dim, self.vit_proj_dim).to(self.device)
+                self.output_dim = self.state_dim + 2 * self.vit_proj_dim
+            else:
+                token_dim = self.vit_embed_dim * self.vit_front.num_patches
+                self.output_dim = self.state_dim + 2 * token_dim
         else:
             self.params_per_camera = 0
             self.params_total = 0
@@ -541,9 +854,17 @@ class VisualObsEncoder(nn.Module):
         assert self.vit_front is not None and self.vit_wrist is not None
         front_x = self._prep_images(front, augment=augment)
         wrist_x = self._prep_images(wrist, augment=augment)
-        front_tokens = self.vit_front(front_x).flatten(1, 2)
-        wrist_tokens = self.vit_wrist(wrist_x).flatten(1, 2)
-        return torch.cat([joint[:, : self.state_dim], front_tokens, wrist_tokens], dim=-1)
+        front_tokens = self.vit_front(front_x)
+        wrist_tokens = self.vit_wrist(wrist_x)
+        if self.project_tokens:
+            assert self.front_proj is not None and self.wrist_proj is not None
+            # Mean-pool token sequence per camera, then project to compact features.
+            front_feat = self.front_proj(front_tokens.mean(dim=1))
+            wrist_feat = self.wrist_proj(wrist_tokens.mean(dim=1))
+        else:
+            front_feat = front_tokens.flatten(1, 2)
+            wrist_feat = wrist_tokens.flatten(1, 2)
+        return torch.cat([joint[:, : self.state_dim], front_feat, wrist_feat], dim=-1)
 
     def encode_single_no_grad(self, *, front, wrist, joint_state) -> torch.Tensor:
         joint_np = joint_state.detach().cpu().numpy() if torch.is_tensor(joint_state) else np.asarray(joint_state)
@@ -653,7 +974,19 @@ class LocalSmolVLAPolicy:
 
 
 class ResidualActor(nn.Module):
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int, num_layers: int, use_layer_norm: bool):
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        use_layer_norm: bool,
+        use_state_gate: bool,
+        gate_hidden_dim: int,
+        gate_init_bias: float,
+        last_layer_init_scale: float,
+        last_layer_init_distribution: str,
+    ):
         super().__init__()
         in_dim = obs_dim + action_dim
         layers: list[nn.Module] = []
@@ -666,9 +999,46 @@ class ResidualActor(nn.Module):
             dim = hidden_dim
         layers.append(nn.Linear(dim, action_dim))
         self.net = nn.Sequential(*layers)
+        self._init_last_layer(
+            scale=float(last_layer_init_scale),
+            distribution=str(last_layer_init_distribution),
+        )
+        self.use_state_gate = bool(use_state_gate)
+        if self.use_state_gate:
+            gate_dim = max(1, int(gate_hidden_dim))
+            self.gate_net = nn.Sequential(
+                nn.Linear(obs_dim, gate_dim),
+                nn.ReLU(),
+                nn.Linear(gate_dim, 1),
+            )
+            nn.init.constant_(self.gate_net[-1].bias, float(gate_init_bias))
+        else:
+            self.gate_net = None
 
-    def forward(self, obs: torch.Tensor, base_action: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.net(torch.cat([obs, base_action], dim=-1)))
+    def _init_last_layer(self, scale: float, distribution: str) -> None:
+        last = self.net[-1]
+        if not isinstance(last, nn.Linear):
+            return
+        if distribution == "normal":
+            if scale <= 0.0:
+                nn.init.constant_(last.weight, 0.0)
+            else:
+                nn.init.normal_(last.weight, mean=0.0, std=scale)
+        elif distribution == "orthogonal":
+            nn.init.orthogonal_(last.weight, gain=scale)
+        elif distribution == "xavier_uniform":
+            nn.init.xavier_uniform_(last.weight, gain=scale)
+        else:
+            raise ValueError(f"Unknown actor last-layer init distribution: {distribution}")
+        nn.init.constant_(last.bias, 0.0)
+
+    def forward(self, obs: torch.Tensor, base_action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        residual_unit = torch.tanh(self.net(torch.cat([obs, base_action], dim=-1)))
+        if self.use_state_gate and self.gate_net is not None:
+            gate = torch.sigmoid(self.gate_net(obs))
+        else:
+            gate = torch.ones((obs.shape[0], 1), device=obs.device, dtype=obs.dtype)
+        return residual_unit, gate
 
 
 class EnsembleQCritic(nn.Module):
@@ -721,6 +1091,153 @@ class TD3Stats:
     actor_loss: float = 0.0
     residual_l2: float = 0.0
     delta_l2: float = 0.0
+    gate_mean: float = 1.0
+    guidance_progress_term: float = 0.0
+    guidance_gripper_term: float = 0.0
+
+
+@dataclass
+class GuidanceRewardCoefficients:
+    progress_weight: float = 1.0
+    xy_weight: float = 0.25
+    gripper_weight: float = 0.25
+    xy_scale: float = 0.08
+    gripper_scale: float = 15.0
+    progress_power: float = 1.0
+
+
+@dataclass
+class ReferenceTrajectory:
+    traj_id: str
+    ee_pos_w: np.ndarray  # [T, 3]
+    gripper_state: np.ndarray  # [T]
+    initial_cube_pose_w: np.ndarray  # [7]
+    meta: dict
+
+    @property
+    def length(self) -> int:
+        return int(self.ee_pos_w.shape[0])
+
+
+@dataclass
+class TrajectoryGuidanceState:
+    traj: ReferenceTrajectory
+    prev_progress: float = 0.0
+
+
+@dataclass
+class GuidanceStepMetrics:
+    total_reward: float = 0.0
+    progress_term: float = 0.0
+    xy_term: float = 0.0
+    gripper_term: float = 0.0
+
+
+def _parse_guidance_meta(meta_value) -> dict:
+    if meta_value is None:
+        return {}
+    if isinstance(meta_value, np.ndarray):
+        if meta_value.shape == ():
+            meta_value = meta_value.item()
+        elif meta_value.size == 1:
+            meta_value = meta_value.reshape(()).item()
+    if isinstance(meta_value, bytes):
+        meta_value = meta_value.decode("utf-8")
+    if isinstance(meta_value, str):
+        try:
+            return json.loads(meta_value)
+        except json.JSONDecodeError:
+            return {"raw_meta": meta_value}
+    if isinstance(meta_value, dict):
+        return meta_value
+    return {"raw_meta": str(meta_value)}
+
+
+def _load_reference_trajectories(traj_db: str | Path) -> list[ReferenceTrajectory]:
+    traj_dir = Path(traj_db).expanduser()
+    if not traj_dir.exists():
+        raise FileNotFoundError(f"Trajectory DB path does not exist: {traj_dir}")
+    paths = sorted(traj_dir.glob("trajectory_*.npz"))
+    if not paths:
+        raise FileNotFoundError(f"No trajectory_*.npz files found in: {traj_dir}")
+    trajectories: list[ReferenceTrajectory] = []
+    for path in paths:
+        data = np.load(path, allow_pickle=True)
+        ee_pos_w = np.asarray(data["ee_pos_w"], dtype=np.float32)
+        if ee_pos_w.ndim != 2 or ee_pos_w.shape[1] < 2:
+            raise ValueError(f"Invalid ee_pos_w shape in {path}: {ee_pos_w.shape}")
+        gripper_state = np.asarray(data["gripper_state"], dtype=np.float32).reshape(-1)
+        initial_cube_pose_w = np.asarray(data["initial_cube_pose_w"], dtype=np.float32).reshape(-1)
+        if initial_cube_pose_w.shape[0] != 7:
+            raise ValueError(f"Expected initial_cube_pose_w shape (7,), got {initial_cube_pose_w.shape} in {path}")
+        if gripper_state.shape[0] != ee_pos_w.shape[0]:
+            min_len = min(gripper_state.shape[0], ee_pos_w.shape[0])
+            ee_pos_w = ee_pos_w[:min_len]
+            gripper_state = gripper_state[:min_len]
+        meta = _parse_guidance_meta(data["meta_json"] if "meta_json" in data else None)
+        trajectories.append(
+            ReferenceTrajectory(
+                traj_id=path.stem,
+                ee_pos_w=ee_pos_w[:, :3],
+                gripper_state=gripper_state,
+                initial_cube_pose_w=initial_cube_pose_w,
+                meta=meta,
+            )
+        )
+    return trajectories
+
+
+def _select_reference_trajectory(
+    trajectories: list[ReferenceTrajectory], episode_idx: int, *, strategy: str, rng: np.random.Generator
+) -> ReferenceTrajectory:
+    if not trajectories:
+        raise ValueError("No reference trajectories available.")
+    if strategy == "round_robin":
+        return trajectories[episode_idx % len(trajectories)]
+    if strategy == "random":
+        return trajectories[int(rng.integers(len(trajectories)))]
+    raise ValueError(f"Unsupported trajectory sampling strategy: {strategy}")
+
+
+def _closest_index_xy(ref_xy: np.ndarray, current_xy: np.ndarray, min_index: int) -> tuple[int, float]:
+    if min_index >= len(ref_xy):
+        min_index = len(ref_xy) - 1
+    tail = ref_xy[min_index:]
+    if tail.size == 0:
+        idx = len(ref_xy) - 1
+        return idx, float(np.linalg.norm(ref_xy[idx] - current_xy))
+    dists = np.linalg.norm(tail - current_xy[None, :], axis=1)
+    rel_idx = int(np.argmin(dists))
+    idx = min_index + rel_idx
+    return idx, float(dists[rel_idx])
+
+
+def _compute_guidance_reward(
+    state: TrajectoryGuidanceState,
+    *,
+    current_ee_pos_w: np.ndarray,
+    current_gripper_state: float,
+    coeffs: GuidanceRewardCoefficients,
+) -> GuidanceStepMetrics:
+    traj = state.traj
+    ref_xy = traj.ee_pos_w[:, :2]
+    current_xy = np.asarray(current_ee_pos_w, dtype=np.float32)[:2]
+    prev_idx = int(round(state.prev_progress * max(traj.length - 1, 1)))
+    closest_idx, xy_error = _closest_index_xy(ref_xy, current_xy, prev_idx)
+    progress = float(closest_idx / max(traj.length - 1, 1))
+    delta_progress = max(progress - state.prev_progress, 0.0)
+    ref_gripper = float(traj.gripper_state[closest_idx])
+    gripper_error = abs(float(current_gripper_state) - ref_gripper)
+    progress_term = coeffs.progress_weight * (delta_progress**coeffs.progress_power)
+    xy_term = coeffs.xy_weight * np.exp(-xy_error / max(coeffs.xy_scale, 1e-6))
+    gripper_term = coeffs.gripper_weight * np.exp(-gripper_error / max(coeffs.gripper_scale, 1e-6))
+    state.prev_progress = max(state.prev_progress, progress)
+    return GuidanceStepMetrics(
+        total_reward=float(progress_term + xy_term + gripper_term),
+        progress_term=float(progress_term),
+        xy_term=float(xy_term),
+        gripper_term=float(gripper_term),
+    )
 
 
 def _format_seconds(seconds: float) -> str:
@@ -730,6 +1247,36 @@ def _format_seconds(seconds: float) -> str:
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def _crossed_interval(previous: int, current: int, interval: int) -> bool:
+    if interval <= 0:
+        return False
+    return (previous // interval) < (current // interval)
+
+
+def _reset_cube_pose_from_reference(
+    env,
+    env_ids: torch.Tensor,
+    cube_cfg: SceneEntityCfg = SceneEntityCfg("cube"),
+    pose_attribute_name: str = "_trajectory_guidance_initial_cube_pose_w",
+) -> None:
+    """Override cube reset pose from sampled reference trajectory initial pose(s)."""
+    if env_ids.numel() == 0:
+        return
+    if not hasattr(env, pose_attribute_name):
+        return
+    target_pose_w = getattr(env, pose_attribute_name)
+    if target_pose_w is None:
+        return
+    cube = env.scene[cube_cfg.name]
+    pose_w = torch.as_tensor(target_pose_w, dtype=torch.float32, device=env.device)
+    if pose_w.ndim == 1:
+        pose_w = pose_w.unsqueeze(0).repeat(len(env_ids), 1)
+    else:
+        pose_w = pose_w[env_ids]
+    cube.write_root_pose_to_sim(pose_w, env_ids=env_ids)
+    cube.write_root_velocity_to_sim(torch.zeros((len(env_ids), 6), device=env.device), env_ids=env_ids)
 
 
 def _configure_lerobot_absolute_joint_actions(env_cfg, task_type: str) -> None:
@@ -802,8 +1349,8 @@ def _build_policy_client(env: ManagerBasedRLEnv, task_type: str):
     )
 
 
-def _create_env(task: str, device: str) -> tuple[gym.Env, ManagerBasedRLEnv, str]:
-    env_cfg = parse_env_cfg(task, device=device, num_envs=1)
+def _create_env(task: str, device: str, num_envs: int | None = None) -> tuple[gym.Env, ManagerBasedRLEnv, str]:
+    env_cfg = parse_env_cfg(task, device=device, num_envs=(args_cli.num_envs if num_envs is None else int(num_envs)))
     task_type = get_task_type(task)
     if not args_cli.skip_teleop_device_setup:
         env_cfg.use_teleop_device(task_type)
@@ -814,6 +1361,15 @@ def _create_env(task: str, device: str) -> tuple[gym.Env, ManagerBasedRLEnv, str
     env_cfg.recorders = None
     _restore_dense_reward_setup(env_cfg)
     _ensure_collect_env_terminations(env_cfg)
+    if args_cli.traj_guidance_db and args_cli.traj_guidance_reset_from_reference:
+        env_cfg.events.trajectory_guidance_reset_cube = EventTermCfg(
+            func=_reset_cube_pose_from_reference,
+            mode="reset",
+            params={
+                "cube_cfg": SceneEntityCfg("cube"),
+                "pose_attribute_name": "_trajectory_guidance_initial_cube_pose_w",
+            },
+        )
     sim_env = gym.make(task, cfg=env_cfg, render_mode=None)
     return sim_env, sim_env.unwrapped, task_type
 
@@ -826,28 +1382,50 @@ def _extract_record_modalities(obs_dict: dict) -> tuple[torch.Tensor, torch.Tens
     for key in required:
         if key not in rec:
             raise RuntimeError(f"Missing '{key}' in record observations.")
-    return rec["front"][0], rec["wrist"][0], rec["joint_pos_abs"][0]
+    return rec["front"], rec["wrist"], rec["joint_pos_abs"]
 
 
-def _extract_residual_state(obs_dict: dict) -> np.ndarray:
+def _current_ee_position_w(env: ManagerBasedRLEnv, env_id: int = 0) -> np.ndarray:
+    ee_frame = env.scene["ee_frame"]
+    ee_index = 1 if ee_frame.data.target_pos_w.shape[1] > 1 else 0
+    return ee_frame.data.target_pos_w[env_id, ee_index, :3].detach().cpu().numpy().astype(np.float32)
+
+
+def _extract_current_gripper_lerobot(env: ManagerBasedRLEnv, env_id: int = 0) -> float:
+    robot = env.scene["robot"]
+    joint_np = robot.data.joint_pos[env_id].detach().cpu().numpy().astype(np.float32)[None, :]
+    return float(convert_leisaac_action_to_lerobot(joint_np)[0, 5])
+
+
+def _extract_residual_state(obs_dict: dict, env_id: int = 0) -> np.ndarray:
     if args_cli.state_source == "policy":
         if "policy" not in obs_dict:
             raise RuntimeError("Missing 'policy' observation group required by --state_source=policy.")
         pol = obs_dict["policy"]
         if torch.is_tensor(pol):
             if pol.ndim == 2:
-                pol = pol[0]
+                pol = pol[env_id]
             return pol.detach().cpu().numpy().astype(np.float32).reshape(-1)
         return np.asarray(pol, dtype=np.float32).reshape(-1)
     _, _, joint = _extract_record_modalities(obs_dict)
-    return (joint.detach().cpu().numpy() if torch.is_tensor(joint) else np.asarray(joint)).astype(np.float32).reshape(-1)[:6]
+    joint_row = joint[env_id]
+    return (joint_row.detach().cpu().numpy() if torch.is_tensor(joint_row) else np.asarray(joint_row)).astype(np.float32).reshape(
+        -1
+    )[:6]
 
 
 def _prepare_modalities_for_replay(
-    obs_dict: dict, obs_encoder: VisualObsEncoder
+    obs_dict: dict,
+    obs_encoder: VisualObsEncoder,
+    env_id: int = 0,
+    state_standardizer: StateStandardizer | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     front, wrist, _ = _extract_record_modalities(obs_dict)
-    joint_np = _extract_residual_state(obs_dict)
+    front = front[env_id]
+    wrist = wrist[env_id]
+    joint_np = _extract_residual_state(obs_dict, env_id=env_id)
+    if state_standardizer is not None:
+        joint_np = state_standardizer.transform_np(joint_np)
     if obs_encoder.mode == "state":
         # State-only recipe: avoid expensive image resizing/copies for replay.
         front_np = np.zeros((1, 1, 3), dtype=np.uint8)
@@ -874,6 +1452,16 @@ def _build_base_obs(obs_dict: dict, task_description: str) -> dict:
     }
 
 
+def _build_base_obs_for_env(obs_dict: dict, task_description: str, env_id: int) -> dict:
+    base_obs = _build_base_obs(obs_dict, task_description)
+    return {
+        "front": base_obs["front"][env_id : env_id + 1],
+        "wrist": base_obs["wrist"][env_id : env_id + 1],
+        "joint_pos": base_obs["joint_pos"][env_id : env_id + 1],
+        "task_description": task_description,
+    }
+
+
 def _build_base_obs_from_arrays(front: np.ndarray, wrist: np.ndarray, joint_pos: np.ndarray, task_description: str) -> dict:
     return {
         "front": torch.from_numpy(front).unsqueeze(0),
@@ -881,6 +1469,39 @@ def _build_base_obs_from_arrays(front: np.ndarray, wrist: np.ndarray, joint_pos:
         "joint_pos": torch.from_numpy(joint_pos).unsqueeze(0),
         "task_description": task_description,
     }
+
+
+def _compute_obs_vec_batch(
+    obs_dict: dict,
+    obs_encoder: VisualObsEncoder,
+    device: torch.device,
+    num_envs: int,
+    state_standardizer: StateStandardizer | None = None,
+) -> torch.Tensor:
+    feats: list[torch.Tensor] = []
+    front, wrist, _ = _extract_record_modalities(obs_dict)
+    for env_id in range(num_envs):
+        state = _extract_residual_state(obs_dict, env_id=env_id)
+        if state_standardizer is not None:
+            state = state_standardizer.transform_np(state)
+        feat = obs_encoder.encode_single_no_grad(front=front[env_id], wrist=wrist[env_id], joint_state=state).to(device)
+        feats.append(feat)
+    return torch.stack(feats, dim=0)
+
+
+def _compute_base_action_batch(
+    policy,
+    obs_dict: dict,
+    task_description: str,
+    device: torch.device,
+    num_envs: int,
+) -> torch.Tensor:
+    actions: list[torch.Tensor] = []
+    for env_id in range(num_envs):
+        base_obs = _build_base_obs_for_env(obs_dict, task_description, env_id)
+        action = policy.get_action(base_obs).to(device)[0, 0, :].float()
+        actions.append(action)
+    return torch.stack(actions, dim=0)
 
 
 def _concat_batches(lhs: dict[str, torch.Tensor], rhs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -897,19 +1518,42 @@ def _sample_mixed_batch(
     batch_size: int,
     offline_ratio: float,
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+    priority_beta: float,
+) -> tuple[dict[str, torch.Tensor], dict[str, np.ndarray | int]]:
     if offline_replay is None or offline_replay.size == 0 or offline_ratio <= 0.0:
-        return online_replay.sample(batch_size, device)
+        batch, online_idx = online_replay.sample_with_indices(batch_size, device, beta=priority_beta)
+        return batch, {
+            "online_idx": online_idx,
+            "offline_idx": np.empty((0,), dtype=np.int64),
+            "online_bs": int(batch_size),
+            "offline_bs": 0,
+        }
     offline_bs = int(round(batch_size * offline_ratio))
     offline_bs = max(0, min(batch_size, offline_bs, offline_replay.size))
     online_bs = batch_size - offline_bs
     if online_bs <= 0:
-        return offline_replay.sample(batch_size, device)
-    online_batch = online_replay.sample(online_bs, device)
+        batch, offline_idx = offline_replay.sample_with_indices(batch_size, device, beta=priority_beta)
+        return batch, {
+            "online_idx": np.empty((0,), dtype=np.int64),
+            "offline_idx": offline_idx,
+            "online_bs": 0,
+            "offline_bs": int(batch_size),
+        }
+    online_batch, online_idx = online_replay.sample_with_indices(online_bs, device, beta=priority_beta)
     if offline_bs == 0:
-        return online_batch
-    offline_batch = offline_replay.sample(offline_bs, device)
-    return _concat_batches(online_batch, offline_batch)
+        return online_batch, {
+            "online_idx": online_idx,
+            "offline_idx": np.empty((0,), dtype=np.int64),
+            "online_bs": int(online_bs),
+            "offline_bs": 0,
+        }
+    offline_batch, offline_idx = offline_replay.sample_with_indices(offline_bs, device, beta=priority_beta)
+    return _concat_batches(online_batch, offline_batch), {
+        "online_idx": online_idx,
+        "offline_idx": offline_idx,
+        "online_bs": int(online_bs),
+        "offline_bs": int(offline_bs),
+    }
 
 
 def _resolve_lerobot_dataset_class():
@@ -943,6 +1587,73 @@ def _fit_state_dim(state: np.ndarray, state_dim: int) -> np.ndarray:
     return out
 
 
+class StateStandardizer:
+    """Dataset-stat normalizer for residual state vectors."""
+
+    def __init__(self, mean: np.ndarray, std: np.ndarray, min_std: float):
+        mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+        std = np.asarray(std, dtype=np.float32).reshape(-1)
+        if mean.shape != std.shape:
+            raise ValueError(f"State normalizer mean/std shape mismatch: {mean.shape} vs {std.shape}")
+        self.mean = mean
+        self.std = np.maximum(std, float(min_std))
+
+    @property
+    def dim(self) -> int:
+        return int(self.mean.shape[0])
+
+    def transform_np(self, vec: np.ndarray) -> np.ndarray:
+        x = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if x.shape[0] != self.dim:
+            x = _fit_state_dim(x, self.dim)
+        return (x - self.mean) / self.std
+
+
+def _extract_state_stats_from_dataset_stats(stats: dict, state_dim: int) -> tuple[np.ndarray, np.ndarray] | None:
+    if not isinstance(stats, dict):
+        return None
+    candidate_keys = ("observation.state", "state", "joint_pos_abs", "observation.joint_pos")
+    state_stats = None
+    for key in candidate_keys:
+        if key in stats:
+            state_stats = stats[key]
+            break
+    if not isinstance(state_stats, dict):
+        return None
+    mean = state_stats.get("mean", None)
+    std = state_stats.get("std", None)
+    if mean is None or std is None:
+        return None
+    mean_vec = _fit_state_dim(np.asarray(mean, dtype=np.float32).reshape(-1), state_dim)
+    std_vec = _fit_state_dim(np.asarray(std, dtype=np.float32).reshape(-1), state_dim)
+    return mean_vec, std_vec
+
+
+def _build_state_standardizer_from_offline_hf(state_dim: int) -> StateStandardizer | None:
+    if not args_cli.offline_state_normalize:
+        return None
+    if not args_cli.offline_hf_dataset:
+        return None
+    LeRobotDataset = _resolve_lerobot_dataset_class()
+    try:
+        ds = LeRobotDataset(repo_id=args_cli.offline_hf_dataset)
+        stats = getattr(getattr(ds, "meta", None), "stats", None)
+        out = _extract_state_stats_from_dataset_stats(stats, state_dim=state_dim)
+        if out is None:
+            print("[WARN] Offline state normalization requested, but dataset stats missing state mean/std.")
+            return None
+        mean_vec, std_vec = out
+        standardizer = StateStandardizer(mean=mean_vec, std=std_vec, min_std=args_cli.offline_state_min_std)
+        print(
+            f"[INFO] State normalizer from offline dataset: repo={args_cli.offline_hf_dataset} "
+            f"dim={standardizer.dim} min_std={args_cli.offline_state_min_std:g}"
+        )
+        return standardizer
+    except Exception as exc:
+        print(f"[WARN] Failed to build offline state normalizer: {exc}")
+        return None
+
+
 def _offline_hf_cache_path() -> Path | None:
     if not args_cli.offline_hf_cache_dir:
         return None
@@ -965,6 +1676,8 @@ def _offline_hf_cache_path() -> Path | None:
             str(args_cli.recipe),
             str(args_cli.state_source),
             str(args_cli.obs_encoder),
+            str(args_cli.obs_vit_project_tokens),
+            str(args_cli.obs_vit_proj_dim),
         ]
     )
     digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()[:16]
@@ -1041,6 +1754,10 @@ def _load_offline_hf(
     prompt: str,
     device: torch.device,
     obs_encoder: VisualObsEncoder,
+    state_standardizer: StateStandardizer | None = None,
+    use_base_policy_for_base_actions: bool = True,
+    action_low: np.ndarray | None = None,
+    action_high: np.ndarray | None = None,
 ) -> int:
     if not args_cli.offline_hf_dataset:
         raise ValueError("--offline_hf_dataset is required when --offline_source=hf.")
@@ -1097,13 +1814,22 @@ def _load_offline_hf(
                 done = True
 
             obs_joint = _fit_state_dim(_as_np_1d(row[state_key], dtype=np.float32), replay.state_dim)
+            if state_standardizer is not None:
+                obs_joint = state_standardizer.transform_np(obs_joint)
             act_lerobot = _as_np_1d(row[action_key], dtype=np.float32)
             act = convert_lerobot_action_to_leisaac(act_lerobot[None, :])[0].astype(np.float32)
+            if action_low is not None and action_high is not None:
+                act = np.clip(act, action_low, action_high).astype(np.float32)
 
             obs_front = obs_encoder.image_for_replay(row[front_key])
             obs_wrist = obs_encoder.image_for_replay(row[wrist_key])
-            base_obs = _build_base_obs_from_arrays(obs_front, obs_wrist, obs_joint, prompt)
-            base = base_policy.get_action(base_obs).to(device)[0, 0, :].detach().cpu().numpy().astype(np.float32)
+            if use_base_policy_for_base_actions:
+                base_obs = _build_base_obs_from_arrays(obs_front, obs_wrist, obs_joint, prompt)
+                base = base_policy.get_action(base_obs).to(device)[0, 0, :].detach().cpu().numpy().astype(np.float32)
+            else:
+                base = act.copy()
+            if action_low is not None and action_high is not None:
+                base = np.clip(base, action_low, action_high).astype(np.float32)
 
             if done:
                 next_obs_joint = obs_joint
@@ -1112,12 +1838,20 @@ def _load_offline_hf(
                 next_base = np.zeros_like(base)
             else:
                 next_obs_joint = _fit_state_dim(_as_np_1d(nxt[state_key], dtype=np.float32), replay.state_dim)
+                if state_standardizer is not None:
+                    next_obs_joint = state_standardizer.transform_np(next_obs_joint)
                 next_front = obs_encoder.image_for_replay(nxt[front_key])
                 next_wrist = obs_encoder.image_for_replay(nxt[wrist_key])
-                next_base_obs = _build_base_obs_from_arrays(next_front, next_wrist, next_obs_joint, prompt)
-                next_base = (
-                    base_policy.get_action(next_base_obs).to(device)[0, 0, :].detach().cpu().numpy().astype(np.float32)
-                )
+                if use_base_policy_for_base_actions:
+                    next_base_obs = _build_base_obs_from_arrays(next_front, next_wrist, next_obs_joint, prompt)
+                    next_base = (
+                        base_policy.get_action(next_base_obs).to(device)[0, 0, :].detach().cpu().numpy().astype(np.float32)
+                    )
+                else:
+                    nxt_act_lerobot = _as_np_1d(nxt[action_key], dtype=np.float32)
+                    next_base = convert_lerobot_action_to_leisaac(nxt_act_lerobot[None, :])[0].astype(np.float32)
+                if action_low is not None and action_high is not None:
+                    next_base = np.clip(next_base, action_low, action_high).astype(np.float32)
 
             replay.add(
                 obs_joint=obs_joint.astype(np.float32),
@@ -1211,22 +1945,22 @@ def _get_action_bounds(env: ManagerBasedRLEnv, device: torch.device) -> tuple[to
     return low, high
 
 
-def _encode_replay_batch(
-    batch: dict[str, torch.Tensor], obs_encoder: VisualObsEncoder, *, augment: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    obs_feat = obs_encoder.encode_batch(
+def _encode_obs_batch(batch: dict[str, torch.Tensor], obs_encoder: VisualObsEncoder, *, augment: bool) -> torch.Tensor:
+    return obs_encoder.encode_batch(
         joint=batch["obs_joint"],
         front=batch["obs_front"],
         wrist=batch["obs_wrist"],
         augment=augment,
     )
-    next_obs_feat = obs_encoder.encode_batch(
+
+
+def _encode_next_obs_batch(batch: dict[str, torch.Tensor], obs_encoder: VisualObsEncoder, *, augment: bool) -> torch.Tensor:
+    return obs_encoder.encode_batch(
         joint=batch["next_joint"],
         front=batch["next_front"],
         wrist=batch["next_wrist"],
         augment=augment,
     )
-    return obs_feat, next_obs_feat
 
 
 def _compose_action(
@@ -1235,10 +1969,56 @@ def _compose_action(
     residual_scale: float,
     low: torch.Tensor,
     high: torch.Tensor,
+    residual_scale_min: float,
+    residual_scale_max: float,
+    residual_gate: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    delta = residual_scale * residual_unit
+    scale_min = float(min(residual_scale_min, residual_scale_max))
+    scale_max = float(max(residual_scale_min, residual_scale_max))
+    scale_cap = float(np.clip(float(residual_scale), scale_min, scale_max))
+    if residual_gate is None:
+        delta = scale_cap * residual_unit
+    else:
+        # Gate chooses when to apply stronger correction while staying inside [scale_min, scale_cap].
+        gated_scale = scale_min + (scale_cap - scale_min) * torch.clamp(residual_gate, 0.0, 1.0)
+        delta = gated_scale * residual_unit
     final_action = torch.clamp(base_action + delta, low, high)
     return final_action, delta
+
+
+def _effective_residual_scale(step: int) -> float:
+    if args_cli.progressive_clipping_steps <= 0:
+        return float(args_cli.residual_scale)
+    progress = min(1.0, float(step) / max(float(args_cli.progressive_clipping_steps), 1.0))
+    return float(args_cli.residual_scale) * progress
+
+
+def _effective_actor_lr(update_count: int) -> float:
+    warmup = int(max(args_cli.actor_lr_warmup_updates, 0))
+    if warmup <= 0:
+        return float(args_cli.actor_lr)
+    progress = min(1.0, float(update_count + 1) / float(warmup))
+    return float(args_cli.actor_lr) * progress
+
+
+def _effective_exploration_std(step: int) -> float:
+    end = args_cli.exploration_std_min
+    decay_steps = int(max(args_cli.exploration_std_decay_steps, 0))
+    if end is None or decay_steps <= 0:
+        return float(args_cli.exploration_std)
+    start = float(args_cli.exploration_std)
+    end_f = float(end)
+    progress = min(1.0, max(0.0, float(step) / max(float(decay_steps), 1.0)))
+    return float(start + (end_f - start) * progress)
+
+
+def _effective_priority_beta(step: int) -> float:
+    if args_cli.sampling_strategy != "prioritized_replay":
+        return 1.0
+    start = float(args_cli.priority_beta_start)
+    end = float(args_cli.priority_beta_end)
+    progress = min(1.0, max(0.0, float(step) / max(float(args_cli.total_steps), 1.0)))
+    return float(start + (end - start) * progress)
 
 
 def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
@@ -1260,6 +2040,7 @@ def _evaluate(
     task_type: str,
     policy,
     prompt: str,
+    state_standardizer: StateStandardizer | None = None,
 ) -> tuple[float, float]:
     obs_encoder.eval()
     success_count = 0
@@ -1270,18 +2051,33 @@ def _evaluate(
             policy.reset()
         ep_return = 0.0
         while simulation_app.is_running():
-            front, wrist, _ = _extract_record_modalities(obs_dict)
-            state_vec = _extract_residual_state(obs_dict)
+            front_b, wrist_b, _ = _extract_record_modalities(obs_dict)
+            front = front_b[0]
+            wrist = wrist_b[0]
+            state_vec = _extract_residual_state(obs_dict, env_id=0)
+            if state_standardizer is not None:
+                state_vec = state_standardizer.transform_np(state_vec)
             obs_vec = obs_encoder.encode_single_no_grad(front=front, wrist=wrist, joint_state=state_vec).to(device)
-            base_obs = _build_base_obs(obs_dict, prompt)
+            base_obs = _build_base_obs_for_env(obs_dict, prompt, env_id=0)
             base_chunk = policy.get_action(base_obs).to(device)
             base_action = base_chunk[0, 0, :].float()
             if base_only:
                 action = base_action
             else:
                 with torch.no_grad():
-                    residual_unit = actor(obs_vec.unsqueeze(0), base_action.unsqueeze(0)).squeeze(0)
-                action, _ = _compose_action(base_action, residual_unit, residual_scale, low, high)
+                    residual_unit, residual_gate = actor(obs_vec.unsqueeze(0), base_action.unsqueeze(0))
+                    residual_unit = residual_unit.squeeze(0)
+                    residual_gate = residual_gate.squeeze(0)
+                action, _ = _compose_action(
+                    base_action,
+                    residual_unit,
+                    residual_scale,
+                    low,
+                    high,
+                    args_cli.residual_scale_min,
+                    args_cli.residual_scale_max,
+                    residual_gate,
+                )
             if env.cfg.dynamic_reset_gripper_effort_limit:
                 dynamic_reset_gripper_effort_limit_sim(env, task_type)
             obs_dict, reward, terminated, truncated, _ = sim_env.step(action.unsqueeze(0))
@@ -1297,23 +2093,54 @@ def _evaluate(
 
 
 def main() -> None:
+    if args_cli.log_dir == _DEFAULT_LOG_DIR:
+        base_dir = "logs/residual_td3"
+        run_name = args_cli.recipe
+        if args_cli.log_dir_use_timestamp:
+            run_name = f"{run_name}_{time.strftime('%Y%m%d_%H%M%S')}"
+        args_cli.log_dir = os.path.join(base_dir, run_name)
+        print(f"[INFO] Auto-resolved log_dir: {args_cli.log_dir}")
     os.makedirs(args_cli.log_dir, exist_ok=True)
     print(f"[INFO] Recipe: {args_cli.recipe}")
     print(f"[INFO] Reward mode: {args_cli.reward_mode}")
     print(f"[INFO] Requested base policy backend: {args_cli.policy_backend}")
     print(
         f"[INFO] Residual TD3 hypers: residual_scale={args_cli.residual_scale:.3f}, "
+        f"residual_scale_range=[{args_cli.residual_scale_min:.3f},{args_cli.residual_scale_max:.3f}], "
         f"actor_lr={args_cli.actor_lr:.1e}, critic_lr={args_cli.critic_lr:.1e}, "
+        f"exploration_std={args_cli.exploration_std:.4f}, exploration_std_min="
+        f"{(args_cli.exploration_std if args_cli.exploration_std_min is None else args_cli.exploration_std_min):.4f}, "
+        f"exploration_std_decay_steps={args_cli.exploration_std_decay_steps}, "
         f"warmup_steps={args_cli.warmup_steps}, critic_warmup_steps={args_cli.critic_warmup_steps}, "
         f"learning_starts={args_cli.learning_starts}, n_step={args_cli.n_step}, "
         f"num_updates_per_iteration={args_cli.num_updates_per_iteration}, "
         f"num_q={args_cli.num_q}, min_q_heads={args_cli.min_q_heads}, "
-        f"policy_gradient_type={args_cli.policy_gradient_type}, use_layer_norm={args_cli.use_layer_norm}"
+        f"policy_gradient_type={args_cli.policy_gradient_type}, use_layer_norm={args_cli.use_layer_norm}, "
+        f"use_state_gate={args_cli.use_state_gate}, gate_hidden_dim={args_cli.gate_hidden_dim}, "
+        f"gate_init_bias={args_cli.gate_init_bias:.2f}, "
+        f"actor_last_layer_init_scale={args_cli.actor_last_layer_init_scale:.2e}, "
+        f"actor_last_layer_init_distribution={args_cli.actor_last_layer_init_distribution}, "
+        f"use_base_policy_for_warmup={args_cli.use_base_policy_for_warmup}, "
+        f"progressive_clipping_steps={args_cli.progressive_clipping_steps}, "
+        f"clip_q_target_to_reward_range={args_cli.clip_q_target_to_reward_range}"
     )
     print(
         f"[INFO] Offline replay: source={args_cli.offline_source}, "
-        f"mix_ratio={args_cli.offline_mix_ratio:.2f}, max_samples={args_cli.offline_max_samples}"
+        f"mix_ratio={args_cli.offline_mix_ratio:.2f}, max_samples={args_cli.offline_max_samples}, "
+        f"offline_use_base_policy_for_base_actions={args_cli.offline_use_base_policy_for_base_actions}"
     )
+    print(
+        f"[INFO] Replay sampling: strategy={args_cli.sampling_strategy}, "
+        f"priority_alpha={args_cli.priority_alpha:.3f}, "
+        f"priority_beta_start={args_cli.priority_beta_start:.3f}, "
+        f"priority_beta_end={args_cli.priority_beta_end:.3f}"
+    )
+    if args_cli.traj_guidance_db:
+        print(
+            f"[INFO] Trajectory guidance: db={args_cli.traj_guidance_db}, "
+            f"sampling={args_cli.traj_guidance_sampling}, lambda={args_cli.traj_guidance_lambda:.3f}, "
+            f"reset_from_reference={args_cli.traj_guidance_reset_from_reference}"
+        )
     if args_cli.offline_source == "hf":
         print(
             f"[INFO] HF dataset={args_cli.offline_hf_dataset}, split={args_cli.offline_hf_split}, "
@@ -1326,10 +2153,30 @@ def main() -> None:
     wall_start_time = time.time()
 
     device = torch.device(args_cli.device)
-    sim_env, env, task_type = _create_env(args_cli.task, args_cli.device)
+    sim_env, env, task_type = _create_env(args_cli.task, args_cli.device, num_envs=args_cli.num_envs)
+    num_envs = int(getattr(env, "num_envs", args_cli.num_envs))
+    eval_enabled = bool(args_cli.eval_interval > 0 and num_envs == 1)
+    if args_cli.eval_interval > 0 and not eval_enabled:
+        print(
+            "[WARN] Disabling in-loop eval for num_envs>1: IsaacLab does not support creating a second "
+            "simulation context in the same process."
+        )
     prompt = str(getattr(env.cfg, "task_description", args_cli.policy_language_instruction))
     base_policy = _build_policy_client(env, task_type)
     low, high = _get_action_bounds(env, device)
+    guidance_refs: list[ReferenceTrajectory] = []
+    guidance_rng = np.random.default_rng(args_cli.traj_guidance_seed)
+    guidance_coeffs = GuidanceRewardCoefficients(
+        progress_weight=args_cli.traj_guidance_progress_weight,
+        xy_weight=args_cli.traj_guidance_xy_weight,
+        gripper_weight=args_cli.traj_guidance_gripper_weight,
+        xy_scale=args_cli.traj_guidance_xy_scale,
+        gripper_scale=args_cli.traj_guidance_gripper_scale,
+        progress_power=args_cli.traj_guidance_progress_power,
+    )
+    if args_cli.traj_guidance_db:
+        guidance_refs = _load_reference_trajectories(args_cli.traj_guidance_db)
+        print(f"[INFO] Loaded reference trajectories: {len(guidance_refs)}")
     if args_cli.state_source == "policy" and args_cli.offline_source == "hf":
         raise ValueError(
             "--state_source=policy expects privileged policy observations online, but HF offline demos only provide robot state. "
@@ -1339,10 +2186,17 @@ def main() -> None:
     state_dim = 6
     if args_cli.state_source == "policy":
         obs_probe, _ = sim_env.reset()
-        state_dim = int(_extract_residual_state(obs_probe).shape[0])
+        state_dim = int(_extract_residual_state(obs_probe, env_id=0).shape[0])
         if hasattr(base_policy, "reset"):
             base_policy.reset()
+    state_standardizer: StateStandardizer | None = None
+    if args_cli.offline_source == "hf":
+        state_standardizer = _build_state_standardizer_from_offline_hf(state_dim=state_dim)
     print(f"[INFO] Residual state source: {args_cli.state_source} (state_dim={state_dim})")
+    if state_standardizer is not None:
+        print("[INFO] Residual state normalization: enabled (offline dataset stats).")
+    else:
+        print("[INFO] Residual state normalization: disabled.")
     print(f"[INFO] Replay image storage: {'enabled' if store_replay_images else 'disabled (state-only mode)'}")
     obs_encoder = VisualObsEncoder(
         device=device,
@@ -1353,6 +2207,8 @@ def main() -> None:
         vit_embed_dim=args_cli.obs_vit_embed_dim,
         vit_num_heads=args_cli.obs_vit_num_heads,
         vit_patch_size=args_cli.obs_vit_patch_size,
+        vit_proj_dim=args_cli.obs_vit_proj_dim,
+        project_tokens=args_cli.obs_vit_project_tokens,
         train_encoder=args_cli.obs_train_encoder,
         use_drq_aug=args_cli.obs_use_drq_aug,
         random_shift_pad=args_cli.obs_random_shift_pad,
@@ -1363,7 +2219,8 @@ def main() -> None:
             f"(depth={args_cli.obs_vit_depth}, embed_dim={args_cli.obs_vit_embed_dim}, "
             f"heads={args_cli.obs_vit_num_heads}, patch={args_cli.obs_vit_patch_size}, "
             f"img={args_cli.obs_vit_image_size}, train_encoder={args_cli.obs_train_encoder}, "
-            f"drq_aug={args_cli.obs_use_drq_aug}, random_shift_pad={args_cli.obs_random_shift_pad}) "
+            f"drq_aug={args_cli.obs_use_drq_aug}, random_shift_pad={args_cli.obs_random_shift_pad}, "
+            f"project_tokens={args_cli.obs_vit_project_tokens}, proj_dim={args_cli.obs_vit_proj_dim}) "
             f"params_per_camera={obs_encoder.params_per_camera:,} total={obs_encoder.params_total:,}"
         )
 
@@ -1373,28 +2230,49 @@ def main() -> None:
             "This ablation requires LiftCube dense reward terms to be active."
         )
 
+    guidance_episode_idx = 0
+    guidance_episode_counters = [0 for _ in range(num_envs)]
+    guidance_states: list[TrajectoryGuidanceState | None] = [None for _ in range(num_envs)]
+    initial_cube_pose_w: np.ndarray | None = None
+    if guidance_refs:
+        initial_cube_pose_w = np.zeros((num_envs, 7), dtype=np.float32)
+        for env_id in range(num_envs):
+            selected = _select_reference_trajectory(
+                guidance_refs,
+                guidance_episode_counters[env_id],
+                strategy=args_cli.traj_guidance_sampling,
+                rng=guidance_rng,
+            )
+            guidance_states[env_id] = TrajectoryGuidanceState(traj=selected)
+            initial_cube_pose_w[env_id] = selected.initial_cube_pose_w
+        if args_cli.traj_guidance_reset_from_reference:
+            setattr(env, "_trajectory_guidance_initial_cube_pose_w", initial_cube_pose_w)
+        print(f"[INFO] Guidance bootstrap trajectories assigned for {num_envs} envs.")
+
     print("[INFO] Bootstrap: resetting env for initial observation...")
     obs_dict, _ = sim_env.reset()
     if hasattr(base_policy, "reset"):
         print("[INFO] Bootstrap: resetting base policy state...")
         base_policy.reset()
     print("[INFO] Bootstrap: encoding initial observation...")
-    front0, wrist0, _ = _extract_record_modalities(obs_dict)
-    state0 = _extract_residual_state(obs_dict)
-    obs_vec0 = obs_encoder.encode_single_no_grad(front=front0, wrist=wrist0, joint_state=state0).to(device)
-    base_obs0 = _build_base_obs(obs_dict, prompt)
+    obs_vec0 = _compute_obs_vec_batch(
+        obs_dict, obs_encoder, device=device, num_envs=num_envs, state_standardizer=state_standardizer
+    )
     print("[INFO] Bootstrap: querying first base action chunk...")
-    base_action0 = base_policy.get_action(base_obs0).to(device)[0, 0, :].float()
+    base_action0 = _compute_base_action_batch(base_policy, obs_dict, prompt, device=device, num_envs=num_envs)
     print("[INFO] Bootstrap: initial base action ready.")
 
     obs_dim = int(obs_encoder.output_dim)
-    act_dim = int(base_action0.numel())
+    act_dim = int(base_action0.shape[-1])
     replay = ReplayBuffer(
         act_dim,
         args_cli.replay_size,
         image_size=args_cli.obs_vit_image_size,
         state_dim=state_dim,
         store_images=store_replay_images,
+        sampling_strategy=args_cli.sampling_strategy,
+        priority_alpha=args_cli.priority_alpha,
+        priority_eps=args_cli.priority_eps,
     )
     offline_replay: ReplayBuffer | None = None
     if args_cli.offline_source != "none":
@@ -1404,6 +2282,9 @@ def main() -> None:
             image_size=args_cli.obs_vit_image_size,
             state_dim=state_dim,
             store_images=store_replay_images,
+            sampling_strategy=args_cli.sampling_strategy,
+            priority_alpha=args_cli.priority_alpha,
+            priority_eps=args_cli.priority_eps,
         )
         if args_cli.offline_source == "hf":
             offline_added = _load_offline_hf(
@@ -1412,16 +2293,38 @@ def main() -> None:
                 prompt=prompt,
                 device=device,
                 obs_encoder=obs_encoder,
+                state_standardizer=state_standardizer,
+                use_base_policy_for_base_actions=args_cli.offline_use_base_policy_for_base_actions,
+                action_low=low.detach().cpu().numpy(),
+                action_high=high.detach().cpu().numpy(),
             )
         else:
             offline_added = _load_offline_local_npz(offline_replay)
         print(f"[INFO] Loaded offline replay transitions: {offline_added}")
 
     actor = ResidualActor(
-        obs_dim, act_dim, args_cli.hidden_dim, args_cli.actor_num_layers, args_cli.use_layer_norm
+        obs_dim,
+        act_dim,
+        args_cli.hidden_dim,
+        args_cli.actor_num_layers,
+        args_cli.use_layer_norm,
+        args_cli.use_state_gate,
+        args_cli.gate_hidden_dim,
+        args_cli.gate_init_bias,
+        args_cli.actor_last_layer_init_scale,
+        args_cli.actor_last_layer_init_distribution,
     ).to(device)
     actor_target = ResidualActor(
-        obs_dim, act_dim, args_cli.hidden_dim, args_cli.actor_num_layers, args_cli.use_layer_norm
+        obs_dim,
+        act_dim,
+        args_cli.hidden_dim,
+        args_cli.actor_num_layers,
+        args_cli.use_layer_norm,
+        args_cli.use_state_gate,
+        args_cli.gate_hidden_dim,
+        args_cli.gate_init_bias,
+        args_cli.actor_last_layer_init_scale,
+        args_cli.actor_last_layer_init_distribution,
     ).to(device)
     actor_target.load_state_dict(actor.state_dict())
 
@@ -1452,227 +2355,40 @@ def main() -> None:
 
     obs_vec = obs_vec0.to(device)
     base_action = base_action0
-    obs_joint_np, obs_front_np, obs_wrist_np = _prepare_modalities_for_replay(obs_dict, obs_encoder)
-    episode_return = 0.0
+    obs_joint_np = np.zeros((num_envs, state_dim), dtype=np.float32)
+    if store_replay_images:
+        obs_front_np = np.zeros((num_envs, args_cli.obs_vit_image_size, args_cli.obs_vit_image_size, 3), dtype=np.uint8)
+        obs_wrist_np = np.zeros((num_envs, args_cli.obs_vit_image_size, args_cli.obs_vit_image_size, 3), dtype=np.uint8)
+    else:
+        obs_front_np = np.zeros((num_envs, 1, 1, 3), dtype=np.uint8)
+        obs_wrist_np = np.zeros((num_envs, 1, 1, 3), dtype=np.uint8)
+    for env_id in range(num_envs):
+        j, f, w = _prepare_modalities_for_replay(
+            obs_dict, obs_encoder, env_id=env_id, state_standardizer=state_standardizer
+        )
+        obs_joint_np[env_id] = j
+        obs_front_np[env_id] = f
+        obs_wrist_np[env_id] = w
+    episode_return = np.zeros((num_envs,), dtype=np.float64)
     episode_count = 0
     recent_returns = deque(maxlen=20)
     recent_success = deque(maxlen=20)
+    recent_guidance_progress = deque(maxlen=20)
+    recent_guidance_gripper = deque(maxlen=20)
+    episode_guidance_progress = np.zeros((num_envs,), dtype=np.float64)
+    episode_guidance_gripper = np.zeros((num_envs,), dtype=np.float64)
     update_count = 0
     last_stats = TD3Stats()
-    n_step_queue: deque[dict[str, np.ndarray | float | bool]] = deque()
+    n_step_queues: list[deque[dict[str, np.ndarray | float | bool]]] = [deque() for _ in range(num_envs)]
     last_heartbeat_time = time.time()
     print("[INFO] Entering training loop.")
+    env_step = 0
+    control_step = 0
+    last_exploration_std = _effective_exploration_std(0)
 
-    for step in range(1, args_cli.total_steps + 1):
-        if args_cli.no_residual:
-            residual_unit = torch.zeros(act_dim, device=device)
-            action = base_action
-            delta = torch.zeros_like(base_action)
-        elif step <= args_cli.warmup_steps:
-            warmup_noise = torch.empty(act_dim, device=device).uniform_(
-                -args_cli.warmup_noise_scale, args_cli.warmup_noise_scale
-            )
-            action = torch.clamp(base_action + warmup_noise, low, high)
-            # Normalize for logging only (keep bounded like actor output).
-            residual_unit = torch.clamp(warmup_noise / max(args_cli.residual_scale, 1e-6), -1.0, 1.0)
-            delta = action - base_action
-        else:
-            with torch.no_grad():
-                residual_unit = actor(obs_vec.unsqueeze(0), base_action.unsqueeze(0)).squeeze(0)
-                residual_unit = torch.clamp(
-                    residual_unit + torch.randn_like(residual_unit) * args_cli.exploration_std, -1.0, 1.0
-                )
-            action, delta = _compose_action(base_action, residual_unit, args_cli.residual_scale, low, high)
-
-        if env.cfg.dynamic_reset_gripper_effort_limit:
-            dynamic_reset_gripper_effort_limit_sim(env, task_type)
-        next_obs_dict, reward, terminated, truncated, _ = sim_env.step(action.unsqueeze(0))
-        done = bool((terminated[0] | truncated[0]).detach().cpu().item())
-        success = bool(env.reset_terminated[0].detach().cpu().item()) if done else False
-        rew = _select_step_reward(float(reward[0].detach().cpu().item()), done=done, success=success)
-
-        next_front, next_wrist, _ = _extract_record_modalities(next_obs_dict)
-        next_state = _extract_residual_state(next_obs_dict)
-        next_obs_vec = obs_encoder.encode_single_no_grad(front=next_front, wrist=next_wrist, joint_state=next_state).to(device)
-        next_joint_np, next_front_np, next_wrist_np = _prepare_modalities_for_replay(next_obs_dict, obs_encoder)
-        if done:
-            next_base_action = torch.zeros_like(base_action)
-        else:
-            next_base_obs = _build_base_obs(next_obs_dict, prompt)
-            next_base_action = base_policy.get_action(next_base_obs).to(device)[0, 0, :].float()
-
-        if not args_cli.no_residual:
-            n_step_queue.append(
-                {
-                    "obs_joint": np.asarray(obs_joint_np, dtype=np.float32),
-                    "obs_front": np.asarray(obs_front_np, dtype=np.uint8),
-                    "obs_wrist": np.asarray(obs_wrist_np, dtype=np.uint8),
-                    "base": base_action.detach().cpu().numpy(),
-                    "act": action.detach().cpu().numpy(),
-                    "next_joint": np.asarray(next_joint_np, dtype=np.float32),
-                    "next_front": np.asarray(next_front_np, dtype=np.uint8),
-                    "next_wrist": np.asarray(next_wrist_np, dtype=np.uint8),
-                    "next_base": next_base_action.detach().cpu().numpy(),
-                    "rew": float(rew),
-                    "done": bool(done),
-                }
-            )
-            while len(n_step_queue) >= args_cli.n_step or (done and len(n_step_queue) > 0):
-                horizon = min(args_cli.n_step, len(n_step_queue))
-                reward_n = 0.0
-                done_n = False
-                last = n_step_queue[horizon - 1]
-                for i in range(horizon):
-                    tr = n_step_queue[i]
-                    reward_n += (args_cli.gamma**i) * float(tr["rew"])
-                    if bool(tr["done"]):
-                        done_n = True
-                        horizon = i + 1
-                        last = n_step_queue[i]
-                        break
-                discount_n = (args_cli.gamma**horizon) if not done_n else 1.0
-                replay.add(
-                    obs_joint=np.asarray(n_step_queue[0]["obs_joint"], dtype=np.float32),
-                    obs_front=np.asarray(n_step_queue[0]["obs_front"], dtype=np.uint8),
-                    obs_wrist=np.asarray(n_step_queue[0]["obs_wrist"], dtype=np.uint8),
-                    base=np.asarray(n_step_queue[0]["base"], dtype=np.float32),
-                    act=np.asarray(n_step_queue[0]["act"], dtype=np.float32),
-                    next_joint=np.asarray(last["next_joint"], dtype=np.float32),
-                    next_front=np.asarray(last["next_front"], dtype=np.uint8),
-                    next_wrist=np.asarray(last["next_wrist"], dtype=np.uint8),
-                    next_base=np.asarray(last["next_base"], dtype=np.float32),
-                    rew=reward_n,
-                    done=done_n,
-                    discount=discount_n,
-                )
-                n_step_queue.popleft()
-
-        episode_return += rew
-        if done:
-            episode_count += 1
-            recent_returns.append(episode_return)
-            recent_success.append(float(success))
-            episode_return = 0.0
-            obs_dict = next_obs_dict
-            if hasattr(base_policy, "reset"):
-                base_policy.reset()
-            front_r, wrist_r, _ = _extract_record_modalities(obs_dict)
-            state_r = _extract_residual_state(obs_dict)
-            obs_vec = obs_encoder.encode_single_no_grad(front=front_r, wrist=wrist_r, joint_state=state_r).to(device)
-            base_obs = _build_base_obs(obs_dict, prompt)
-            base_action = base_policy.get_action(base_obs).to(device)[0, 0, :].float()
-            obs_joint_np, obs_front_np, obs_wrist_np = _prepare_modalities_for_replay(obs_dict, obs_encoder)
-        else:
-            obs_vec = next_obs_vec
-            base_action = next_base_action
-            obs_joint_np, obs_front_np, obs_wrist_np = next_joint_np, next_front_np, next_wrist_np
-
-        if (
-            (not args_cli.no_residual)
-            and step >= args_cli.learning_starts
-            and replay.size >= args_cli.batch_size
-        ):
-            step_actor_loss = float(last_stats.actor_loss)
-            for _ in range(args_cli.num_updates_per_iteration):
-                batch = _sample_mixed_batch(
-                    online_replay=replay,
-                    offline_replay=offline_replay,
-                    batch_size=args_cli.batch_size,
-                    offline_ratio=args_cli.offline_mix_ratio,
-                    device=device,
-                )
-                if args_cli.obs_encoder == "vit" and args_cli.obs_train_encoder:
-                    obs_encoder.train()
-                else:
-                    obs_encoder.eval()
-                if encoder_opt is not None:
-                    encoder_opt.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    _, next_obs_feat_tgt = _encode_replay_batch(batch, obs_encoder, augment=args_cli.obs_use_drq_aug)
-                    target_residual = actor_target(next_obs_feat_tgt, batch["next_base"])
-                    if args_cli.target_action_noise:
-                        target_noise = torch.clamp(
-                            torch.randn_like(target_residual) * args_cli.target_noise_std,
-                            -args_cli.target_noise_clip,
-                            args_cli.target_noise_clip,
-                        )
-                        target_residual = torch.clamp(target_residual + target_noise, -1.0, 1.0)
-                    target_action, _ = _compose_action(
-                        batch["next_base"], target_residual, args_cli.residual_scale, low, high
-                    )
-                    q_t = critic_target(next_obs_feat_tgt, target_action)
-                    q_t_min = critic_target.target_min(q_t, args_cli.min_q_heads)
-                    target_q = batch["rew"] + (1.0 - batch["done"]) * batch["discount"] * q_t_min
-
-                obs_feat, _ = _encode_replay_batch(batch, obs_encoder, augment=args_cli.obs_use_drq_aug)
-                q_values = critic(obs_feat, batch["act"])
-                critic_loss = F.mse_loss(q_values, target_q.unsqueeze(0).expand_as(q_values))
-                critic_opt.zero_grad(set_to_none=True)
-                critic_loss.backward()
-                if encoder_opt is not None:
-                    encoder_opt.step()
-                critic_opt.step()
-
-                actor_loss = torch.tensor(0.0, device=device)
-                actor_update_enabled = update_count >= args_cli.critic_warmup_steps
-                if actor_update_enabled and update_count % args_cli.policy_delay == 0:
-                    obs_actor = obs_feat.detach()
-                    actor_residual = actor(obs_actor, batch["base"])
-                    actor_action, actor_delta = _compose_action(
-                        batch["base"], actor_residual, args_cli.residual_scale, low, high
-                    )
-                    actor_q = critic(obs_actor, actor_action)
-                    actor_val = critic.policy_value(actor_q, args_cli.policy_gradient_type)
-                    actor_loss = -actor_val.mean()
-                    actor_loss = actor_loss + args_cli.residual_reg_weight * (actor_delta.pow(2).mean())
-                    actor_opt.zero_grad(set_to_none=True)
-                    actor_loss.backward()
-                    actor_opt.step()
-                    step_actor_loss = float(actor_loss.detach().cpu().item())
-
-                    _soft_update(actor_target, actor, args_cli.tau)
-                    _soft_update(critic_target, critic, args_cli.tau)
-                else:
-                    # Keep critic targets fresh even during actor warmup.
-                    _soft_update(critic_target, critic, args_cli.tau)
-
-                update_count += 1
-                last_stats = TD3Stats(
-                    critic_loss=float(critic_loss.detach().cpu().item()),
-                    actor_loss=step_actor_loss,
-                    residual_l2=float(residual_unit.norm(p=2).detach().cpu().item()),
-                    delta_l2=float(delta.norm(p=2).detach().cpu().item()),
-                )
-
-        if step % args_cli.log_interval == 0:
-            mean_return = float(np.mean(recent_returns)) if recent_returns else 0.0
-            mean_success = float(np.mean(recent_success)) if recent_success else 0.0
-            elapsed_s = time.time() - wall_start_time
-            steps_per_s = step / max(elapsed_s, 1e-6)
-            remaining_steps = max(args_cli.total_steps - step, 0)
-            eta_s = remaining_steps / max(steps_per_s, 1e-6)
-            print(
-                f"[TRAIN] step={step} episodes={episode_count} replay={replay.size} "
-                f"elapsed={_format_seconds(elapsed_s)} eta={_format_seconds(eta_s)} steps_per_s={steps_per_s:.2f} "
-                f"return20={mean_return:.3f} success20={mean_success:.3f} "
-                f"critic_loss={last_stats.critic_loss:.3e} actor_loss={last_stats.actor_loss:.3e} "
-                f"residual_l2={last_stats.residual_l2:.4f} delta_l2={last_stats.delta_l2:.4f}"
-            )
-
-        now_time = time.time()
-        if args_cli.heartbeat_interval_s > 0.0 and (now_time - last_heartbeat_time) >= args_cli.heartbeat_interval_s:
-            elapsed_s = now_time - wall_start_time
-            steps_per_s = step / max(elapsed_s, 1e-6)
-            remaining_steps = max(args_cli.total_steps - step, 0)
-            eta_s = remaining_steps / max(steps_per_s, 1e-6)
-            print(
-                f"[HEARTBEAT] step={step}/{args_cli.total_steps} replay={replay.size} "
-                f"updates={update_count} elapsed={_format_seconds(elapsed_s)} eta={_format_seconds(eta_s)} "
-                f"sps={steps_per_s:.2f}"
-            )
-            last_heartbeat_time = now_time
-
-        if step % args_cli.eval_interval == 0:
+    if eval_enabled and args_cli.eval_first:
+        should_eval_base = bool(args_cli.eval_base_during_training or args_cli.no_residual)
+        if should_eval_base:
             base_sr, base_ret = _evaluate(
                 actor=actor,
                 device=device,
@@ -1687,7 +2403,398 @@ def main() -> None:
                 task_type=task_type,
                 policy=base_policy,
                 prompt=prompt,
+                state_standardizer=state_standardizer,
             )
+        else:
+            base_sr, base_ret = float("nan"), float("nan")
+        residual_sr, residual_ret = _evaluate(
+            actor=actor,
+            device=device,
+            obs_encoder=obs_encoder,
+            residual_scale=args_cli.residual_scale,
+            low=low,
+            high=high,
+            base_only=bool(args_cli.no_residual),
+            episodes=args_cli.eval_episodes,
+            sim_env=sim_env,
+            env=env,
+            task_type=task_type,
+            policy=base_policy,
+            prompt=prompt,
+            state_standardizer=state_standardizer,
+        )
+        print(
+            f"[EVAL@0] step=0 residual_sr={residual_sr:.3f} residual_return={residual_ret:.3f} "
+            f"base_sr={base_sr:.3f} base_return={base_ret:.3f}"
+        )
+
+    while env_step < args_cli.total_steps:
+        control_step += 1
+        step_for_schedule = env_step + num_envs
+        exploration_std_step = _effective_exploration_std(step_for_schedule)
+        last_exploration_std = exploration_std_step
+        residual_scale_step = _effective_residual_scale(step_for_schedule)
+        residual_gate = torch.ones((num_envs, 1), device=device, dtype=torch.float32)
+        if args_cli.no_residual:
+            residual_unit = torch.zeros((num_envs, act_dim), device=device)
+            action = base_action
+            delta = torch.zeros_like(base_action)
+        elif step_for_schedule <= args_cli.warmup_steps:
+            if args_cli.use_base_policy_for_warmup:
+                warmup_noise = torch.empty((num_envs, act_dim), device=device).uniform_(
+                    -args_cli.warmup_noise_scale, args_cli.warmup_noise_scale
+                )
+                action = torch.clamp(base_action + warmup_noise, low, high)
+            else:
+                action = torch.empty((num_envs, act_dim), device=device).uniform_(
+                    -args_cli.warmup_noise_scale, args_cli.warmup_noise_scale
+                )
+                action = torch.clamp(action, low, high)
+                warmup_noise = action - base_action
+            # Normalize for logging only (keep bounded like actor output).
+            residual_unit = torch.clamp(warmup_noise / max(residual_scale_step, 1e-6), -1.0, 1.0)
+            delta = action - base_action
+        else:
+            with torch.no_grad():
+                residual_unit, residual_gate = actor(obs_vec, base_action)
+                residual_unit = torch.clamp(
+                    residual_unit + torch.randn_like(residual_unit) * exploration_std_step, -1.0, 1.0
+                )
+            action, delta = _compose_action(
+                base_action,
+                residual_unit,
+                residual_scale_step,
+                low,
+                high,
+                args_cli.residual_scale_min,
+                args_cli.residual_scale_max,
+                residual_gate,
+            )
+
+        if env.cfg.dynamic_reset_gripper_effort_limit:
+            dynamic_reset_gripper_effort_limit_sim(env, task_type)
+        next_obs_dict, reward, terminated, truncated, step_info = sim_env.step(action)
+        executed_action = action
+        if isinstance(step_info, dict):
+            scaled_action = step_info.get("scaled_action")
+            if isinstance(scaled_action, torch.Tensor) and scaled_action.shape == action.shape:
+                executed_action = scaled_action.to(device=device, dtype=action.dtype)
+        done_t = (terminated | truncated).detach().to(torch.bool)
+        done_np = done_t.detach().cpu().numpy().astype(bool).reshape(-1)
+        reward_np = reward.detach().cpu().numpy().reshape(-1)
+        success_np = env.reset_terminated.detach().cpu().numpy().astype(bool).reshape(-1)
+        task_rew_np = np.asarray(
+            [
+                _select_step_reward(float(reward_np[i]), done=bool(done_np[i]), success=bool(success_np[i]))
+                for i in range(num_envs)
+            ],
+            dtype=np.float32,
+        )
+        guidance_rew_np = np.zeros((num_envs,), dtype=np.float32)
+        guidance_progress_terms = np.zeros((num_envs,), dtype=np.float32)
+        guidance_gripper_terms = np.zeros((num_envs,), dtype=np.float32)
+        for env_id in range(num_envs):
+            if guidance_states[env_id] is not None:
+                metrics = _compute_guidance_reward(
+                    guidance_states[env_id],
+                    current_ee_pos_w=_current_ee_position_w(env, env_id=env_id),
+                    current_gripper_state=_extract_current_gripper_lerobot(env, env_id=env_id),
+                    coeffs=guidance_coeffs,
+                )
+                guidance_rew_np[env_id] = float(metrics.total_reward)
+                guidance_progress_terms[env_id] = float(metrics.progress_term)
+                guidance_gripper_terms[env_id] = float(metrics.gripper_term)
+        rew_np = task_rew_np + float(args_cli.traj_guidance_lambda) * guidance_rew_np
+        episode_guidance_progress += guidance_progress_terms
+        episode_guidance_gripper += guidance_gripper_terms
+
+        next_obs_vec = _compute_obs_vec_batch(
+            next_obs_dict,
+            obs_encoder,
+            device=device,
+            num_envs=num_envs,
+            state_standardizer=state_standardizer,
+        )
+        next_joint_np = np.zeros((num_envs, state_dim), dtype=np.float32)
+        next_front_np = np.zeros_like(obs_front_np)
+        next_wrist_np = np.zeros_like(obs_wrist_np)
+        for env_id in range(num_envs):
+            j, f, w = _prepare_modalities_for_replay(
+                next_obs_dict, obs_encoder, env_id=env_id, state_standardizer=state_standardizer
+            )
+            next_joint_np[env_id] = j
+            next_front_np[env_id] = f
+            next_wrist_np[env_id] = w
+        next_base_action = _compute_base_action_batch(base_policy, next_obs_dict, prompt, device=device, num_envs=num_envs)
+        next_base_action[done_t.reshape(-1)] = 0.0
+
+        if not args_cli.no_residual:
+            base_np = base_action.detach().cpu().numpy()
+            act_np = executed_action.detach().cpu().numpy()
+            next_base_np = next_base_action.detach().cpu().numpy()
+            for env_id in range(num_envs):
+                queue = n_step_queues[env_id]
+                queue.append(
+                    {
+                        "obs_joint": np.asarray(obs_joint_np[env_id], dtype=np.float32),
+                        "obs_front": np.asarray(obs_front_np[env_id], dtype=np.uint8),
+                        "obs_wrist": np.asarray(obs_wrist_np[env_id], dtype=np.uint8),
+                        "base": np.asarray(base_np[env_id], dtype=np.float32),
+                        "act": np.asarray(act_np[env_id], dtype=np.float32),
+                        "next_joint": np.asarray(next_joint_np[env_id], dtype=np.float32),
+                        "next_front": np.asarray(next_front_np[env_id], dtype=np.uint8),
+                        "next_wrist": np.asarray(next_wrist_np[env_id], dtype=np.uint8),
+                        "next_base": np.asarray(next_base_np[env_id], dtype=np.float32),
+                        "rew": float(rew_np[env_id]),
+                        "done": bool(done_np[env_id]),
+                    }
+                )
+                while len(queue) >= args_cli.n_step or (done_np[env_id] and len(queue) > 0):
+                    horizon = min(args_cli.n_step, len(queue))
+                    reward_n = 0.0
+                    done_n = False
+                    last = queue[horizon - 1]
+                    for i in range(horizon):
+                        tr = queue[i]
+                        reward_n += (args_cli.gamma**i) * float(tr["rew"])
+                        if bool(tr["done"]):
+                            done_n = True
+                            horizon = i + 1
+                            last = queue[i]
+                            break
+                    discount_n = (args_cli.gamma**horizon) if not done_n else 1.0
+                    replay.add(
+                        obs_joint=np.asarray(queue[0]["obs_joint"], dtype=np.float32),
+                        obs_front=np.asarray(queue[0]["obs_front"], dtype=np.uint8),
+                        obs_wrist=np.asarray(queue[0]["obs_wrist"], dtype=np.uint8),
+                        base=np.asarray(queue[0]["base"], dtype=np.float32),
+                        act=np.asarray(queue[0]["act"], dtype=np.float32),
+                        next_joint=np.asarray(last["next_joint"], dtype=np.float32),
+                        next_front=np.asarray(last["next_front"], dtype=np.uint8),
+                        next_wrist=np.asarray(last["next_wrist"], dtype=np.uint8),
+                        next_base=np.asarray(last["next_base"], dtype=np.float32),
+                        rew=reward_n,
+                        done=done_n,
+                        discount=discount_n,
+                    )
+                    queue.popleft()
+
+        episode_return += rew_np
+        for env_id in range(num_envs):
+            if not done_np[env_id]:
+                continue
+            episode_count += 1
+            recent_returns.append(float(episode_return[env_id]))
+            recent_success.append(float(success_np[env_id]))
+            recent_guidance_progress.append(float(episode_guidance_progress[env_id]))
+            recent_guidance_gripper.append(float(episode_guidance_gripper[env_id]))
+            episode_return[env_id] = 0.0
+            episode_guidance_progress[env_id] = 0.0
+            episode_guidance_gripper[env_id] = 0.0
+            if guidance_refs:
+                guidance_episode_counters[env_id] += 1
+                guidance_episode_idx += 1
+                selected = _select_reference_trajectory(
+                    guidance_refs,
+                    guidance_episode_counters[env_id],
+                    strategy=args_cli.traj_guidance_sampling,
+                    rng=guidance_rng,
+                )
+                guidance_states[env_id] = TrajectoryGuidanceState(traj=selected)
+                if args_cli.traj_guidance_reset_from_reference and initial_cube_pose_w is not None:
+                    initial_cube_pose_w[env_id] = selected.initial_cube_pose_w
+
+        if args_cli.traj_guidance_reset_from_reference and initial_cube_pose_w is not None:
+            setattr(env, "_trajectory_guidance_initial_cube_pose_w", initial_cube_pose_w)
+
+        if num_envs > 1 and hasattr(base_policy, "reset"):
+            # Shared chunked policy state is hard to manage with asynchronous per-env resets.
+            # Reset every control step to keep multi-env behavior deterministic.
+            base_policy.reset()
+
+        obs_dict = next_obs_dict
+        obs_vec = next_obs_vec
+        base_action = next_base_action
+        obs_joint_np, obs_front_np, obs_wrist_np = next_joint_np, next_front_np, next_wrist_np
+
+        prev_env_step = env_step
+        env_step = min(env_step + num_envs, int(args_cli.total_steps))
+
+        if (
+            (not args_cli.no_residual)
+            and env_step >= args_cli.learning_starts
+            and replay.size >= args_cli.batch_size
+        ):
+            step_actor_loss = float(last_stats.actor_loss)
+            for _ in range(args_cli.num_updates_per_iteration):
+                priority_beta = _effective_priority_beta(env_step)
+                batch, sample_meta = _sample_mixed_batch(
+                    online_replay=replay,
+                    offline_replay=offline_replay,
+                    batch_size=args_cli.batch_size,
+                    offline_ratio=args_cli.offline_mix_ratio,
+                    device=device,
+                    priority_beta=priority_beta,
+                )
+                if args_cli.obs_encoder == "vit" and args_cli.obs_train_encoder:
+                    obs_encoder.train()
+                else:
+                    obs_encoder.eval()
+                if encoder_opt is not None:
+                    encoder_opt.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    next_obs_feat_tgt = _encode_next_obs_batch(batch, obs_encoder, augment=args_cli.obs_use_drq_aug)
+                    target_residual, target_gate = actor_target(next_obs_feat_tgt, batch["next_base"])
+                    if args_cli.target_action_noise:
+                        target_noise = torch.clamp(
+                            torch.randn_like(target_residual) * args_cli.target_noise_std,
+                            -args_cli.target_noise_clip,
+                            args_cli.target_noise_clip,
+                        )
+                        target_residual = torch.clamp(target_residual + target_noise, -1.0, 1.0)
+                    target_action, _ = _compose_action(
+                        batch["next_base"],
+                        target_residual,
+                        residual_scale_step,
+                        low,
+                        high,
+                        args_cli.residual_scale_min,
+                        args_cli.residual_scale_max,
+                        target_gate,
+                    )
+                    q_t = critic_target(next_obs_feat_tgt, target_action)
+                    q_t_min = critic_target.target_min(q_t, args_cli.min_q_heads)
+                    target_q = batch["rew"] + (1.0 - batch["done"]) * batch["discount"] * q_t_min
+                    if args_cli.clip_q_target_to_reward_range and args_cli.reward_mode == "sparse":
+                        target_q = torch.clamp(target_q, min=0.0, max=1.0)
+
+                obs_feat = _encode_obs_batch(batch, obs_encoder, augment=args_cli.obs_use_drq_aug)
+                q_values = critic(obs_feat, batch["act"])
+                td_error_sq = (q_values - target_q.unsqueeze(0).expand_as(q_values)).pow(2).mean(dim=0).squeeze(-1)
+                is_weight = batch["is_weight"].squeeze(-1)
+                critic_loss = (is_weight * td_error_sq).mean()
+                critic_opt.zero_grad(set_to_none=True)
+                critic_loss.backward()
+                if encoder_opt is not None:
+                    encoder_opt.step()
+                critic_opt.step()
+                if args_cli.sampling_strategy == "prioritized_replay":
+                    td_priority = torch.sqrt(torch.clamp(td_error_sq.detach(), min=0.0)).cpu().numpy()
+                    online_bs = int(sample_meta["online_bs"])
+                    offline_bs = int(sample_meta["offline_bs"])
+                    if online_bs > 0:
+                        replay.update_priorities(
+                            np.asarray(sample_meta["online_idx"], dtype=np.int64),
+                            td_priority[:online_bs],
+                        )
+                    if offline_replay is not None and offline_bs > 0:
+                        offline_replay.update_priorities(
+                            np.asarray(sample_meta["offline_idx"], dtype=np.int64),
+                            td_priority[online_bs : online_bs + offline_bs],
+                        )
+
+                actor_loss = torch.tensor(0.0, device=device)
+                actor_update_enabled = update_count >= args_cli.critic_warmup_steps
+                if actor_update_enabled and update_count % args_cli.policy_delay == 0:
+                    obs_actor = obs_feat.detach()
+                    actor_residual, actor_gate = actor(obs_actor, batch["base"])
+                    actor_action, actor_delta = _compose_action(
+                        batch["base"],
+                        actor_residual,
+                        residual_scale_step,
+                        low,
+                        high,
+                        args_cli.residual_scale_min,
+                        args_cli.residual_scale_max,
+                        actor_gate,
+                    )
+                    actor_q = critic(obs_actor, actor_action)
+                    actor_val = critic.policy_value(actor_q, args_cli.policy_gradient_type)
+                    actor_loss = -actor_val.mean()
+                    actor_loss = actor_loss + args_cli.residual_reg_weight * (actor_delta.pow(2).mean())
+                    actor_opt.zero_grad(set_to_none=True)
+                    actor_loss.backward()
+                    actor_lr_step = _effective_actor_lr(update_count)
+                    for group in actor_opt.param_groups:
+                        group["lr"] = actor_lr_step
+                    actor_opt.step()
+                    step_actor_loss = float(actor_loss.detach().cpu().item())
+
+                    _soft_update(actor_target, actor, args_cli.tau)
+                    _soft_update(critic_target, critic, args_cli.tau)
+                else:
+                    # Keep critic targets fresh even during actor warmup.
+                    _soft_update(critic_target, critic, args_cli.tau)
+
+                update_count += 1
+                last_stats = TD3Stats(
+                    critic_loss=float(critic_loss.detach().cpu().item()),
+                    actor_loss=step_actor_loss,
+                    residual_l2=float(residual_unit.norm(p=2, dim=-1).mean().detach().cpu().item()),
+                    delta_l2=float(delta.norm(p=2, dim=-1).mean().detach().cpu().item()),
+                    gate_mean=float(residual_gate.mean().detach().cpu().item()),
+                    guidance_progress_term=(
+                        float(np.mean(recent_guidance_progress)) if recent_guidance_progress else 0.0
+                    ),
+                    guidance_gripper_term=(
+                        float(np.mean(recent_guidance_gripper)) if recent_guidance_gripper else 0.0
+                    ),
+                )
+
+        if _crossed_interval(prev_env_step, env_step, args_cli.log_interval) or env_step == args_cli.total_steps:
+            mean_return = float(np.mean(recent_returns)) if recent_returns else 0.0
+            mean_success = float(np.mean(recent_success)) if recent_success else 0.0
+            mean_guidance_progress = float(np.mean(recent_guidance_progress)) if recent_guidance_progress else 0.0
+            mean_guidance_gripper = float(np.mean(recent_guidance_gripper)) if recent_guidance_gripper else 0.0
+            elapsed_s = time.time() - wall_start_time
+            steps_per_s = env_step / max(elapsed_s, 1e-6)
+            remaining_steps = max(args_cli.total_steps - env_step, 0)
+            eta_s = remaining_steps / max(steps_per_s, 1e-6)
+            print(
+                f"[TRAIN] step={env_step} episodes={episode_count} replay={replay.size} "
+                f"elapsed={_format_seconds(elapsed_s)} eta={_format_seconds(eta_s)} steps_per_s={steps_per_s:.2f} "
+                f"return20={mean_return:.3f} success20={mean_success:.3f} "
+                f"critic_loss={last_stats.critic_loss:.3e} actor_loss={last_stats.actor_loss:.3e} "
+                f"residual_l2={last_stats.residual_l2:.4f} delta_l2={last_stats.delta_l2:.4f} "
+                f"gate_mean={last_stats.gate_mean:.3f} expl_std={last_exploration_std:.4f} "
+                f"guidance_prog={mean_guidance_progress:.4f} "
+                f"guidance_grip={mean_guidance_gripper:.4f}"
+            )
+
+        now_time = time.time()
+        if args_cli.heartbeat_interval_s > 0.0 and (now_time - last_heartbeat_time) >= args_cli.heartbeat_interval_s:
+            elapsed_s = now_time - wall_start_time
+            steps_per_s = env_step / max(elapsed_s, 1e-6)
+            remaining_steps = max(args_cli.total_steps - env_step, 0)
+            eta_s = remaining_steps / max(steps_per_s, 1e-6)
+            print(
+                f"[HEARTBEAT] step={env_step}/{args_cli.total_steps} replay={replay.size} "
+                f"updates={update_count} elapsed={_format_seconds(elapsed_s)} eta={_format_seconds(eta_s)} "
+                f"sps={steps_per_s:.2f}"
+            )
+            last_heartbeat_time = now_time
+
+        if eval_enabled and _crossed_interval(prev_env_step, env_step, args_cli.eval_interval):
+            should_eval_base = bool(args_cli.eval_base_during_training or args_cli.no_residual)
+            if should_eval_base:
+                base_sr, base_ret = _evaluate(
+                    actor=actor,
+                    device=device,
+                    obs_encoder=obs_encoder,
+                    residual_scale=args_cli.residual_scale,
+                    low=low,
+                    high=high,
+                    base_only=True,
+                    episodes=args_cli.eval_episodes,
+                    sim_env=sim_env,
+                    env=env,
+                    task_type=task_type,
+                    policy=base_policy,
+                    prompt=prompt,
+                    state_standardizer=state_standardizer,
+                )
+            else:
+                base_sr, base_ret = float("nan"), float("nan")
             if args_cli.no_residual:
                 residual_sr, residual_ret = base_sr, base_ret
             else:
@@ -1705,26 +2812,22 @@ def main() -> None:
                     task_type=task_type,
                     policy=base_policy,
                     prompt=prompt,
+                    state_standardizer=state_standardizer,
                 )
-            # Resume training from a clean state after evaluation episodes.
-            obs_dict, _ = sim_env.reset()
-            if hasattr(base_policy, "reset"):
-                base_policy.reset()
-            front_e, wrist_e, _ = _extract_record_modalities(obs_dict)
-            state_e = _extract_residual_state(obs_dict)
-            obs_vec = obs_encoder.encode_single_no_grad(front=front_e, wrist=wrist_e, joint_state=state_e).to(device)
-            base_obs = _build_base_obs(obs_dict, prompt)
-            base_action = base_policy.get_action(base_obs).to(device)[0, 0, :].float()
-            obs_joint_np, obs_front_np, obs_wrist_np = _prepare_modalities_for_replay(obs_dict, obs_encoder)
-            episode_return = 0.0
-            print(
-                f"[EVAL] step={step} base_sr={base_sr:.3f} residual_sr={residual_sr:.3f} "
-                f"base_ret={base_ret:.3f} residual_ret={residual_ret:.3f}"
-            )
+            if should_eval_base:
+                print(
+                    f"[EVAL] step={env_step} base_sr={base_sr:.3f} residual_sr={residual_sr:.3f} "
+                    f"base_ret={base_ret:.3f} residual_ret={residual_ret:.3f}"
+                )
+            else:
+                print(
+                    f"[EVAL] step={env_step} base=skipped residual_sr={residual_sr:.3f} "
+                    f"residual_ret={residual_ret:.3f}"
+                )
 
-        if step % args_cli.save_interval == 0:
+        if _crossed_interval(prev_env_step, env_step, args_cli.save_interval):
             ckpt = {
-                "step": step,
+                "step": env_step,
                 "actor": actor.state_dict(),
                 "critic": critic.state_dict(),
                 "actor_target": actor_target.state_dict(),
@@ -1735,7 +2838,7 @@ def main() -> None:
                 "encoder_opt": encoder_opt.state_dict() if encoder_opt is not None else None,
                 "args": vars(args_cli),
             }
-            ckpt_path = os.path.join(args_cli.log_dir, f"residual_td3_step_{step:08d}.pt")
+            ckpt_path = os.path.join(args_cli.log_dir, f"residual_td3_step_{env_step:08d}.pt")
             torch.save(ckpt, ckpt_path)
             print(f"[CHECKPOINT] Saved {ckpt_path}")
 
