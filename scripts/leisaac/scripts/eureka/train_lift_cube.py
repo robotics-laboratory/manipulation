@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run IsaacLabEureka on the LeIsaac direct PickOrange task.
+"""Run IsaacLabEureka on the LeIsaac direct LiftCube task.
 
 This wrapper keeps IsaacLabEureka unmodified. It registers the LeIsaac task in
 Eureka's task config and patches the worker environment creation so subprocesses
@@ -12,12 +12,12 @@ import argparse
 import os
 
 TASKS_CFG_PATCH = {
-    "LeIsaac-SO101-PickOrange-Eureka-Direct-v0": {
+    "LeIsaac-SO101-LiftCube-Eureka-Direct-v0": {
         "description": (
-            "pick three oranges, place them on the plate, and return the SO-101 arm to its rest pose. "
-            "The reward should encourage reaching the active unplaced orange, grasping it, lifting it, "
-            "moving it above the plate, releasing it on the plate, avoiding disturbance of future oranges, "
-            "and completing all three placements."
+            "lift the red cube from the table with the SO-101 arm in a stable, human-like motion. "
+            "The reward should encourage reaching and grasping the cube, lifting it above the base-height "
+            "success threshold, keeping the cube stable while lifted, avoiding wrist-flip exploits, and "
+            "finishing with a controlled hold at the target height."
         ),
         "success_metric": "self._eureka_success_metric(env_ids)",
         "success_metric_to_win": 1.0,
@@ -75,8 +75,8 @@ def _patch_isaaclab_eureka() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train PickOrange rewards with IsaacLabEureka.")
-    parser.add_argument("--task", type=str, default="LeIsaac-SO101-PickOrange-Eureka-Direct-v0")
+    parser = argparse.ArgumentParser(description="Train LiftCube rewards with IsaacLabEureka.")
+    parser.add_argument("--task", type=str, default="LeIsaac-SO101-LiftCube-Eureka-Direct-v0")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--env_seed", type=int, default=42)
     parser.add_argument("--max_eureka_iterations", type=int, default=5)
@@ -89,7 +89,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.rl_library != "rsl_rl":
-        raise ValueError("LeIsaac PickOrange Eureka currently registers only an RSL-RL config.")
+        raise ValueError("LeIsaac LiftCube Eureka currently registers only an RSL-RL config.")
     if os.name == "nt" and args.num_parallel_runs > 1:
         args.num_parallel_runs = 1
 

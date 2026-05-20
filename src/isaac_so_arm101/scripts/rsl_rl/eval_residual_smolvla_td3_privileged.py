@@ -604,6 +604,157 @@ def _extract_state(obs_dict: dict, state_source: str) -> np.ndarray:
     return arr.astype(np.float32).reshape(-1)[:6]
 
 
+# ---------------------------------------------------------------------------
+# State standardization (must mirror training-time normalization to avoid a
+# silent train-eval distribution shift on the ViT encoder + residual actor).
+# ---------------------------------------------------------------------------
+
+def _fit_state_dim(state: np.ndarray, state_dim: int) -> np.ndarray:
+    vec = np.asarray(state, dtype=np.float32).reshape(-1)
+    out = np.zeros((int(state_dim),), dtype=np.float32)
+    n = min(out.shape[0], vec.shape[0])
+    if n > 0:
+        out[:n] = vec[:n]
+    return out
+
+
+class StateStandardizer:
+    """Dataset-stat normalizer for residual state vectors (eval-side copy)."""
+
+    def __init__(self, mean: np.ndarray, std: np.ndarray, min_std: float):
+        mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+        std = np.asarray(std, dtype=np.float32).reshape(-1)
+        if mean.shape != std.shape:
+            raise ValueError(f"State normalizer mean/std shape mismatch: {mean.shape} vs {std.shape}")
+        self.mean = mean
+        self.std = np.maximum(std, float(min_std))
+        self.min_std = float(min_std)
+
+    @property
+    def dim(self) -> int:
+        return int(self.mean.shape[0])
+
+    def transform_np(self, vec: np.ndarray) -> np.ndarray:
+        x = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if x.shape[0] != self.dim:
+            x = _fit_state_dim(x, self.dim)
+        return (x - self.mean) / self.std
+
+
+def _resolve_lerobot_dataset_class():
+    for import_path in (
+        "lerobot.common.datasets.lerobot_dataset",
+        "lerobot.common.datasets",
+        "lerobot.datasets.lerobot_dataset",
+        "lerobot.datasets",
+    ):
+        try:
+            mod = __import__(import_path, fromlist=["LeRobotDataset"])
+            dataset_cls = getattr(mod, "LeRobotDataset", None)
+            if dataset_cls is not None:
+                return dataset_cls
+        except Exception:
+            continue
+    raise RuntimeError("Could not import LeRobotDataset. Install lerobot dataset extras.")
+
+
+def _extract_state_stats_from_dataset_stats(stats: dict, state_dim: int) -> tuple[np.ndarray, np.ndarray] | None:
+    if not isinstance(stats, dict):
+        return None
+    candidate_keys = ("observation.state", "state", "joint_pos_abs", "observation.joint_pos")
+    state_stats = None
+    for key in candidate_keys:
+        if key in stats:
+            state_stats = stats[key]
+            break
+    if not isinstance(state_stats, dict):
+        return None
+    mean = state_stats.get("mean", None)
+    std = state_stats.get("std", None)
+    if mean is None or std is None:
+        return None
+    mean_vec = _fit_state_dim(np.asarray(mean, dtype=np.float32).reshape(-1), state_dim)
+    std_vec = _fit_state_dim(np.asarray(std, dtype=np.float32).reshape(-1), state_dim)
+    return mean_vec, std_vec
+
+
+def _build_eval_state_standardizer(
+    ckpt: dict,
+    ckpt_args: dict,
+    state_dim: int,
+) -> StateStandardizer | None:
+    """Reconstruct training-time state standardizer for eval.
+
+    Preference order:
+      1. Use serialized standardizer saved in the checkpoint (new format).
+      2. Fall back to rebuilding from the offline HF dataset that training used
+         (matches `_build_state_standardizer_from_offline_hf` in the trainer).
+      3. Return None if normalization was disabled at training time or stats are
+         unavailable (eval will then feed raw state, same as legacy behavior).
+    """
+    payload = ckpt.get("state_standardizer")
+    if isinstance(payload, dict) and "mean" in payload and "std" in payload:
+        try:
+            standardizer = StateStandardizer(
+                mean=np.asarray(payload["mean"], dtype=np.float32),
+                std=np.asarray(payload["std"], dtype=np.float32),
+                min_std=float(payload.get("min_std", 1e-3)),
+            )
+            print(
+                f"[INFO] State normalizer loaded from checkpoint payload "
+                f"(dim={standardizer.dim}, min_std={standardizer.min_std:g})."
+            )
+            if standardizer.dim != int(state_dim):
+                print(
+                    f"[WARN] Checkpoint standardizer dim {standardizer.dim} != eval state_dim "
+                    f"{state_dim}; transform_np will fit-or-truncate the vector."
+                )
+            return standardizer
+        except Exception as exc:
+            print(f"[WARN] Failed to load standardizer from checkpoint payload: {exc}")
+
+    if not bool(ckpt_args.get("offline_state_normalize", True)):
+        print("[INFO] State normalization disabled at training time (offline_state_normalize=False).")
+        return None
+    repo_id = ckpt_args.get("offline_hf_dataset")
+    if not repo_id:
+        print(
+            "[WARN] No state_standardizer in checkpoint and no offline_hf_dataset in checkpoint args; "
+            "eval will feed RAW state to the encoder/actor. This causes train-eval distribution shift "
+            "if training was run with --offline_state_normalize."
+        )
+        return None
+
+    try:
+        LeRobotDataset = _resolve_lerobot_dataset_class()
+        ds = LeRobotDataset(repo_id=str(repo_id))
+        stats = getattr(getattr(ds, "meta", None), "stats", None)
+        out = _extract_state_stats_from_dataset_stats(stats, state_dim=int(state_dim))
+        if out is None:
+            print(
+                f"[WARN] Offline dataset {repo_id} has no usable state mean/std; "
+                "eval will feed RAW state (distribution shift risk)."
+            )
+            return None
+        mean_vec, std_vec = out
+        standardizer = StateStandardizer(
+            mean=mean_vec,
+            std=std_vec,
+            min_std=float(ckpt_args.get("offline_state_min_std", 1e-3)),
+        )
+        print(
+            f"[INFO] State normalizer rebuilt from offline dataset: repo={repo_id} "
+            f"dim={standardizer.dim} min_std={standardizer.min_std:g}"
+        )
+        return standardizer
+    except Exception as exc:
+        print(
+            f"[WARN] Failed to rebuild state normalizer from offline dataset {repo_id}: {exc}. "
+            "Eval will feed RAW state (distribution shift risk)."
+        )
+        return None
+
+
 def _build_base_obs(obs_dict: dict, task_description: str) -> dict:
     rec = obs_dict["record"]
     return {
@@ -856,6 +1007,18 @@ def main() -> None:
 
     def _build_eval_setup(source: str) -> tuple[ResidualActor, Callable[[dict], np.ndarray], int]:
         state_dim_local = int(_extract_state(obs0, source).shape[0])
+        # Rebuild training-time state normalizer (loaded from ckpt payload if present,
+        # otherwise reconstructed from the offline HF dataset that training used).
+        # Applied to the joint/state vector BEFORE it enters the ViT encoder or the actor,
+        # matching `state_standardizer.transform_np(...)` calls on the training path.
+        state_standardizer = _build_eval_state_standardizer(ckpt, ckpt_args, state_dim_local)
+
+        def _normalized_state(obs_dict: dict) -> np.ndarray:
+            raw = _extract_state(obs_dict, source)
+            if state_standardizer is None:
+                return raw
+            return state_standardizer.transform_np(raw)
+
         obs_dim_local = state_dim_local
         vit_encoder: EvalVisualObsEncoder | None = None
         if obs_encoder_mode == "vit":
@@ -885,13 +1048,15 @@ def main() -> None:
 
             def _extractor(obs_dict: dict) -> np.ndarray:
                 front, wrist, _ = _extract_record_modalities(obs_dict)
-                encoded = vit_encoder.encode_single_no_grad(front=front, wrist=wrist, joint_state=_extract_state(obs_dict, source))
+                encoded = vit_encoder.encode_single_no_grad(
+                    front=front, wrist=wrist, joint_state=_normalized_state(obs_dict)
+                )
                 return encoded.detach().cpu().numpy().astype(np.float32).reshape(-1)
 
         else:
 
             def _extractor(obs_dict: dict) -> np.ndarray:
-                return _extract_state(obs_dict, source)
+                return _normalized_state(obs_dict)
 
         actor_local = ResidualActor(
             obs_dim=obs_dim_local,

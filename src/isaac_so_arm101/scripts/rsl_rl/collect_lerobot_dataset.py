@@ -66,6 +66,15 @@ parser.add_argument(
     default=True,
     help="Use must-go mode for residual base policy service client.",
 )
+parser.add_argument(
+    "--skip_teleop_device_setup",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help=(
+        "Override teleop setup toggle. If omitted with --residual_checkpoint, "
+        "uses checkpoint args['skip_teleop_device_setup'] when available."
+    ),
+)
 parser.add_argument("--num_episodes", type=int, default=50, help="Number of successful episodes to record.")
 parser.add_argument(
     "--repo_id",
@@ -219,6 +228,7 @@ from isaaclab.envs import (
     DirectMARLEnvCfg,
     DirectRLEnvCfg,
     ManagerBasedRLEnvCfg,
+    mdp as isaac_mdp,
     multi_agent_to_single_agent,
 )
 from isaaclab.managers import DatasetExportMode, SceneEntityCfg, TerminationTermCfg
@@ -242,10 +252,10 @@ except ModuleNotFoundError:
 import isaaclab_tasks  # noqa: F401
 import isaac_so_arm101.tasks  # noqa: F401
 import leisaac.tasks  # noqa: F401
-from isaaclab_tasks.utils import get_checkpoint_path
+from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from leisaac.tasks.lift_cube import mdp as lift_cube_mdp
-from leisaac.utils.env_utils import get_task_type
+from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim, get_task_type
 from leisaac.utils.robot_utils import convert_leisaac_action_to_lerobot, convert_lerobot_action_to_leisaac
 
 
@@ -686,6 +696,35 @@ def _detect_lift_cube_success(env) -> torch.Tensor:
     )
 
 
+def _configure_lerobot_absolute_joint_actions(env_cfg, task_type: str) -> None:
+    if task_type != "so101leader":
+        return
+    for action_name in ("arm_action", "gripper_action"):
+        action_cfg = getattr(env_cfg.actions, action_name, None)
+        if action_cfg is not None and hasattr(action_cfg, "use_default_offset"):
+            action_cfg.use_default_offset = False
+            action_cfg.scale = 1.0
+
+
+def _restore_dense_reward_setup(env_cfg, task: str) -> None:
+    if "LiftCube" not in task:
+        return
+    dense_cfg = parse_env_cfg("LeIsaac-SO101-LiftCube-RewardDense-v0", device=args_cli.device, num_envs=1)
+    env_cfg.rewards = dense_cfg.rewards
+    env_cfg.curriculum = dense_cfg.curriculum
+
+
+def _ensure_collect_env_terminations(env_cfg, task: str) -> None:
+    if "Collect" not in task:
+        return
+    # Keep episodes running after geometric success; collection loop will
+    # mark success manually after recording --post_success_steps extra frames.
+    env_cfg.terminations.success = TerminationTermCfg(
+        func=lambda env: torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device),
+    )
+    env_cfg.terminations.time_out = TerminationTermCfg(func=isaac_mdp.time_out, time_out=True)
+
+
 def _get_action_bounds(env, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     action_space = env.unwrapped.single_action_space
     low = torch.as_tensor(action_space.low, dtype=torch.float32, device=device)
@@ -761,7 +800,10 @@ def _build_residual_collection_policy(env, residual_checkpoint_path: str, device
     task_type = get_task_type(args_cli.task)
     base_policy = _build_policy_client(env, task_type, policy_backend, policy_ckpt, action_horizon)
     low, high = _get_action_bounds(env, device)
-    obs0 = env.get_observations()
+    if hasattr(env, "get_observations"):
+        obs0 = env.get_observations()
+    else:
+        obs0 = _reset_env_obs(env)
 
     vit_encoder: EvalVisualObsEncoder | None = None
     state_dim = int(_extract_state(obs0, state_source).shape[0])
@@ -898,6 +940,27 @@ def _warmup_after_reset(env, num_steps: int) -> None:
         env.unwrapped.sim.render()
 
 
+def _reset_env_obs(env):
+    """Reset env and always return observation dict."""
+    reset_out = env.reset()
+    if isinstance(reset_out, tuple):
+        return reset_out[0]
+    return reset_out
+
+
+def _step_env_obs(env, actions):
+    """Step env and return (obs, done_tensor_or_none)."""
+    step_out = env.step(actions)
+    if isinstance(step_out, tuple) and len(step_out) == 5:
+        obs, _reward, terminated, truncated, _info = step_out
+        done = terminated | truncated
+        return obs, done
+    if isinstance(step_out, tuple) and len(step_out) == 4:
+        obs, _reward, done, _info = step_out
+        return obs, done
+    raise RuntimeError("Unexpected env.step output format in collection loop.")
+
+
 class ManualDecisionController:
     """Keyboard callbacks for manual dataset decisions during automated teacher rollout."""
 
@@ -936,11 +999,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Collect successful LeRobot episodes with an RSL-RL agent."""
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Collect", "").replace("-Play", "")
+    task_type = get_task_type(args_cli.task)
 
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    skip_teleop = args_cli.skip_teleop_device_setup
+    if args_cli.residual_checkpoint and skip_teleop is None:
+        try:
+            residual_ckpt_path = str(retrieve_file_path(args_cli.residual_checkpoint))
+            ckpt = torch.load(residual_ckpt_path, map_location="cpu")
+            ckpt_args = ckpt.get("args", {})
+            if isinstance(ckpt_args, dict):
+                skip_teleop = bool(ckpt_args.get("skip_teleop_device_setup", False))
+        except Exception as exc:
+            print(f"[WARN] Could not inspect residual checkpoint teleop setup flag: {exc}")
+    if skip_teleop is None:
+        skip_teleop = False
+    if not skip_teleop and hasattr(env_cfg, "use_teleop_device"):
+        env_cfg.use_teleop_device(task_type)
+    _configure_lerobot_absolute_joint_actions(env_cfg, task_type)
+    _restore_dense_reward_setup(env_cfg, args_cli.task)
+    _ensure_collect_env_terminations(env_cfg, args_cli.task)
 
     resume_path = None
     if not args_cli.residual_checkpoint:
@@ -962,35 +1043,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         env_cfg.log_dir = os.path.dirname(resume_path)
 
-    env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
+    sim_env = gym.make(args_cli.task, cfg=env_cfg)
+    if isinstance(sim_env.unwrapped, DirectMARLEnv):
+        sim_env = multi_agent_to_single_agent(sim_env)
 
-    _replace_lerobot_recorder(env, env_cfg)
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    _replace_lerobot_recorder(sim_env, env_cfg)
 
-    device = torch.device(env.unwrapped.device)
+    # Keep residual collection on the same raw gym-env stepping path as eval script.
+    policy_env = sim_env if args_cli.residual_checkpoint else RslRlVecEnvWrapper(sim_env.unwrapped, clip_actions=agent_cfg.clip_actions)
+
+    device = torch.device(policy_env.unwrapped.device)
     if args_cli.residual_checkpoint:
         residual_ckpt_path = str(retrieve_file_path(args_cli.residual_checkpoint))
-        policy = _build_residual_collection_policy(env, residual_ckpt_path, device=device)
+        policy = _build_residual_collection_policy(policy_env, residual_ckpt_path, device=device)
     else:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         if agent_cfg.class_name == "OnPolicyRunner":
-            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+            runner = OnPolicyRunner(policy_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         elif agent_cfg.class_name == "DistillationRunner":
-            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+            runner = DistillationRunner(policy_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
         runner.load(resume_path)
-        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        policy = runner.get_inference_policy(device=policy_env.unwrapped.device)
 
-    obs = env.get_observations()
+    if hasattr(policy_env, "get_observations"):
+        obs = policy_env.get_observations()
+    else:
+        obs = _reset_env_obs(policy_env)
     if hasattr(policy, "reset"):
         policy.reset()
     total_steps = 0
-    initial_episode_count = _get_lerobot_episode_count(env) if args_cli.resume_dataset else 0
+    initial_episode_count = _get_lerobot_episode_count(policy_env) if args_cli.resume_dataset else 0
     target_episode_count = initial_episode_count + args_cli.num_episodes
-    last_success_count = env.unwrapped.recorder_manager.exported_successful_episode_count
+    last_success_count = policy_env.unwrapped.recorder_manager.exported_successful_episode_count
     success_detected = False
     post_success_steps = 0
     collection_complete = False
@@ -1014,6 +1100,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.max_action_delta > 0.0:
         target_dims = "all action dims" if args_cli.limit_gripper_delta else "arm action dims only"
         print(f"[INFO] Limiting teacher action delta to {args_cli.max_action_delta:g} per step ({target_dims}).")
+    episode_horizon = int(getattr(policy_env.unwrapped, "max_episode_length", 0))
+    if args_cli.max_steps > 0 and episode_horizon > 0 and args_cli.max_steps <= episode_horizon:
+        print(
+            f"[WARN] --max_steps={args_cli.max_steps} is <= one episode horizon ({episode_horizon}). "
+            "Success-only collection may terminate before any successful export."
+        )
     if manual_controller is not None:
         print("[INFO] Manual decision mode enabled. Press B to start, N to save success+reset, R to reset/skip.")
         print(f"[INFO] Post-reset render warmup: {args_cli.post_reset_warmup_steps} frames.")
@@ -1025,11 +1117,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print("Task Success!!!")
                     print("[INFO] Manual success marked; exporting episode and resetting.")
                     expected_success_count = last_success_count + 1
-                    _set_manual_success(env, True)
-                    obs, _ = env.reset()
+                    _set_manual_success(policy_env, True)
+                    obs = _reset_env_obs(policy_env)
                     if hasattr(policy, "reset"):
                         policy.reset()
-                    _set_manual_success(env, False)
+                    _set_manual_success(policy_env, False)
                     previous_actions = None
                     success_detected = False
                     post_success_steps = 0
@@ -1038,7 +1130,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     manual_recording_active = False
                     manual_controller.reset_flags()
 
-                    success_count = env.unwrapped.recorder_manager.exported_successful_episode_count
+                    success_count = policy_env.unwrapped.recorder_manager.exported_successful_episode_count
                     if success_count > last_success_count:
                         last_success_count = success_count
                         total_success_count = initial_episode_count + success_count
@@ -1059,8 +1151,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
                 if manual_controller.reset_failed:
                     print("[INFO] Manual reset requested; skipping current episode.")
-                    _set_manual_success(env, False)
-                    obs, _ = env.reset()
+                    _set_manual_success(policy_env, False)
+                    obs = _reset_env_obs(policy_env)
                     if hasattr(policy, "reset"):
                         policy.reset()
                     previous_actions = None
@@ -1074,7 +1166,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     continue
 
                 if pending_manual_warmup_steps > 0:
-                    env.unwrapped.sim.render()
+                    policy_env.unwrapped.sim.render()
                     pending_manual_warmup_steps -= 1
                     continue
 
@@ -1084,7 +1176,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     manual_controller.start_recording = False
 
                 if not manual_recording_active:
-                    env.unwrapped.sim.render()
+                    policy_env.unwrapped.sim.render()
                     continue
 
             with torch.no_grad():
@@ -1095,14 +1187,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 max_delta=args_cli.max_action_delta,
                 limit_gripper=args_cli.limit_gripper_delta,
             )
-            obs, _, _, _ = env.step(actions)
-            rate_limiter.sleep(env.unwrapped)
+            if policy_env.unwrapped.cfg.dynamic_reset_gripper_effort_limit:
+                dynamic_reset_gripper_effort_limit_sim(policy_env.unwrapped, task_type)
+            obs, done_flags = _step_env_obs(policy_env, actions)
+            rate_limiter.sleep(policy_env.unwrapped)
             previous_actions = actions.detach().clone()
 
             total_steps += 1
 
             if manual_controller is None:
-                is_success = bool(_detect_lift_cube_success(env)[0].item())
+                is_success = bool(_detect_lift_cube_success(policy_env)[0].item())
                 if is_success and not success_detected:
                     success_detected = True
                     post_success_steps = 0
@@ -1112,18 +1206,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     )
                 if success_detected:
                     post_success_steps += 1
+                elif done_flags is not None and bool(done_flags[0].detach().cpu().item()):
+                    # Match eval behavior: after unsuccessful terminal episodes, reset and try again.
+                    obs = _reset_env_obs(policy_env)
+                    if hasattr(policy, "reset"):
+                        policy.reset()
+                    previous_actions = None
+                    success_detected = False
+                    post_success_steps = 0
+                    continue
 
             if manual_controller is None and success_detected and post_success_steps >= args_cli.post_success_steps:
-                _set_manual_success(env, True)
-                obs, _ = env.reset()
+                _set_manual_success(policy_env, True)
+                obs = _reset_env_obs(policy_env)
                 if hasattr(policy, "reset"):
                     policy.reset()
-                _set_manual_success(env, False)
+                _set_manual_success(policy_env, False)
                 previous_actions = None
                 success_detected = False
                 post_success_steps = 0
 
-                success_count = env.unwrapped.recorder_manager.exported_successful_episode_count
+                success_count = policy_env.unwrapped.recorder_manager.exported_successful_episode_count
                 if success_count > last_success_count:
                     last_success_count = success_count
                     total_success_count = initial_episode_count + success_count
@@ -1139,13 +1242,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"[WARN] Reached --max_steps={args_cli.max_steps} before collection completed.")
                 break
     finally:
-        if hasattr(env.unwrapped.recorder_manager, "finalize"):
-            env.unwrapped.recorder_manager.finalize()
+        if hasattr(policy_env.unwrapped.recorder_manager, "finalize"):
+            policy_env.unwrapped.recorder_manager.finalize()
         if args_cli.push_to_hub and collection_complete:
-            _push_dataset_to_hub(env)
+            _push_dataset_to_hub(policy_env)
         elif args_cli.push_to_hub:
             print("[WARN] Collection did not reach requested episode count; skipping push_to_hub.")
-        env.close()
+        policy_env.close()
 
 
 if __name__ == "__main__":

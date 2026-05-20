@@ -130,6 +130,36 @@ parser.add_argument(
     help="Upper bound for applied residual action scale.",
 )
 parser.add_argument(
+    "--residual_takeover_start_steps",
+    type=int,
+    default=0,
+    help="Keep residual inactive until this many env steps (base-only rollout).",
+)
+parser.add_argument(
+    "--residual_takeover_ramp_steps",
+    type=int,
+    default=0,
+    help=(
+        "Linearly ramp residual takeover probability from 0->1 over this many env steps after "
+        "--residual_takeover_start_steps. 0 means immediate full takeover."
+    ),
+)
+parser.add_argument(
+    "--episode_takeover_delay_steps",
+    type=int,
+    default=0,
+    help="Per-episode base-only prefix length in env steps before residual takeover can activate.",
+)
+parser.add_argument(
+    "--episode_takeover_delay_random_max_steps",
+    type=int,
+    default=0,
+    help=(
+        "If >0, sample per-episode takeover delay uniformly in "
+        "[episode_takeover_delay_steps, episode_takeover_delay_random_max_steps]."
+    ),
+)
+parser.add_argument(
     "--progressive_clipping_steps",
     type=int,
     default=0,
@@ -159,6 +189,28 @@ parser.add_argument(
     type=float,
     default=-2.0,
     help="Initial bias for gate head logits (negative keeps early gate conservative).",
+)
+parser.add_argument(
+    "--gate_reg_weight",
+    type=float,
+    default=0.0,
+    help=(
+        "L1 penalty on the gate value g(s) added to actor loss. Adds a fixed per-sample cost "
+        "for opening the gate, so the actor only opens it where Q-gain over base outweighs the "
+        "penalty. Typical useful range: 0.05-0.5 with --reward_mode=dense; 0.005-0.05 with sparse. "
+        "0.0 disables (gate will tend to saturate to 1.0 like the original ResFiT-style loss)."
+    ),
+)
+parser.add_argument(
+    "--gate_advantage_reg_weight",
+    type=float,
+    default=0.0,
+    help=(
+        "Advantage-aware gate penalty: lambda * gate(s) * relu(Q(s, base) - Q(s, base+delta)). "
+        "Adds extra cost for opening the gate only in states where the residual is NOT improving "
+        "Q over the base policy. Encourages selective intervention. Typical: 0.1-1.0. "
+        "0.0 disables. Works on top of --gate_reg_weight."
+    ),
 )
 parser.add_argument(
     "--actor_last_layer_init_scale",
@@ -1092,6 +1144,8 @@ class TD3Stats:
     residual_l2: float = 0.0
     delta_l2: float = 0.0
     gate_mean: float = 1.0
+    gate_reg_loss: float = 0.0
+    actor_q_advantage: float = 0.0
     guidance_progress_term: float = 0.0
     guidance_gripper_term: float = 0.0
 
@@ -1597,6 +1651,7 @@ class StateStandardizer:
             raise ValueError(f"State normalizer mean/std shape mismatch: {mean.shape} vs {std.shape}")
         self.mean = mean
         self.std = np.maximum(std, float(min_std))
+        self.min_std = float(min_std)
 
     @property
     def dim(self) -> int:
@@ -1607,6 +1662,17 @@ class StateStandardizer:
         if x.shape[0] != self.dim:
             x = _fit_state_dim(x, self.dim)
         return (x - self.mean) / self.std
+
+
+def _state_standardizer_payload(standardizer: "StateStandardizer | None") -> dict | None:
+    """Serializable payload for state standardizer (saved in checkpoints for eval-time reuse)."""
+    if standardizer is None:
+        return None
+    return {
+        "mean": np.asarray(standardizer.mean, dtype=np.float32),
+        "std": np.asarray(standardizer.std, dtype=np.float32),
+        "min_std": float(standardizer.min_std),
+    }
 
 
 def _extract_state_stats_from_dataset_stats(stats: dict, state_dim: int) -> tuple[np.ndarray, np.ndarray] | None:
@@ -1972,6 +2038,7 @@ def _compose_action(
     residual_scale_min: float,
     residual_scale_max: float,
     residual_gate: torch.Tensor | None = None,
+    takeover_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     scale_min = float(min(residual_scale_min, residual_scale_max))
     scale_max = float(max(residual_scale_min, residual_scale_max))
@@ -1982,6 +2049,8 @@ def _compose_action(
         # Gate chooses when to apply stronger correction while staying inside [scale_min, scale_cap].
         gated_scale = scale_min + (scale_cap - scale_min) * torch.clamp(residual_gate, 0.0, 1.0)
         delta = gated_scale * residual_unit
+    if takeover_mask is not None:
+        delta = delta * takeover_mask.to(device=delta.device, dtype=delta.dtype)
     final_action = torch.clamp(base_action + delta, low, high)
     return final_action, delta
 
@@ -1991,6 +2060,27 @@ def _effective_residual_scale(step: int) -> float:
         return float(args_cli.residual_scale)
     progress = min(1.0, float(step) / max(float(args_cli.progressive_clipping_steps), 1.0))
     return float(args_cli.residual_scale) * progress
+
+
+def _effective_residual_takeover_prob(step: int) -> float:
+    start = int(max(args_cli.residual_takeover_start_steps, 0))
+    ramp = int(max(args_cli.residual_takeover_ramp_steps, 0))
+    if step < start:
+        return 0.0
+    if ramp <= 0:
+        return 1.0
+    progress = float(step - start) / float(ramp)
+    return float(min(1.0, max(0.0, progress)))
+
+
+def _sample_episode_takeover_delay_steps(rng: np.random.Generator, count: int) -> np.ndarray:
+    fixed = int(max(args_cli.episode_takeover_delay_steps, 0))
+    random_max = int(max(args_cli.episode_takeover_delay_random_max_steps, 0))
+    if random_max <= 0:
+        return np.full((count,), fixed, dtype=np.int32)
+    lo = min(fixed, random_max)
+    hi = max(fixed, random_max)
+    return rng.integers(lo, hi + 1, size=(count,), dtype=np.int32)
 
 
 def _effective_actor_lr(update_count: int) -> float:
@@ -2107,6 +2197,10 @@ def main() -> None:
     print(
         f"[INFO] Residual TD3 hypers: residual_scale={args_cli.residual_scale:.3f}, "
         f"residual_scale_range=[{args_cli.residual_scale_min:.3f},{args_cli.residual_scale_max:.3f}], "
+        f"residual_takeover_start_steps={args_cli.residual_takeover_start_steps}, "
+        f"residual_takeover_ramp_steps={args_cli.residual_takeover_ramp_steps}, "
+        f"episode_takeover_delay_steps={args_cli.episode_takeover_delay_steps}, "
+        f"episode_takeover_delay_random_max_steps={args_cli.episode_takeover_delay_random_max_steps}, "
         f"actor_lr={args_cli.actor_lr:.1e}, critic_lr={args_cli.critic_lr:.1e}, "
         f"exploration_std={args_cli.exploration_std:.4f}, exploration_std_min="
         f"{(args_cli.exploration_std if args_cli.exploration_std_min is None else args_cli.exploration_std_min):.4f}, "
@@ -2150,6 +2244,7 @@ def main() -> None:
         print("[INFO] --no_residual enabled: running pure base policy (delta=0).")
     torch.manual_seed(args_cli.seed)
     np.random.seed(args_cli.seed)
+    episode_takeover_rng = np.random.default_rng(args_cli.seed + 17)
     wall_start_time = time.time()
 
     device = torch.device(args_cli.device)
@@ -2380,11 +2475,15 @@ def main() -> None:
     update_count = 0
     last_stats = TD3Stats()
     n_step_queues: list[deque[dict[str, np.ndarray | float | bool]]] = [deque() for _ in range(num_envs)]
+    episode_step_in_env = np.zeros((num_envs,), dtype=np.int32)
+    episode_takeover_delay_steps = _sample_episode_takeover_delay_steps(episode_takeover_rng, num_envs)
     last_heartbeat_time = time.time()
     print("[INFO] Entering training loop.")
     env_step = 0
     control_step = 0
     last_exploration_std = _effective_exploration_std(0)
+    last_takeover_prob = _effective_residual_takeover_prob(0)
+    last_takeover_rate = 0.0
 
     if eval_enabled and args_cli.eval_first:
         should_eval_base = bool(args_cli.eval_base_during_training or args_cli.no_residual)
@@ -2434,7 +2533,15 @@ def main() -> None:
         exploration_std_step = _effective_exploration_std(step_for_schedule)
         last_exploration_std = exploration_std_step
         residual_scale_step = _effective_residual_scale(step_for_schedule)
+        takeover_prob_step = _effective_residual_takeover_prob(step_for_schedule)
+        last_takeover_prob = takeover_prob_step
+        episode_takeover_ready_mask = torch.as_tensor(
+            (episode_step_in_env >= episode_takeover_delay_steps).astype(np.float32),
+            device=device,
+            dtype=torch.float32,
+        ).unsqueeze(-1)
         residual_gate = torch.ones((num_envs, 1), device=device, dtype=torch.float32)
+        takeover_mask = torch.zeros((num_envs, 1), device=device, dtype=torch.float32)
         if args_cli.no_residual:
             residual_unit = torch.zeros((num_envs, act_dim), device=device)
             action = base_action
@@ -2460,6 +2567,8 @@ def main() -> None:
                 residual_unit = torch.clamp(
                     residual_unit + torch.randn_like(residual_unit) * exploration_std_step, -1.0, 1.0
                 )
+            takeover_mask = (torch.rand((num_envs, 1), device=device) < takeover_prob_step).to(torch.float32)
+            takeover_mask = takeover_mask * episode_takeover_ready_mask
             action, delta = _compose_action(
                 base_action,
                 residual_unit,
@@ -2469,7 +2578,9 @@ def main() -> None:
                 args_cli.residual_scale_min,
                 args_cli.residual_scale_max,
                 residual_gate,
+                takeover_mask,
             )
+        last_takeover_rate = float(takeover_mask.mean().detach().cpu().item())
 
         if env.cfg.dynamic_reset_gripper_effort_limit:
             dynamic_reset_gripper_effort_limit_sim(env, task_type)
@@ -2481,6 +2592,7 @@ def main() -> None:
                 executed_action = scaled_action.to(device=device, dtype=action.dtype)
         done_t = (terminated | truncated).detach().to(torch.bool)
         done_np = done_t.detach().cpu().numpy().astype(bool).reshape(-1)
+        episode_step_in_env += 1
         reward_np = reward.detach().cpu().numpy().reshape(-1)
         success_np = env.reset_terminated.detach().cpu().numpy().astype(bool).reshape(-1)
         task_rew_np = np.asarray(
@@ -2603,6 +2715,10 @@ def main() -> None:
                 guidance_states[env_id] = TrajectoryGuidanceState(traj=selected)
                 if args_cli.traj_guidance_reset_from_reference and initial_cube_pose_w is not None:
                     initial_cube_pose_w[env_id] = selected.initial_cube_pose_w
+            episode_step_in_env[env_id] = 0
+            episode_takeover_delay_steps[env_id] = int(
+                _sample_episode_takeover_delay_steps(episode_takeover_rng, 1)[0]
+            )
 
         if args_cli.traj_guidance_reset_from_reference and initial_cube_pose_w is not None:
             setattr(env, "_trajectory_guidance_initial_cube_pose_w", initial_cube_pose_w)
@@ -2626,6 +2742,8 @@ def main() -> None:
             and replay.size >= args_cli.batch_size
         ):
             step_actor_loss = float(last_stats.actor_loss)
+            step_gate_reg_loss = float(last_stats.gate_reg_loss)
+            step_actor_q_advantage = float(last_stats.actor_q_advantage)
             for _ in range(args_cli.num_updates_per_iteration):
                 priority_beta = _effective_priority_beta(env_step)
                 batch, sample_meta = _sample_mixed_batch(
@@ -2661,6 +2779,7 @@ def main() -> None:
                         args_cli.residual_scale_min,
                         args_cli.residual_scale_max,
                         target_gate,
+                        (torch.rand((target_residual.shape[0], 1), device=device) < takeover_prob_step).to(torch.float32),
                     )
                     q_t = critic_target(next_obs_feat_tgt, target_action)
                     q_t_min = critic_target.target_min(q_t, args_cli.min_q_heads)
@@ -2707,11 +2826,43 @@ def main() -> None:
                         args_cli.residual_scale_min,
                         args_cli.residual_scale_max,
                         actor_gate,
+                        (torch.rand((actor_residual.shape[0], 1), device=device) < takeover_prob_step).to(torch.float32),
                     )
                     actor_q = critic(obs_actor, actor_action)
                     actor_val = critic.policy_value(actor_q, args_cli.policy_gradient_type)
                     actor_loss = -actor_val.mean()
                     actor_loss = actor_loss + args_cli.residual_reg_weight * (actor_delta.pow(2).mean())
+
+                    # Optional gate penalties to keep the gate selective rather than letting it
+                    # saturate to 1.0 (default ResFiT/TD3 behavior when residual is generally useful).
+                    gate_reg_term = torch.tensor(0.0, device=device)
+                    gate_advantage_term = torch.tensor(0.0, device=device)
+                    advantage_mean_for_log = 0.0
+                    if (
+                        args_cli.gate_reg_weight > 0.0
+                        or args_cli.gate_advantage_reg_weight > 0.0
+                    ):
+                        gate_flat = actor_gate.squeeze(-1)
+                        if args_cli.gate_reg_weight > 0.0:
+                            gate_reg_term = args_cli.gate_reg_weight * gate_flat.mean()
+                        if args_cli.gate_advantage_reg_weight > 0.0:
+                            # Q(s, base) under the same critic ensemble. Detach to isolate the
+                            # penalty's gradient to the gate (the main actor objective already
+                            # pushes residual_unit to improve Q).
+                            with torch.no_grad():
+                                q_base_heads = critic(obs_actor, batch["base"])
+                                q_base = critic.policy_value(
+                                    q_base_heads, args_cli.policy_gradient_type
+                                ).squeeze(-1)
+                            advantage = actor_val.detach().squeeze(-1) - q_base
+                            advantage_mean_for_log = float(advantage.mean().detach().cpu().item())
+                            neg_advantage = torch.relu(-advantage).detach()
+                            gate_advantage_term = (
+                                args_cli.gate_advantage_reg_weight
+                                * (gate_flat * neg_advantage).mean()
+                            )
+                        actor_loss = actor_loss + gate_reg_term + gate_advantage_term
+
                     actor_opt.zero_grad(set_to_none=True)
                     actor_loss.backward()
                     actor_lr_step = _effective_actor_lr(update_count)
@@ -2719,6 +2870,10 @@ def main() -> None:
                         group["lr"] = actor_lr_step
                     actor_opt.step()
                     step_actor_loss = float(actor_loss.detach().cpu().item())
+                    step_gate_reg_loss = float(
+                        (gate_reg_term + gate_advantage_term).detach().cpu().item()
+                    )
+                    step_actor_q_advantage = advantage_mean_for_log
 
                     _soft_update(actor_target, actor, args_cli.tau)
                     _soft_update(critic_target, critic, args_cli.tau)
@@ -2733,6 +2888,8 @@ def main() -> None:
                     residual_l2=float(residual_unit.norm(p=2, dim=-1).mean().detach().cpu().item()),
                     delta_l2=float(delta.norm(p=2, dim=-1).mean().detach().cpu().item()),
                     gate_mean=float(residual_gate.mean().detach().cpu().item()),
+                    gate_reg_loss=step_gate_reg_loss,
+                    actor_q_advantage=step_actor_q_advantage,
                     guidance_progress_term=(
                         float(np.mean(recent_guidance_progress)) if recent_guidance_progress else 0.0
                     ),
@@ -2756,7 +2913,9 @@ def main() -> None:
                 f"return20={mean_return:.3f} success20={mean_success:.3f} "
                 f"critic_loss={last_stats.critic_loss:.3e} actor_loss={last_stats.actor_loss:.3e} "
                 f"residual_l2={last_stats.residual_l2:.4f} delta_l2={last_stats.delta_l2:.4f} "
-                f"gate_mean={last_stats.gate_mean:.3f} expl_std={last_exploration_std:.4f} "
+                f"gate_mean={last_stats.gate_mean:.3f} gate_reg={last_stats.gate_reg_loss:.3e} "
+                f"adv={last_stats.actor_q_advantage:+.3e} expl_std={last_exploration_std:.4f} "
+                f"takeover_prob={last_takeover_prob:.3f} takeover_rate={last_takeover_rate:.3f} "
                 f"guidance_prog={mean_guidance_progress:.4f} "
                 f"guidance_grip={mean_guidance_gripper:.4f}"
             )
@@ -2837,6 +2996,7 @@ def main() -> None:
                 "critic_opt": critic_opt.state_dict(),
                 "encoder_opt": encoder_opt.state_dict() if encoder_opt is not None else None,
                 "args": vars(args_cli),
+                "state_standardizer": _state_standardizer_payload(state_standardizer),
             }
             ckpt_path = os.path.join(args_cli.log_dir, f"residual_td3_step_{env_step:08d}.pt")
             torch.save(ckpt, ckpt_path)
@@ -2857,6 +3017,7 @@ def main() -> None:
             "critic_opt": critic_opt.state_dict(),
             "encoder_opt": encoder_opt.state_dict() if encoder_opt is not None else None,
             "args": vars(args_cli),
+            "state_standardizer": _state_standardizer_payload(state_standardizer),
         },
         final_path,
     )
